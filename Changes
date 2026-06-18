@@ -1,0 +1,33 @@
+Revision history for App-PerlGraph
+
+0.001     2026-06-17
+          - Initial release.
+          - Static knowledge graph of a Perl codebase: packages, classes, subs,
+            methods, fields, constants (`use constant`), calls, references,
+            imports and inheritance, via tree-sitter-perl (Text::Treesitter) into
+            a SQLite graph with FTS5.
+          - Native OO (perl 5.38 `feature 'class'` and Object::Pad): `class`,
+            `method` and `field` declarations, with `:isa`/`:does` inheritance.
+          - Queries: search, node, explore, callers, callees, impact, path,
+            affected, unused, status; plus index / sync / watch.
+          - Static OO resolution (heuristic provenance): $self/$class method
+            calls against the enclosing package, the transitive MRO -- inheritance
+            via @ISA / parent / base / Moo·Moose `extends` / `Mojo::Base` / native
+            `class :isa`, plus composed `with` / `:does` roles.
+          - Incremental sync re-resolves dependents, so renames/removals leave
+            no stale cross-file edges.
+          - Parallel indexing: `pcg index --jobs N` (auto-detects cores) forks
+            parse workers over the per-file parse phase, inserting serially in
+            the parent -- byte-identical graph, much faster on large trees.
+          - `pcg index --max-file-size SZ` (e.g. 1M) skips oversized files,
+            which in a dependency tree are almost always generated data tables
+            (Module::CoreList: 18 subs, 25k data lines) that dominate the index
+            for almost no code graph -- ~10x on trees that contain one.
+          - Opt-in runtime enrichment (--runtime): Devel::Symdump symbol table,
+            B:: optree dynamic dispatch, and Moo/Moose MOP roles & attributes,
+            run in a forked, timeout-guarded child.
+          - Framework route resolvers (Dancer2 / Mojolicious::Lite / Catalyst)
+            and an XS/C bridge linking Perl subs to their XSUBs.
+          - Graph export to dot / mermaid / json (whole graph or a subgraph).
+          - MCP server (newline-delimited JSON-RPC 2.0 over stdio) exposing
+            nine tools, plus Claude Code install/uninstall.

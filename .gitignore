@@ -1,0 +1,9 @@
+/upstream/
+.pcg/
+/blib/
+/Makefile
+/Makefile.old
+/pm_to_blib
+/MYMETA.*
+/App-PerlGraph-*.tar.gz
+*.bak

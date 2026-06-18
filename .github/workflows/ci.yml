@@ -1,0 +1,52 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        perl: ['5.36', '5.38', '5.40']
+    name: "${{ matrix.os }} / perl ${{ matrix.perl }}"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tree-sitter runtime from source (Linux)
+        if: runner.os == 'Linux'
+        # The distro libtree-sitter (Ubuntu noble ships 0.20.8) only supports
+        # grammar language version <=13; tree-sitter-perl needs version 15, so a
+        # current release is required -- apt's package fails to load the grammar.
+        run: |
+          git clone --depth 1 --branch v0.26.8 https://github.com/tree-sitter/tree-sitter
+          make -C tree-sitter
+          sudo make -C tree-sitter install PREFIX=/usr/local
+          sudo ldconfig
+
+      - name: Install system tree-sitter (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tree-sitter
+
+      - name: Set up perl ${{ matrix.perl }}
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install dependencies
+        run: |
+          cpanm --notest --installdeps .
+          cpanm --notest Text::Treesitter
+          # opt-in enrichers so --runtime is exercised; inotify watcher on Linux
+          cpanm --notest Devel::Symdump Class::MOP || true
+          if [ "${{ runner.os }}" = "Linux" ]; then cpanm --notest Linux::Inotify2 || true; fi
+
+      - name: Build the tree-sitter-perl grammar
+        run: ./tools/build-grammar.sh
+
+      - name: Run the test suite
+        run: prove -lr t/

@@ -1,0 +1,543 @@
+package App::PerlGraph::Extractor;
+use v5.36;
+our $VERSION = q{0.001};
+use Moo;
+use App::PerlGraph::Model qw(node_id qualify);
+use App::PerlGraph::Grammar qw(:all);
+use App::PerlGraph::Pod;
+no warnings 'recursion';   # deep but bounded CST walks (after Moo re-enables warnings)
+
+# Walks a normalized parse tree (from App::PerlGraph::Parser) and produces
+# { nodes => [...], edges => [...], refs => [...] }.
+#
+# Scope model: the *current package* is instance state ($self->{_pkg}).
+# Statement-form `package NAME;` sets it and leaks to all following siblings.
+# Block-form `package NAME { ... }` sets it for its block only, then _walk
+# restores the prior value at the block boundary. The *current sub* is threaded
+# through _walk as a parameter (it scopes to a sub body).
+
+has file_path => (is => 'ro', required => 1);
+has _nodes    => (is => 'ro', default => sub { [] });
+has _edges    => (is => 'ro', default => sub { [] });
+has _refs     => (is => 'ro', default => sub { [] });
+has _packages => (is => 'ro', default => sub { {} });   # qname  -> package node (post-pass)
+has _exports  => (is => 'ro', default => sub { {} });   # symbol -> 1
+has source    => (is => 'ro', default => '');           # raw file source (for POD docstrings)
+
+# `use`d module names that are pragmas / handled specially — not real imports.
+# (`constant` is handled specially too -> _handle_constant, so it's not here.)
+my %PRAGMA = map { $_ => 1 } qw(strict warnings utf8 feature lib vars overload);
+
+# Layer 3 framework signals
+my %FRAMEWORK  = ('Dancer2' => 'dancer', 'Dancer' => 'dancer', 'Mojolicious::Lite' => 'mojo');
+my %ROUTE_VERB = map { $_ => 1 } qw(get post put del delete patch options any);
+my %CAT_ATTR   = map { $_ => 1 } qw(Path Local Global Chained Args Method Private Regex LocalRegex);
+my %MOOSEY     = map { $_ => 1 } qw(Moo Moose Moo::Role Moose::Role Mouse Mouse::Role);
+my %MODIFIER   = map { $_ => 1 } qw(before after around);
+# native-class / Object::Pad class attributes -> edge kind
+my %CLASS_ATTR = (isa => 'extends', does => 'implements');
+
+sub extract ($self, $tree) {
+    my $file = $self->_emit({ kind => 'file', name => $self->file_path,
+        qualified_name => $self->file_path, start_line => 1, end_line => $tree->{el} });
+    $self->{_file} = $file;
+    $self->{_pkg}  = undef;
+    $self->_walk($tree, undef);
+    $self->_postprocess;
+    return { nodes => $self->_nodes, edges => $self->_edges, refs => $self->_refs };
+}
+
+sub _emit ($self, $n) {
+    $n->{file_path} //= $self->file_path;
+    $n->{language}  //= 'perl';
+    $n->{id} = node_id($n);
+    push @{ $self->_nodes }, $n;
+    return $n;
+}
+
+sub _edge ($self, $src, $tgt, $kind, %extra) {
+    push @{ $self->_edges },
+        { source => $src, target => $tgt, kind => $kind, provenance => 'static', %extra };
+}
+
+sub _walk ($self, $node, $cur_sub) {
+    for my $child (@{ $node->{children} }) {
+        my $t = $child->{type};
+        if ($t eq NODE_PACKAGE || $t eq NODE_CLASS) {
+            my $prev = $self->{_pkg};
+            $self->{_pkg} = $t eq NODE_CLASS ? $self->_handle_class($child) : $self->_handle_package($child);
+            $self->_walk($child, $cur_sub);
+            # Block form `package NAME { ... }` / `class NAME { ... }` scopes to its
+            # block -> restore the outer package after it. Statement form has no
+            # block child and intentionally leaks to following siblings.
+            $self->{_pkg} = $prev if grep { $_->{type} eq NODE_BLOCK } @{ $child->{children} };
+        }
+        elsif ($t eq NODE_SUB || $t eq NODE_METHOD_DECL) {
+            my $snode = $self->_handle_sub($child);
+            $self->_walk($child, $snode // $cur_sub);
+        }
+        elsif ($t eq NODE_VAR_DECL) {
+            # `field $x ...` inside a class (first child is the `field` keyword);
+            # any other variable_declaration just recurses as before.
+            $self->_handle_field($child)
+                if @{ $child->{children} } && $child->{children}[0]{type} eq NODE_FIELD;
+            $self->_walk($child, $cur_sub);
+        }
+        elsif ($t eq NODE_USE) {
+            $self->_handle_use($child);
+        }
+        elsif ($t eq NODE_REQUIRE) {
+            $self->_handle_require($child);
+        }
+        elsif ($t eq NODE_ASSIGN) {
+            $self->_handle_assign($child);
+            $self->_walk($child, $cur_sub);
+        }
+        elsif ($t eq NODE_METHOD_CALL) {
+            $self->_handle_method_call($child, $cur_sub);
+            $self->_walk($child, $cur_sub);
+        }
+        elsif ($t eq NODE_REFGEN) {
+            $self->_handle_refgen($child, $cur_sub);
+            $self->_walk($child, $cur_sub);
+        }
+        elsif (grep { $_ eq $t } @{ +CALL_TYPES }) {
+            if    ($self->_framework_now && $self->_handle_route($child, $cur_sub))    {}
+            elsif ($self->_moosey_now    && $self->_handle_modifier($child, $cur_sub)) {}
+            elsif ($self->_moosey_now    && ($self->_handle_isa_fn($child, 'with',    'implements')
+                                          || $self->_handle_isa_fn($child, 'extends', 'extends')))     {}
+            else  { $self->_handle_call($child, $cur_sub); $self->_walk($child, $cur_sub) }
+        }
+        else {
+            $self->_walk($child, $cur_sub);
+        }
+    }
+}
+
+sub _src_id ($self) { $self->{_pkg} ? $self->{_pkg}{id} : $self->{_file}{id} }
+
+sub _framework_now ($self) { ($self->{_pkg} && $self->{_pkg}{_framework}) || $self->{_framework_file} }
+sub _moosey_now    ($self) { ($self->{_pkg} && $self->{_pkg}{_moosey})    || $self->{_moosey_file} }
+
+sub _handle_package ($self, $n) {
+    my $nm = $n->{fields}{ +F_NAME };
+    my $name = $nm ? $nm->{text} : 'main';
+    my $pnode = $self->_emit({ kind => 'package', name => $name, qualified_name => $name,
+        start_line => $n->{sl}, end_line => $n->{el} });
+    $self->_edge($self->{_file}{id}, $pnode->{id}, 'contains');
+    $self->_packages->{$name} = $pnode;
+    return $pnode;
+}
+
+# Native `class NAME :isa(Parent) { ... }` (perl 5.38 feature 'class' / Object::Pad).
+# Mirrors _handle_package but emits a class node and turns :isa into an extends edge
+# (null target, resolved by name later -- same shape as `use parent` / @ISA).
+sub _handle_class ($self, $n) {
+    my $nm = $n->{fields}{ +F_NAME };
+    my $name = $nm ? $nm->{text} : 'main';
+    my $cnode = $self->_emit({ kind => 'class', name => $name, qualified_name => $name,
+        start_line => $n->{sl}, end_line => $n->{el} });
+    $self->_edge($self->{_file}{id}, $cnode->{id}, 'contains');
+    $self->_packages->{$name} = $cnode;
+    if (my $attrs = $n->{fields}{ +F_ATTRIBUTES }) {
+        for my $a (@{ $attrs->{children} }) {
+            next unless $a->{type} eq NODE_ATTRIBUTE;
+            my $an = $a->{fields}{ +F_NAME } or next;
+            my $kind = $CLASS_ATTR{ $an->{text} } or next;   # :isa -> extends, :does -> implements
+            my $v = $a->{fields}{ +F_VALUE } or next;
+            (my $base = $v->{text}) =~ s/^[\s('"]+|[\s)'"]+$//g;   # attribute_value is a raw token
+            $self->_edge($cnode->{id}, undef, $kind, metadata => { via => $an->{text}, name => $base })
+                if length $base;
+        }
+    }
+    return $cnode;
+}
+
+# `field $x :param = ...;` inside a class -> a field node (sigil-stripped name,
+# scoped to the class), matching the runtime MOP field naming.
+sub _handle_field ($self, $n) {
+    my $pkg = $self->{_pkg} or return;   # `field` is only meaningful inside a class
+    my $var = $n->{fields}{ +F_VARIABLE } or return;
+    my $vn  = $self->_find_descendant($var, NODE_VARNAME) or return;
+    my $name = $vn->{text};
+    my $node = $self->_emit({ kind => 'field', name => $name,
+        qualified_name => qualify($pkg->{qualified_name}, $name),
+        start_line => $n->{sl}, end_line => $n->{el},
+        visibility => ($name =~ /^_/ ? 'private' : 'public') });
+    $self->_edge($pkg->{id}, $node->{id}, 'contains');
+}
+
+sub _handle_sub ($self, $n) {
+    my $nm = $n->{fields}{ +F_NAME } or return undef;
+    my $name = $nm->{text};
+    my $pkg  = $self->{_pkg};
+    my $pkgq = $pkg ? $pkg->{qualified_name} : 'main';
+    my $sig;
+    for my $c (@{ $n->{children} }) { $sig = $c->{text}, last if $c->{type} eq 'signature' }
+    my $snode = $self->_emit({
+        kind           => ($n->{type} eq NODE_METHOD_DECL ? 'method' : 'function'),
+        name           => $name,
+        qualified_name => qualify($pkgq, $name),
+        start_line     => $n->{sl}, end_line => $n->{el},
+        signature      => $sig,
+        visibility     => ($name =~ /^_/ ? 'private' : 'public'),
+    });
+    $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $snode->{id}, 'contains');
+    $self->_handle_catalyst($n, $snode);
+    return $snode;
+}
+
+# Dancer2/Mojo::Lite: `get '/x' => sub {...}` -> route node + anon handler (scoped).
+# Returns true if it consumed the call.
+sub _handle_route ($self, $n, $cur_sub) {
+    my $fn = $n->{fields}{ +F_FUNCTION } or return 0;
+    my $verb = $fn->{text};
+    return 0 unless $ROUTE_VERB{$verb};
+    my $args = $n->{fields}{ +F_ARGUMENTS } or return 0;
+    my $handler = $self->_find_descendant($args, NODE_ANON_SUB);   # inline handler (absent for render-shortcut routes)
+    my $path    = $self->_route_path($args);
+    # A route is `VERB PATH => sub {...}` or the handler-less render shortcut
+    # (`get '/x' => {...}` / `=> 'template'`). Without a sub, require a literal
+    # `/`-path so a bareword `get($url)` (e.g. LWP::Simple, which exports get/head)
+    # isn't mistaken for a route.
+    return 0 unless $handler || (defined $path && $path =~ m{^/});
+    $path //= '?';
+
+    my $pkg   = $self->{_pkg};
+    my $owner = $pkg ? $pkg->{id} : $self->{_file}{id};
+    my $pkgq  = $pkg ? $pkg->{qualified_name} : 'main';
+
+    my $route = $self->_emit({ kind => 'route', name => "\U$verb\E $path",
+        qualified_name => "$pkgq \U$verb\E $path", start_line => $n->{sl}, end_line => $n->{el},
+        metadata => { provenance => 'framework', verb => uc $verb, path => $path } });
+    $self->_edge($owner, $route->{id}, 'contains', provenance => 'framework');
+
+    if ($handler) {
+        my $hnode = $self->_emit({ kind => 'function', name => '__ANON__',
+            qualified_name => "${pkgq}::__ANON__\@$handler->{sl}", start_line => $handler->{sl},
+            end_line => $handler->{el}, visibility => 'private', metadata => { provenance => 'framework' } });
+        $self->_edge($owner, $hnode->{id}, 'contains', provenance => 'framework');
+        $self->_edge($route->{id}, $hnode->{id}, 'references', provenance => 'framework', metadata => { via => 'route' });
+
+        # walk the handler body with the handler as current sub (its calls attribute to it)
+        if (my $body = $handler->{fields}{ +F_BODY }) { $self->_walk($body, $hnode) }
+    }
+    return 1;
+}
+
+# The route path is the first top-level string argument BEFORE the handler sub
+# (skips method arrays like `any ['get','post'] => '/x' => sub`, and avoids
+# grabbing a string from inside the handler body).
+sub _route_path ($self, $args) {
+    for my $c (@{ $args->{children} }) {
+        last if $c->{type} eq NODE_ANON_SUB;
+        next unless $c->{type} eq NODE_INTERP_STRING || $c->{type} eq NODE_STRING_LIT;
+        my $sc = $self->_find_descendant($c, NODE_STRING_CONTENT);
+        return $sc->{text} if $sc;
+    }
+    return undef;
+}
+
+# Catalyst action: a sub carrying a routing attribute (:Path/:Local/:Chained/...).
+sub _handle_catalyst ($self, $n, $snode) {
+    my $attrs = $n->{fields}{ +F_ATTRIBUTES } or return;
+    my (@routing, $path);
+    for my $a (@{ $attrs->{children} }) {
+        next unless $a->{type} eq NODE_ATTRIBUTE;
+        my $aname = $a->{fields}{ +F_NAME } or next;
+        next unless $CAT_ATTR{ $aname->{text} };
+        push @routing, $aname->{text};
+        if ($aname->{text} eq 'Path' && (my $v = $a->{fields}{ +F_VALUE })) {
+            (my $t = $v->{text}) =~ s/^[\s('"]+|[\s)'"]+$//g;     # attribute_value is a raw token
+            $path //= $t if length $t;
+        }
+    }
+    return unless @routing;
+    $path //= '/' . $snode->{name};
+    my $pkg  = $self->{_pkg};
+    my $pkgq = $pkg ? $pkg->{qualified_name} : 'main';
+    my $route = $self->_emit({ kind => 'route', name => $path, qualified_name => "$pkgq route $path",
+        start_line => $n->{sl}, end_line => $n->{el},
+        metadata => { provenance => 'framework', framework => 'catalyst', attrs => \@routing, path => $path } });
+    $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $route->{id}, 'contains', provenance => 'framework');
+    $self->_edge($route->{id}, $snode->{id}, 'references', provenance => 'framework', metadata => { via => 'route' });
+}
+
+sub _handle_use ($self, $n) {
+    my $mod = $n->{fields}{ +F_MODULE } or return;
+    my $module = $mod->{text};
+    # framework/moosey are tracked per-package (with a file-level fallback for
+    # `use Moo; package Foo;`), so they don't leak into a later package in the same file.
+    if (my $fw = $FRAMEWORK{$module}) {
+        if ($self->{_pkg}) { $self->{_pkg}{_framework} //= $fw } else { $self->{_framework_file} //= $fw }
+    }
+    if ($MOOSEY{$module}) {
+        if ($self->{_pkg}) { $self->{_pkg}{_moosey} = 1 } else { $self->{_moosey_file} = 1 }
+    }
+    # `use constant FOO => ...` / `use constant { A => 1, B => 2 }` define callable
+    # symbols -> constant nodes (not an import).
+    if ($module eq 'constant') {
+        $self->_handle_constant($n);
+    }
+    # inheritance declared via `use`: parent / base, and Mojolicious's
+    # `use Mojo::Base 'Parent'` (the canonical Mojo controller/model idiom).
+    elsif ($module eq 'parent' || $module eq 'base' || $module eq 'Mojo::Base') {
+        my @bases;
+        $self->_collect_strings($n, \@bases);
+        my $via = $module eq 'Mojo::Base' ? 'mojo_base' : 'parent';
+        for my $base (@bases) {
+            next if $base =~ /^-/;                       # -norequire / -base / -role / -signatures
+            $self->_edge($self->_src_id, undef, 'extends', metadata => { via => $via, name => $base });
+        }
+        # Mojo::Base always declares a class, even `use Mojo::Base -base;` (no parent).
+        $self->{_pkg}{_is_class} = 1 if $self->{_pkg} && ($module eq 'Mojo::Base' || @bases);
+    }
+    elsif (!$PRAGMA{$module}) {
+        $self->_edge($self->_src_id, undef, 'imports', metadata => { via => 'use', module => $module });
+    }
+}
+
+# `use constant FOO => ...` / `use constant { A => 1, B => 2 }` -> constant nodes.
+# Hash form: every bareword key is a name. List form (`NAME => VALUE`): only the
+# FIRST key is the name (the rest is the value). _constant_keys collects only true
+# keys (a bareword before `=>`) and prunes value hashref/arrayref subtrees, so
+# neither a value hashref's keys (`MAP => { x => 1 }`) nor a `$ENV{KEY}` subscript
+# become phantom constants.
+sub _handle_constant ($self, $n) {
+    my $pkg  = $self->{_pkg};
+    my $pkgq = $pkg ? $pkg->{qualified_name} : 'main';
+    my ($hash) = grep { $_->{type} eq 'anonymous_hash_expression' } @{ $n->{children} };
+    my @names; $self->_constant_keys($hash // $n, \@names);
+    @names = @names[0 .. 0] if !$hash && @names;     # list form names only the first key
+    for my $name (@names) {
+        my $node = $self->_emit({ kind => 'constant', name => $name,
+            qualified_name => qualify($pkgq, $name), start_line => $n->{sl}, end_line => $n->{el},
+            visibility => ($name =~ /^_/ ? 'private' : 'public') });
+        $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $node->{id}, 'contains');
+    }
+}
+
+# Bareword keys (an autoquoted_bareword immediately before `=>`), recursing through
+# the spec (the list right-nests, so subsequent pairs are nested) but NEVER into a
+# value hashref/arrayref -- their keys are data, not constant names. A subscript
+# key like `$ENV{KEY}` isn't collected either (it's not before a `=>`).
+sub _constant_keys ($self, $node, $acc) {
+    my @kids = @{ $node->{children} };
+    for my $i (0 .. $#kids) {
+        my $c = $kids[$i];
+        push @$acc, $c->{text}
+            if $c->{type} eq 'autoquoted_bareword' && $i < $#kids && ($kids[$i + 1]{type} // '') eq '=>';
+        next if $c->{type} eq 'anonymous_hash_expression' || $c->{type} eq 'anonymous_array_expression';
+        $self->_constant_keys($c, $acc);
+    }
+}
+
+sub _handle_require ($self, $n) {
+    for my $c (@{ $n->{children} }) {
+        if ($c->{type} eq NODE_PACKAGE_NAME || $c->{type} eq NODE_BAREWORD) {
+            $self->_edge($self->_src_id, undef, 'imports', metadata => { via => 'require', module => $c->{text} });
+            return;
+        }
+    }
+}
+
+sub _handle_assign ($self, $n) {
+    my $pkg  = $self->{_pkg} or return;
+    my $left = $n->{fields}{ +F_LEFT } or return;
+    # Require an array (@-sigil) container, so a scalar like `my $ISA = ...` is
+    # NOT mistaken for @ISA / @EXPORT.
+    my $arr  = $self->_find_descendant($left, 'array') or return;
+    my $var  = $self->_find_descendant($arr, NODE_VARNAME) or return;
+    my $vname = $var->{text};
+    return unless $vname eq 'ISA' || $vname eq 'EXPORT' || $vname eq 'EXPORT_OK';
+
+    my @vals;
+    $self->_collect_strings($n, \@vals);
+    if ($vname eq 'ISA') {
+        $self->_edge($pkg->{id}, undef, 'extends', metadata => { via => 'isa', name => $_ }) for @vals;
+        $pkg->{_is_class} = 1 if @vals;
+    }
+    else {  # EXPORT / EXPORT_OK
+        $self->_exports->{$_} = 1 for @vals;
+    }
+}
+
+# Gather string values from a subtree: string_literal contents, and qw(...) words.
+sub _collect_strings ($self, $node, $acc) {
+    if ($node->{type} eq NODE_QW) {
+        my $c = $node->{fields}{ +F_CONTENT };
+        push @$acc, split ' ', $c->{text} if $c;
+        return;
+    }
+    if ($node->{type} eq NODE_STRING_CONTENT) {
+        push @$acc, $node->{text};
+        return;
+    }
+    $self->_collect_strings($_, $acc) for @{ $node->{children} };
+}
+
+sub _find_descendant ($self, $node, $type) {
+    return $node if $node->{type} eq $type;
+    for my $c (@{ $node->{children} }) {
+        my $f = $self->_find_descendant($c, $type);
+        return $f if $f;
+    }
+    return undef;
+}
+
+# Moo/Moose `with 'Role::A', 'Role::B'` -> implements edges and `extends 'Base'`
+# -> extends edges (both resolved by name, like @ISA), so composed roles AND
+# declared parents feed _mro and `$self->method` resolution. Modern OO declares
+# inheritance with `extends`, not `our @ISA`. Option containers
+# (`with 'R' => { -alias => {...} }`) are skipped. Returns true if consumed.
+sub _handle_isa_fn ($self, $n, $fname, $kind) {
+    my $fn = $n->{fields}{ +F_FUNCTION } or return 0;
+    return 0 unless ($fn->{text} // '') eq $fname;
+    my $pkg = $self->{_pkg} or return 0;
+    my @strs; $self->_role_names($n, \@strs);
+    my @names = grep { /\A\w+(?:::\w+)*\z/ } @strs;   # package-shaped only (skip -alias / option strings)
+    return 0 unless @names;
+    $self->_edge($pkg->{id}, undef, $kind, metadata => { via => $fname, name => $_ }) for @names;
+    $pkg->{_is_class} = 1;
+    return 1;
+}
+
+# Like _collect_strings, but never descends into anonymous hash/array refs -- the
+# role-options containers (`with 'Role' => { -alias => { m => 'n' } }`), whose
+# inner strings (method names) must NOT be mistaken for role names.
+sub _role_names ($self, $node, $acc) {
+    my $t = $node->{type};
+    return if $t eq 'anonymous_hash_expression' || $t eq 'anonymous_array_expression';
+    if ($t eq NODE_QW)             { my $c = $node->{fields}{ +F_CONTENT }; push @$acc, split ' ', $c->{text} if $c; return }
+    if ($t eq NODE_STRING_CONTENT) { push @$acc, $node->{text}; return }
+    $self->_role_names($_, $acc) for @{ $node->{children} };
+}
+
+sub _handle_modifier ($self, $n, $cur_sub) {
+    my $fn = $n->{fields}{ +F_FUNCTION } or return 0;
+    my $type = $fn->{text};
+    return 0 unless $MODIFIER{$type};
+    my $args = $n->{fields}{ +F_ARGUMENTS } or return 0;
+    my $handler = $self->_find_descendant($args, NODE_ANON_SUB) or return 0;
+    my $meth = $self->_method_arg($args);
+    return 0 unless defined $meth && length $meth;
+
+    my $pkg   = $self->{_pkg};
+    my $pkgq  = $pkg ? $pkg->{qualified_name} : 'main';
+    my $owner = $pkg ? $pkg->{id} : $self->{_file}{id};
+    my $mod = $self->_emit({ kind => 'method', name => "__${type}__", visibility => 'private',
+        qualified_name => "${pkgq}::__${type}_${meth}\@$n->{sl}",
+        start_line => $handler->{sl}, end_line => $handler->{el},
+        metadata => { provenance => 'framework', modifier => $type } });
+    $self->_edge($owner, $mod->{id}, 'contains', provenance => 'framework');
+    $self->_edge($mod->{id}, undef, 'overrides', provenance => 'framework',
+        metadata => { via => 'modifier', modifier => $type, name => qualify($pkgq, $meth) });
+    if (my $body = $handler->{fields}{ +F_BODY }) { $self->_walk($body, $mod) }
+    return 1;
+}
+
+# The first method-name argument (string or autoquoted bareword) before the handler sub.
+sub _method_arg ($self, $args) {
+    for my $c (@{ $args->{children} }) {
+        last if $c->{type} eq NODE_ANON_SUB;
+        if ($c->{type} eq NODE_INTERP_STRING || $c->{type} eq NODE_STRING_LIT) {
+            my $sc = $self->_find_descendant($c, NODE_STRING_CONTENT);
+            return $sc->{text} if $sc;
+        }
+        return $c->{text} if $c->{type} eq 'autoquoted_bareword';
+    }
+    return undef;
+}
+
+sub _from_id ($self, $cur_sub) {
+    return $cur_sub      ? $cur_sub->{id}
+         : $self->{_pkg} ? $self->{_pkg}{id}
+         :                 $self->{_file}{id};
+}
+
+sub _handle_call ($self, $n, $cur_sub) {
+    my $fn = $n->{fields}{ +F_FUNCTION } or return;
+    my $name = $fn->{text};
+    return unless defined $name && length $name;
+    push @{ $self->_refs }, {
+        from_node_id   => $self->_from_id($cur_sub),
+        reference_name => $name, reference_kind => 'call',
+        line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
+    };
+}
+
+# \&name -> a code reference. Record it as a `references` ref so callback-wired
+# subs (dispatch tables, sort comparators, event handlers) aren't seen as dead
+# -- and so they surface in callers/impact. Only the literal \&name form (a
+# direct varname child); \&$x / \&{...} are dynamic and skipped.
+sub _handle_refgen ($self, $n, $cur_sub) {
+    my $fn = $self->_find_descendant($n, NODE_FUNCTION) or return;
+    my ($vn) = grep { $_->{type} eq NODE_VARNAME } @{ $fn->{children} };
+    return unless $vn && defined $vn->{text} && length $vn->{text};
+    push @{ $self->_refs }, {
+        from_node_id   => $self->_from_id($cur_sub),
+        reference_name => $vn->{text}, reference_kind => 'references',
+        line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
+    };
+}
+
+sub _handle_method_call ($self, $n, $cur_sub) {
+    my $m = $n->{fields}{ +F_METHOD } or return;
+    my $meth = $m->{text};
+    return unless defined $meth && length $meth;
+    my $inv  = $n->{fields}{ +F_INVOCANT };
+    my $recv = $inv ? $inv->{text} : undef;
+    push @{ $self->_refs }, {
+        from_node_id   => $self->_from_id($cur_sub),
+        reference_name => $meth, reference_kind => 'method_call',
+        line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
+        candidates => (defined $recv ? { receiver => $recv } : undef),
+    };
+}
+
+sub _postprocess ($self) {
+    for my $p (values %{ $self->_packages }) { $p->{kind} = 'class' if delete $p->{_is_class} }
+    if (my @ex = keys %{ $self->_exports }) {
+        my %want = map { $_ => 1 } @ex;
+        for my $node (@{ $self->_nodes }) {
+            $node->{is_exported} = 1
+                if $node->{kind} =~ /function|method|constant/ && $want{ $node->{name} };
+        }
+    }
+    # attach POD docstrings (=head2/=item <name>) to matching subs/methods
+    if (length $self->source) {
+        my $pod = App::PerlGraph::Pod::extract($self->source);
+        if (%$pod) {
+            for my $node (@{ $self->_nodes }) {
+                next unless $node->{kind} =~ /function|method/;
+                $node->{docstring} //= $pod->{ $node->{name} };
+            }
+        }
+    }
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+App::PerlGraph::Extractor - walk a parse tree into graph nodes, edges and references
+
+=head1 DESCRIPTION
+
+Turns one file tree-sitter parse into package/class/sub/method/field/constant/route nodes plus call, reference and inheritance edges.
+
+This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
+C<pcg> command for the public interface.
+
+=head1 AUTHOR
+
+vividsnow E<lt>vividsnow@pm.meE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2026 by vividsnow. This library is free software; you may
+redistribute and/or modify it under the same terms as Perl itself.
+
+=cut
