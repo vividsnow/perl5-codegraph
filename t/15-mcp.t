@@ -18,7 +18,7 @@ is $mcp0->dispatch({ jsonrpc => '2.0', method => 'notifications/initialized' }),
 # --- tools/list ---
 my $tl = $mcp0->dispatch({ jsonrpc => '2.0', id => 2, method => 'tools/list' });
 my @tools = @{ $tl->{result}{tools} };
-is scalar(@tools), 9, 'nine tools';
+is scalar(@tools), 12, 'twelve tools (9 read + index / sync / status)';
 ok( (grep { $_->{name} eq 'pcg_callers'  } @tools), 'pcg_callers listed' );
 ok( (grep { $_->{name} eq 'pcg_explore'  } @tools), 'pcg_explore listed' );
 ok( (grep { $_->{name} eq 'pcg_unused'   } @tools), 'pcg_unused listed' );

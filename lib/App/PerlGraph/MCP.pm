@@ -1,20 +1,25 @@
 package App::PerlGraph::MCP;
 use v5.36;
-our $VERSION = q{0.001};
+our $VERSION = q{0.002};
 use Moo;
 use Cpanel::JSON::XS ();
 use App::PerlGraph ();
 use App::PerlGraph::Format;
+use App::PerlGraph::Query ();
+use App::PerlGraph::Indexer ();
 
 # A minimal MCP server: newline-delimited JSON-RPC 2.0 over stdio, wrapping the
-# read-only Query engine. `dispatch` is a pure request->response function (so it
-# is unit-testable); `run` is the stdio loop.
+# Query engine plus index/sync lifecycle tools. `dispatch` is a pure
+# request->response function (so it is unit-testable); `run` is the stdio loop.
 
-has query       => (is => 'ro');                         # App::PerlGraph::Query or undef (no index)
+has indexer     => (is => 'ro');                          # App::PerlGraph::Indexer over the shared store
+has query       => (is => 'lazy');                        # read view over indexer's store (built on demand)
 has base        => (is => 'ro', default => '.');         # project root, for reading source
 has server_name => (is => 'ro', default => 'pcg');
 has watch       => (is => 'ro', default => 0);           # lazily re-sync before tool calls
-has indexer     => (is => 'ro');                          # App::PerlGraph::Indexer (for --watch)
+sub _build_query ($self) {
+    $self->indexer ? App::PerlGraph::Query->new(store => $self->indexer->store) : undef;
+}
 has in          => (is => 'ro', default => sub { \*STDIN });
 has out         => (is => 'ro', default => sub { \*STDOUT });
 has _json       => (is => 'lazy');
@@ -23,7 +28,8 @@ sub _build__json ($self) { Cpanel::JSON::XS->new->utf8->canonical }
 use constant PROTOCOL_VERSION => '2024-11-05';
 use constant INSTRUCTIONS => <<'MD';
 `pcg` is a Perl code knowledge graph. Prefer these tools over grep/Read when reasoning about Perl code structure:
-pcg_explore (symbols + source + relationships in one call — best first stop), pcg_search (find symbols), pcg_node (a symbol's definition + location), pcg_callers / pcg_callees (who calls X / what X calls), pcg_impact (transitive callers — blast radius), pcg_path (how A reaches B — shortest call chain), pcg_unused (dead-code candidates — subs nothing references), pcg_affected (files/tests impacted by changing given files — CI triage). Results are authoritative for statically-resolved relationships. If a tool reports "no index", run `pcg index` in the project root first.
+pcg_explore (symbols + source + relationships in one call — best first stop), pcg_search (find symbols), pcg_node (a symbol's definition + location), pcg_callers / pcg_callees (who calls X / what X calls), pcg_impact (transitive callers — blast radius), pcg_path (how A reaches B — shortest call chain), pcg_unused (dead-code candidates — subs nothing references), pcg_affected (files/tests impacted by changing given files — CI triage). Results are authoritative for statically-resolved relationships.
+Lifecycle: if a read tool reports "no index", call pcg_index once to build the graph (no restart needed). After you edit Perl files, call pcg_sync so queries reflect your changes. pcg_status reports the graph's health.
 MD
 
 my @TOOLS = (
@@ -48,6 +54,13 @@ my @TOOLS = (
           files      => { type => 'array', items => { type => 'string' }, description => 'Changed file paths' },
           tests_only => { type => 'boolean', description => 'Restrict to .t test files (default false)' },
       }, required => ['files'] } },
+    # --- lifecycle tools: build / refresh the graph in-session ---
+    { name => 'pcg_index', handler => 'index', description => 'Build (or rebuild) the code graph for this project. Run this first if a read tool reports no index, or after large changes. Set runtime=true to also LOAD AND RUN the project code (forked + timeout-guarded) for dynamic-dispatch resolution.',
+      inputSchema => { type => 'object', properties => { runtime => { type => 'boolean', description => 'Also run runtime enrichment -- executes the project code; default false' } } } },
+    { name => 'pcg_sync', handler => 'sync', description => 'Incrementally refresh the graph after you edit files (re-resolves changed files and their dependents). Call this after changing Perl code so subsequent queries reflect it.',
+      inputSchema => { type => 'object', properties => {} } },
+    { name => 'pcg_status', handler => 'status', description => 'Graph health: node/edge counts and the edge provenance breakdown, or whether the graph has been built yet.',
+      inputSchema => { type => 'object', properties => {} } },
 );
 
 # Tool names, for the installer's permission allow-list (single source of truth).
@@ -100,8 +113,46 @@ sub _call_tool ($self, $id, $params) {
     return $self->_result($id, { content => [{ type => 'text', text => $text }] });
 }
 
+sub _indexed ($self) {
+    my $q = $self->query or return 0;
+    my $store = eval { $q->store } or return 1;   # a query with no introspectable store -> assume usable
+    return scalar @{ $store->dbh->selectcol_arrayref('select 1 from nodes limit 1') };
+}
+
+sub _status_text ($self) {
+    my $q = $self->query or return "Graph not built yet -- call pcg_index.";
+    return "Graph not built yet -- call pcg_index." unless $self->_indexed;
+    my $s = $q->store;
+    my ($n) = $s->dbh->selectrow_array('select count(*) from nodes');
+    my ($e) = $s->dbh->selectrow_array('select count(*) from edges');
+    my ($u) = $s->dbh->selectrow_array('select count(*) from unresolved_refs');
+    my $by  = $s->dbh->selectall_arrayref('select provenance, count(*) c from edges group by provenance order by provenance');
+    my $prov = @$by ? "\nedges by provenance: " . join(', ', map { "$_->[0]=$_->[1]" } @$by) : "";
+    return "nodes=$n edges=$e unresolved=$u$prov";
+}
+
 sub _run_tool ($self, $handler, $args) {
-    my $q = $self->query or return "No index found. Run `pcg index` in the project root first.";
+    my $idx = $self->indexer;
+
+    # lifecycle tools operate even before any graph exists
+    if ($handler eq 'index') {
+        return "No project to index (the server was started without an indexer)." unless $idx;
+        my $rt = $args->{runtime} ? 1 : 0;
+        my $st = App::PerlGraph::Indexer->new(store => $idx->store, root => $self->base, runtime => $rt)->index_all;
+        return "Indexed $st->{files} files ($st->{reindexed} (re)parsed)" . ($rt ? " + runtime enrichment" : "") . ".";
+    }
+    if ($handler eq 'sync') {
+        return "No project to sync (the server was started without an indexer)." unless $idx;
+        my $st = $idx->sync;
+        return "Synced: $st->{reindexed} reindexed"
+            . ($st->{dependents} ? ", $st->{dependents} dependent(s) refreshed" : "")
+            . ($st->{deleted}    ? ", $st->{deleted} deleted" : "") . ".";
+    }
+    return $self->_status_text if $handler eq 'status';
+
+    # read tools require a built graph
+    return "No index yet. Call pcg_index first to build the graph for this project." unless $self->_indexed;
+    my $q = $self->query;
     my $sym = $args->{symbol} // '';
     return App::PerlGraph::Format::search($args->{query} // '', [ $q->search($args->{query} // '') ]) if $handler eq 'search';
     return App::PerlGraph::Format::callers($sym, [ $q->callers($sym) ]) if $handler eq 'callers';

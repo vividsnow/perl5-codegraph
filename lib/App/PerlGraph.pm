@@ -1,6 +1,6 @@
 package App::PerlGraph;
 use v5.36;
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 1;
 
 __END__

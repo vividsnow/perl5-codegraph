@@ -71,6 +71,8 @@ t/42-parallel.t
 t/43-runtime-safety.t
 t/44-fuzz.t
 t/45-max-file-size.t
+t/46-mcp-lifecycle.t
+t/47-cli-ux.t
 t/corpus/dist/lib/Foo.pm
 t/corpus/dist/lib/Foo/Bar.pm
 t/corpus/oo/lib/Animal.pm

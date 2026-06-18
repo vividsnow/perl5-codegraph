@@ -1,6 +1,6 @@
 package App::PerlGraph::Installer;
 use v5.36;
-our $VERSION = q{0.001};
+our $VERSION = q{0.002};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);

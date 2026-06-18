@@ -1,6 +1,6 @@
 package App::PerlGraph::Parser;
 use v5.36;
-our $VERSION = q{0.001};
+our $VERSION = q{0.002};
 use Moo;
 use Text::Treesitter;
 no warnings 'recursion';                 # deep but bounded CST walks (after Moo re-enables warnings)

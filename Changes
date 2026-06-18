@@ -1,5 +1,17 @@
 Revision history for App-PerlGraph
 
+0.002     2026-06-19
+          - MCP lifecycle tools: pcg_index (with runtime option), pcg_sync and
+            pcg_status. The server now bootstraps and refreshes its own graph
+            in-session -- no separate `pcg index` run or restart needed. (Twelve
+            MCP tools total; re-run `pcg install` to allow-list the new ones.)
+          - `pcg --version`.
+          - `pcg status` is now a setup/health check: it reports whether the
+            parser works (grammar built, libtree-sitter recent enough) before the
+            graph counts, so a broken setup is diagnosable.
+          - A query before indexing now prints "No index -- run `pcg index`"
+            instead of an empty result, and no longer creates a stray .pcg/.
+
 0.001     2026-06-17
           - Initial release.
           - Static knowledge graph of a Perl codebase: packages, classes, subs,

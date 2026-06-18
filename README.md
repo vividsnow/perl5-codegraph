@@ -61,7 +61,8 @@ pcg affected lib/Foo.pm           # files/tests impacted by a change (CI: git di
 pcg unused                        # dead-code candidates: subs nothing references (--all keeps exported/lifecycle subs)
 pcg export --format mermaid --around Some::Module::run   # render the (sub)graph for docs/review (dot|mermaid|json)
 pcg search  thing
-pcg status
+pcg status                        # setup health (parser/grammar/libtree-sitter) + graph counts
+pcg --version
 ```
 
 Example:
@@ -92,10 +93,15 @@ uninstall` reverses them):
 "mcpServers": { "pcg": { "type": "stdio", "command": "pcg", "args": ["serve", "--mcp"] } }
 ```
 
-Tools exposed: `pcg_explore`, `pcg_node`, `pcg_search`, `pcg_callers`,
-`pcg_callees`, `pcg_impact`, `pcg_path`, `pcg_unused`, `pcg_affected`. Run the server by hand with `pcg serve --mcp [--watch] [path]`
-(`--watch` lazily re-indexes before tool calls so the agent's view stays fresh)
-(newline-delimited JSON-RPC 2.0 over stdio, protocol `2024-11-05`).
+Tools exposed (12): the read tools `pcg_explore`, `pcg_node`, `pcg_search`,
+`pcg_callers`, `pcg_callees`, `pcg_impact`, `pcg_path`, `pcg_unused`,
+`pcg_affected`, plus lifecycle tools `pcg_index` (with a `runtime` option),
+`pcg_sync` and `pcg_status`. The agent can therefore build and refresh the graph
+itself: on first use it calls `pcg_index`, and after editing code it calls
+`pcg_sync` — no separate `pcg index` run and no server restart. Run the server
+by hand with `pcg serve --mcp [--watch] [path]` (`--watch` also lazily re-indexes
+before tool calls) (newline-delimited JSON-RPC 2.0 over stdio, protocol
+`2024-11-05`).
 
 ## Runtime enrichment (`--runtime`)
 

@@ -1,6 +1,6 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.001};
+our $VERSION = q{0.002};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify);
 use App::PerlGraph::Grammar qw(:all);

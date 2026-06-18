@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.001};
+our $VERSION = q{0.002};
 use Path::Tiny qw(path);
 use App::PerlGraph::Store;
 use App::PerlGraph::Indexer;
@@ -19,6 +19,18 @@ sub _store ($root) {
     my $s = App::PerlGraph::Store->new(path => _db_path($root));
     $s->init;
     return $s;
+}
+
+# A read-only Query over an EXISTING graph. Unlike _store it never creates a
+# .pcg/ -- a query before `pcg index` should say so, not silently make an empty
+# index. Returns undef (after printing guidance) when there is no graph.
+sub _query ($root) {
+    my $db = path($root)->child('.pcg/graph.db');
+    unless ($db->exists) {
+        print STDERR "No index found in $root -- run `pcg index $root` first.\n";
+        return undef;
+    }
+    return App::PerlGraph::Query->new(store => App::PerlGraph::Store->new(path => "$db")->init);
 }
 
 my $USAGE = <<'U';
@@ -44,7 +56,8 @@ sub _usage { print STDERR $USAGE; return 2 }
 
 sub run ($class, @argv) {
     my $cmd = shift @argv // 'help';
-    if ($cmd =~ /^(?:help|--help|-h)$/) { print $USAGE; return 0 }
+    if ($cmd =~ /^(?:help|--help|-h)$/)        { print $USAGE; return 0 }
+    if ($cmd =~ /^(?:version|--version|-v)$/)  { say "pcg (App::PerlGraph) $VERSION"; return 0 }
     my %d = (
         index   => \&_cmd_index,
         sync    => \&_cmd_sync,
@@ -131,65 +144,59 @@ sub _cmd_serve (@args) {
     my $watch = grep { $_ eq '--watch' } @args;
     my ($root) = grep { $_ !~ /^--/ } @args;       # skip --mcp / --watch flags
     $root //= '.';
-    my $db = path($root)->child('.pcg/graph.db');
-    my ($query, $indexer);
-    if ($db->exists) {
-        my $s = App::PerlGraph::Store->new(path => "$db");
-        $s->init;
-        $query = App::PerlGraph::Query->new(store => $s);
-        $indexer = App::PerlGraph::Indexer->new(store => $s, root => $root) if $watch;
-    }
-    warn "pcg serve --watch: no index at $db (run `pcg index` first); watch disabled\n"
-        if $watch && !$indexer;
-    App::PerlGraph::MCP->new(query => $query, base => $root, watch => $watch, indexer => $indexer)->run;
+    # Always give the server an indexer over a (possibly-empty) store: the
+    # pcg_index / pcg_sync tools bootstrap and refresh the graph in-session, so
+    # the server works even with no pre-existing index (no restart needed).
+    my $indexer = App::PerlGraph::Indexer->new(store => _store($root), root => $root);
+    App::PerlGraph::MCP->new(indexer => $indexer, base => $root, watch => $watch)->run;
     return 0;
 }
 
 sub _cmd_search ($query = undef, $root = '.') {
     return _usage() unless defined $query;
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::search($query, [ $q->search($query) ]);
     return 0;
 }
 
 sub _cmd_node ($symbol = undef, $root = '.') {
     return _usage() unless defined $symbol;
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::node_view($symbol, [ $q->node_view($symbol) ], $root);
     return 0;
 }
 
 sub _cmd_explore ($query = undef, $root = '.') {
     return _usage() unless defined $query;
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::explore($query, [ $q->explore($query) ], $root);
     return 0;
 }
 
 sub _cmd_callers ($symbol = undef, $root = '.') {
     return _usage() unless defined $symbol;
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::callers($symbol, [ $q->callers($symbol) ]);
     return 0;
 }
 
 sub _cmd_callees ($symbol = undef, $root = '.') {
     return _usage() unless defined $symbol;
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::callees($symbol, [ $q->callees($symbol) ]);
     return 0;
 }
 
 sub _cmd_impact ($symbol = undef, $root = '.') {
     return _usage() unless defined $symbol;
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::impact($symbol, [ $q->impact($symbol) ]);
     return 0;
 }
 
 sub _cmd_path ($from = undef, $to = undef, $root = '.') {
     return _usage() unless defined $from && defined $to;
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::path($from, $to, [ $q->path($from, $to) ]);
     return 0;
 }
@@ -218,7 +225,7 @@ sub _cmd_affected (@args) {
     return _usage() if grep { /^--/ } @files;        # reject unknown flags (don't silently treat a typo as a file)
     if ($flag{stdin}) { while (my $l = <STDIN>) { chomp $l; push @files, $l if length $l } }
     return _usage() unless @files;
-    my $q = App::PerlGraph::Query->new(store => _store($flag{path} // '.'));
+    my $q = _query($flag{path} // '.') or return 1;
     say for $q->affected(\@files, tests_only => $flag{tests});
     return 0;
 }
@@ -228,7 +235,7 @@ sub _cmd_unused (@args) {
     my $all = grep { $_ eq '--all' } @args;
     my ($root) = grep { $_ !~ /^--/ } @args;
     $root //= '.';
-    my $q = App::PerlGraph::Query->new(store => _store($root));
+    my $q = _query($root) or return 1;
     print App::PerlGraph::Format::unused([ $q->unused(all => $all) ]);
     return 0;
 }
@@ -245,17 +252,30 @@ sub _cmd_export (@args) {
     return _usage() if grep { /^--/ } @pos;          # reject unknown flags (don't treat a typo as the root)
     my $fmt = $opt{format} // 'mermaid';
     return _usage() unless $fmt =~ /^(?:dot|mermaid|json)$/;
-    my $q = App::PerlGraph::Query->new(store => _store($pos[0] // '.'));
+    my $q = _query($pos[0] // '.') or return 1;
     print App::PerlGraph::Format::export($q->graph(around => $opt{around}, depth => $opt{depth}), $fmt);
     return 0;
 }
 
 sub _cmd_status ($root = '.') {
-    my $s = _store($root);
+    # setup health: can we parse at all? (catches a missing grammar or a too-old
+    # system libtree-sitter, which otherwise surface as a cryptic parse error)
+    if (eval { App::PerlGraph::Parser->new->parse_string("1;\n"); 1 }) {
+        say "parser: ok (grammar at " . ($ENV{PCG_TS_PARSER_DIR} // "$ENV{HOME}/.cache/pcg/tree-sitter-perl") . ")";
+    }
+    else {
+        (my $err = $@) =~ s/\s+\z//;
+        say "parser: NOT WORKING -- $err";
+        say "  -> run ./tools/build-grammar.sh, and ensure a system libtree-sitter >= 0.25";
+    }
+    # graph state -- never creates the index
+    my $db = path($root)->child('.pcg/graph.db');
+    unless ($db->exists) { say "graph:  not indexed yet (run `pcg index $root`)"; return 0 }
+    my $s = App::PerlGraph::Store->new(path => "$db")->init;
     my ($n) = $s->dbh->selectrow_array('select count(*) from nodes');
     my ($e) = $s->dbh->selectrow_array('select count(*) from edges');
     my ($u) = $s->dbh->selectrow_array('select count(*) from unresolved_refs');
-    say "nodes=$n edges=$e unresolved=$u";
+    say "graph:  nodes=$n edges=$e unresolved=$u";
     my $by = $s->dbh->selectall_arrayref('select provenance, count(*) c from edges group by provenance order by provenance');
     say "  edges by provenance: " . join(', ', map { "$_->[0]=$_->[1]" } @$by) if @$by;
     return 0;
