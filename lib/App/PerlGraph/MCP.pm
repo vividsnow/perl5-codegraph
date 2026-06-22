@@ -1,6 +1,6 @@
 package App::PerlGraph::MCP;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
 use Cpanel::JSON::XS ();
 use App::PerlGraph ();
@@ -28,15 +28,19 @@ sub _build__json ($self) { Cpanel::JSON::XS->new->utf8->canonical }
 use constant PROTOCOL_VERSION => '2024-11-05';
 use constant INSTRUCTIONS => <<'MD';
 `pcg` is a Perl code knowledge graph. Prefer these tools over grep/Read when reasoning about Perl code structure:
-pcg_explore (symbols + source + relationships in one call — best first stop), pcg_search (find symbols), pcg_node (a symbol's definition + location), pcg_callers / pcg_callees (who calls X / what X calls), pcg_impact (transitive callers — blast radius), pcg_path (how A reaches B — shortest call chain), pcg_unused (dead-code candidates — subs nothing references), pcg_affected (files/tests impacted by changing given files — CI triage), pcg_deps / pcg_cycles (module dependency graph and circular dependencies), pcg_hotspots (most depended-upon / most complex symbols — review & refactor triage), pcg_risk (git churn x fan-in — frequently-changed + widely-depended-upon code), pcg_cochange (files that change together — logical coupling, incl. hidden), pcg_diff (structural diff vs a git ref), pcg_review (one-call branch/PR review: diff + blast radius + tests to run), pcg_api (a module's public surface), pcg_covers (which tests exercise a symbol), pcg_untested (public API no test reaches). Results are authoritative for statically-resolved relationships.
+pcg_overview (codebase map: scale, frameworks, entry points, central symbols — the best FIRST call when landing in an unfamiliar repo), pcg_explore (symbols + source + relationships in one call — best first stop for a specific area), pcg_search (find symbols), pcg_node (a symbol's definition + location), pcg_explain (one-call dossier: a symbol's source + callers/callees + transitive blast radius + covering tests, saving separate pcg_node/pcg_impact/pcg_covers calls), pcg_callers / pcg_callees (who calls X / what X calls), pcg_impact (transitive callers — blast radius), pcg_path (how A reaches B — shortest call chain), pcg_unused (dead-code candidates — subs nothing references), pcg_affected (files/tests impacted by changing given files — CI triage), pcg_deps / pcg_cycles (module dependency graph and circular dependencies), pcg_hotspots (most depended-upon / most complex symbols — review & refactor triage), pcg_risk (git churn x fan-in — frequently-changed + widely-depended-upon code), pcg_cochange (files that change together — logical coupling, incl. hidden), pcg_sinks (security attack surface — command/SQL execution sites + which endpoints reach them), pcg_diff (structural diff vs a git ref), pcg_review (one-call branch/PR review: diff + blast radius + tests to run), pcg_api (a module's public surface), pcg_covers (which tests exercise a symbol), pcg_untested (public API no test reaches). Results are authoritative for statically-resolved relationships.
+Refactoring: pcg_rename renames a function/method across the codebase via the graph (the one WRITE tool) -- it edits only the call sites the resolver can tie to the symbol and reports the dynamic `$obj->method` ones it can't. Dry-run unless apply:true; call pcg_sync after.
 Lifecycle: if a read tool reports "no index", call pcg_index once to build the graph (no restart needed). After you edit Perl files, call pcg_sync so queries reflect your changes. pcg_status reports the graph's health.
 Resolving the unresolvable: most "unresolved" calls are opaque `$obj->method` dispatch static analysis can't tie to a class. pcg_unresolved lists the ones that DO match real candidate methods; infer each receiver's class (read the code if needed) and call pcg_resolve -- prefer the { caller, receiver, class } form, which types a receiver once and resolves all its calls at that site. BEST: pcg_unresolved by_receiver:true does the candidate-narrowing for you -- it groups by receiver and intersects the classes defining every method called on it, so a unique intersection is a near-certain type you just confirm and pass to pcg_resolve. Those edges are marked `llm` and persist across reindex. (pcg_index deps:true first resolves many dependency calls statically.)
 MD
 
 my @TOOLS = (
-    { name => 'pcg_search', handler => 'search', description => 'Search Perl symbols by name.',
-      inputSchema => { type => 'object', properties => { query => { type => 'string', description => 'Symbol name or term' } }, required => ['query'] } },
+    { name => 'pcg_search', handler => 'search', description => 'Search Perl symbols by name (keyword). Set semantic=true to rank by MEANING instead -- requires embeddings (pcg_index embed:true) and a local embedding provider; if either is missing it says so and you should use keyword search.',
+      inputSchema => { type => 'object', properties => { query => { type => 'string', description => 'Symbol name or term' },
+          semantic => { type => 'boolean', description => 'Rank by embedding similarity (meaning), not keyword; default false' } }, required => ['query'] } },
     { name => 'pcg_node', handler => 'node', description => "A symbol's definition(s): verbatim source + immediate callers/callees.",
+      inputSchema => { type => 'object', properties => { symbol => { type => 'string', description => 'Bare name or Foo::bar' } }, required => ['symbol'] } },
+    { name => 'pcg_explain', handler => 'explain', description => "Everything about a symbol in ONE call: its definition + verbatim source, immediate callers and callees, transitive blast radius (how many callers depend on it), and which tests cover it. Use instead of separate pcg_node + pcg_impact + pcg_covers round-trips.",
       inputSchema => { type => 'object', properties => { symbol => { type => 'string', description => 'Bare name or Foo::bar' } }, required => ['symbol'] } },
     { name => 'pcg_explore', handler => 'explore', description => 'Explore an area: matching symbols with their source and immediate relationships, in one call. Prefer this over grep/Read.',
       inputSchema => { type => 'object', properties => { query => { type => 'string', description => 'Symbol name or term to explore' } }, required => ['query'] } },
@@ -60,6 +64,16 @@ my @TOOLS = (
       inputSchema => { type => 'object', properties => { module => { type => 'string', description => 'Focus on one module (optional)' } } } },
     { name => 'pcg_cycles', handler => 'cycles', description => 'Circular module dependencies -- cycles in the import/inheritance graph.',
       inputSchema => { type => 'object', properties => {} } },
+    { name => 'pcg_overview', handler => 'overview', description => 'A codebase orientation map for first contact with an unfamiliar project, in one call: scale (files/packages/subs/edges + unresolved + provenance mix), web-route count, entry-point scripts (.pl/.psgi), the top namespaces by sub count, the most central symbols (highest fan-in -- change with care), and the most-subclassed classes. The best first call when landing in a repo.',
+      inputSchema => { type => 'object', properties => { limit => { type => 'integer', description => 'Top N per list (default 12)' } } } },
+    { name => 'pcg_sinks', handler => 'sinks', description => 'Security attack surface: command-execution (system/exec/syscall) and SQL-execution (DBI do/execute/select*) call sites, and -- for a web app -- which routes/endpoints can transitively REACH each sink (route handler -> call closure). Heuristic by call name (a placeholdered DBI call is safe), so a reached sink is a site to VERIFY for tainted/request-derived input, not a confirmed bug.',
+      inputSchema => { type => 'object', properties => {} } },
+    { name => 'pcg_rename', handler => 'rename', description => 'Rename a function/method to a new name within its OWN package, using the graph to locate every reference precisely and the resolver to decide which call sites actually target it (a same-named method on a different class is left alone). Returns the edit plan; set apply=true to write the files. Dynamic `$obj->method` dispatch of the same name that the resolver could not tie to this symbol is reported for manual review, never silently edited. Call pcg_sync after apply. (Sync first if you have unsaved edits.)',
+      inputSchema => { type => 'object', properties => {
+          old   => { type => 'string',  description => 'Symbol to rename: Pkg::sub, or a unique bare name' },
+          new   => { type => 'string',  description => 'The new (short) name' },
+          apply => { type => 'boolean', description => 'Write the edits to disk (default false = dry-run plan)' },
+      }, required => ['old', 'new'] } },
     { name => 'pcg_hotspots', handler => 'hotspots', description => 'Call-graph hotspots, four lists: the most depended-upon symbols (fan-in, each with its transitive blast radius -- change with care), the symbols that make the most calls (fan-out), the most cyclomatically-complex symbols, and the most efferently-coupled modules. Good for review/refactor triage.',
       inputSchema => { type => 'object', properties => { limit => { type => 'integer', description => 'Top N per list (default 15)' } } } },
     { name => 'pcg_risk', handler => 'risk', description => 'History-aware risk: symbols ranked by git churn (commits touching their file) x fan-in (how many depend on them). Frequently-changed AND widely-depended-upon code is the top refactor/test target. With `since`, count only churn from commits since that ref (risk on the current branch). Needs a git work tree.',
@@ -75,7 +89,7 @@ my @TOOLS = (
       } } },
     { name => 'pcg_diff', handler => 'diff', description => 'Structural ("semantic") diff vs a git ref: which functions/methods/constants/packages/classes were added, removed, or had their signature change between <ref> and the working tree -- with breaking changes (removed or re-signatured PUBLIC API) flagged. Ideal for reviewing a branch or PR. Needs a git work tree.',
       inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to compare against (e.g. main, HEAD~3)' } }, required => ['ref'] } },
-    { name => 'pcg_review', handler => 'review', description => 'Review a branch/PR in one call: the structural diff vs a git ref (added/removed/re-signatured symbols, breaking PUBLIC API flagged), the blast radius (count of files affected by the change), the tests to run, and -- for each breaking symbol -- how many callers still reference it. Composes the structural diff with the affected-files closure. Needs a git work tree and an index.',
+    { name => 'pcg_review', handler => 'review', description => 'Review a branch/PR in one call: the structural diff vs a git ref (added/removed/re-signatured symbols, breaking PUBLIC API flagged), the blast radius (count of files affected by the change), the tests to run, and -- for each breaking symbol -- how many callers still reference it. Plus graph-derived findings: untested public changes (no test reaches them) and wide-blast-radius changes (a touched public symbol many things still call). Composes the structural diff with the affected-files closure. Needs a git work tree and an index.',
       inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to review against (e.g. main, HEAD~3)' } }, required => ['ref'] } },
     { name => 'pcg_api', handler => 'api', description => "A module's public surface: its exported and public (non-_) functions/methods/constants.",
       inputSchema => { type => 'object', properties => { module => { type => 'string', description => 'Module name' } }, required => ['module'] } },
@@ -105,8 +119,9 @@ my @TOOLS = (
       inputSchema => { type => 'object', properties => {
           runtime => { type => 'boolean', description => 'Also run runtime enrichment -- executes the project code; default false' },
           deps    => { type => 'boolean', description => 'Also index used CPAN modules\' public API from @INC (no code run); default false' },
+          embed   => { type => 'boolean', description => 'Also compute semantic-search embeddings (needs a local provider: PCG_EMBED_CMD or Ollama); default false' },
       } } },
-    { name => 'pcg_sync', handler => 'sync', description => 'Incrementally refresh the graph after you edit files (re-resolves changed files and their dependents). Call this after changing Perl code so subsequent queries reflect it.',
+    { name => 'pcg_sync', handler => 'sync', description => 'Incrementally refresh the graph after you edit files (re-resolves changed files and their dependents). Call this after changing Perl code so subsequent queries reflect it. (Does not refresh semantic-search embeddings -- re-run pcg_index embed:true to rebuild those.)',
       inputSchema => { type => 'object', properties => {} } },
     { name => 'pcg_status', handler => 'status', description => 'Graph health: node/edge counts and the edge provenance breakdown, or whether the graph has been built yet.',
       inputSchema => { type => 'object', properties => {} } },
@@ -192,9 +207,10 @@ sub _run_tool ($self, $handler, $args) {
         return "No project to index (the server was started without an indexer)." unless $idx;
         my $rt = $args->{runtime} ? 1 : 0;
         my $st = App::PerlGraph::Indexer->new(store => $idx->store, root => $self->base,
-            runtime => $rt, deps => ($args->{deps} ? 1 : 0))->index_all;
+            runtime => $rt, deps => ($args->{deps} ? 1 : 0), embed => ($args->{embed} ? 1 : 0))->index_all;
         return "Indexed $st->{files} files ($st->{reindexed} (re)parsed)"
-            . ($st->{deps} ? " + $st->{deps} CPAN deps" : "") . ($rt ? " + runtime enrichment" : "") . ".";
+            . ($st->{deps} ? " + $st->{deps} CPAN deps" : "") . ($rt ? " + runtime enrichment" : "")
+            . ($st->{embedded} ? " + $st->{embedded} embeddings" : "") . ".";
     }
     if ($handler eq 'sync') {
         return "No project to sync (the server was started without an indexer)." unless $idx;
@@ -211,11 +227,16 @@ sub _run_tool ($self, $handler, $args) {
         unless $self->_indexed || $handler eq 'diff';
     my $q = $self->query;
     my $sym = $args->{symbol} // '';
-    return App::PerlGraph::Format::search($args->{query} // '', [ $q->search($args->{query} // '') ]) if $handler eq 'search';
+    if ($handler eq 'search') {
+        my $query = $args->{query} // '';
+        return $args->{semantic} ? App::PerlGraph::Format::semantic($query, $q->semantic($query))
+                                 : App::PerlGraph::Format::search($query, [ $q->search($query) ]);
+    }
     return App::PerlGraph::Format::callers($sym, [ $q->callers($sym) ]) if $handler eq 'callers';
     return App::PerlGraph::Format::callees($sym, [ $q->callees($sym) ]) if $handler eq 'callees';
     return App::PerlGraph::Format::impact($sym,  [ $q->impact($sym) ])  if $handler eq 'impact';
     return App::PerlGraph::Format::node_view($sym, [ $q->node_view($sym) ], $self->base) if $handler eq 'node';
+    return App::PerlGraph::Format::explain($sym, [ $q->explain($sym) ], $self->base) if $handler eq 'explain';
     return App::PerlGraph::Format::explore($args->{query} // '', [ $q->explore($args->{query} // '') ], $self->base)
         if $handler eq 'explore';
     return App::PerlGraph::Format::unused([ $q->unused(all => $args->{all}) ]) if $handler eq 'unused';
@@ -233,6 +254,14 @@ sub _run_tool ($self, $handler, $args) {
     }
     return App::PerlGraph::Format::deps([ $q->deps($args->{module}) ])             if $handler eq 'deps';
     return App::PerlGraph::Format::cycles([ $q->cycles ])                          if $handler eq 'cycles';
+    return App::PerlGraph::Format::overview($q->overview(defined $args->{limit} ? (limit => $args->{limit}) : ())) if $handler eq 'overview';
+    return App::PerlGraph::Format::sinks($q->sinks) if $handler eq 'sinks';
+    if ($handler eq 'rename') {
+        require App::PerlGraph::Refactor;
+        return App::PerlGraph::Format::rename(
+            App::PerlGraph::Refactor->new(store => $q->store, root => $self->base)
+                ->rename($args->{old} // '', $args->{new} // '', ($args->{apply} ? (apply => 1) : ())));
+    }
     return App::PerlGraph::Format::hotspots($q->hotspots(defined $args->{limit} ? (limit => $args->{limit}) : ())) if $handler eq 'hotspots';
     if ($handler eq 'diff' || $handler eq 'review') {
         require App::PerlGraph::Git; require App::PerlGraph::Diff; require App::PerlGraph::Parser;

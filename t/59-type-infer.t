@@ -66,4 +66,23 @@ my @r = callees($s3, 'App::r');
 ok !(grep { $_->[0] =~ /nope/ } @r),        'an inferred type never fabricates an edge to a method it lacks';
 ok +(grep { $_->[0] eq 'Store::new' } @r), 'the Store->new constructor call itself resolves (sanity)';
 
+# interprocedural: my $x = make(); $x->m -- resolve $x via make()'s inferred return type
+{
+    my $g = graph(<<'PL');
+package Widget;
+sub new { bless {}, shift }
+sub draw { 1 }
+package Other;
+sub draw { 0 }
+package Main;
+sub make { Widget->new }
+sub use_it { my $w = make(); $w->draw }
+PL
+    my @c = callees($g, 'Main::use_it');
+    ok( (grep { $_->[0] eq 'Widget::draw' && $_->[1] eq 'inferred' } @c),
+        'my $x = make(); $x->draw resolves to Widget::draw (inferred) via make()s return type' );
+    ok !(grep { $_->[0] eq 'Other::draw' } @c),
+        '... and not the globally-ambiguous Other::draw -- only the producer return type matches';
+}
+
 done_testing;

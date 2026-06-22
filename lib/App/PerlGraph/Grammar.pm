@@ -1,6 +1,6 @@
 package App::PerlGraph::Grammar;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Exporter 'import';
 
 # Node-type names — verified against tree-sitter-perl v1.1.2 (see docs/grammar-ground-truth.md).
@@ -8,6 +8,7 @@ use constant {
     NODE_ROOT           => 'source_file',
     NODE_PACKAGE        => 'package_statement',
     NODE_CLASS          => 'class_statement',          # native `class NAME {...}` (perl 5.38+ / Object::Pad)
+    NODE_ROLE           => 'role_statement',           # Object::Pad `role NAME {...}` (class-like; methods compose in)
     NODE_SUB            => 'subroutine_declaration_statement',
     NODE_METHOD_DECL    => 'method_declaration_statement',
     NODE_USE            => 'use_statement',
@@ -61,7 +62,7 @@ use constant CALL_TYPES => [qw(
 )];
 
 our @EXPORT_OK = qw(
-    NODE_ROOT NODE_PACKAGE NODE_CLASS NODE_SUB NODE_METHOD_DECL NODE_USE NODE_REQUIRE
+    NODE_ROOT NODE_PACKAGE NODE_CLASS NODE_ROLE NODE_SUB NODE_METHOD_DECL NODE_USE NODE_REQUIRE
     NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_ASSIGN
     NODE_VAR_DECL NODE_FIELD NODE_QW NODE_BLOCK NODE_EXPR_STMT
     NODE_PACKAGE_NAME NODE_BAREWORD NODE_FUNCTION NODE_METHOD NODE_VARNAME NODE_STRING_CONTENT

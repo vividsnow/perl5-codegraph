@@ -1,10 +1,11 @@
 package App::PerlGraph::Diff;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
 use Path::Tiny qw(path);
 use App::PerlGraph::Git;
 use App::PerlGraph::Extractor;
+use App::PerlGraph::Model qw(is_public);
 
 # Structural ("semantic") diff between a git ref and the working tree: which
 # symbols were added, removed, or had their signature change -- and whether any
@@ -17,7 +18,6 @@ has ref    => (is => 'ro', required => 1);   # the git ref to compare against (e
 has parser => (is => 'ro', required => 1);   # an App::PerlGraph::Parser
 
 my $KINDS = qr/\A(?:function|method|constant|package|class)\z/;
-sub _public ($n) { $n->{is_exported} || ($n->{visibility} // '') ne 'private' }
 
 sub diff ($self) {
     my $git = App::PerlGraph::Git->new(root => $self->root);
@@ -30,10 +30,10 @@ sub diff ($self) {
         push @added, $new{$_} for grep { !exists $old{$_} } keys %new;
         for my $q (keys %old) {
             if (!exists $new{$q}) {
-                push @removed, { %{ $old{$q} }, _breaking => _public($old{$q}) };
+                push @removed, { %{ $old{$q} }, _breaking => is_public($old{$q}) };
             }
             elsif (($old{$q}{signature} // '') ne ($new{$q}{signature} // '')) {
-                push @changed, { old => $old{$q}, new => $new{$q}, _breaking => _public($new{$q}) };
+                push @changed, { old => $old{$q}, new => $new{$q}, _breaking => is_public($new{$q}) };
             }
         }
     }

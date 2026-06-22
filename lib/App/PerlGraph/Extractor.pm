@@ -1,8 +1,8 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
-use App::PerlGraph::Model qw(node_id qualify);
+use App::PerlGraph::Model qw(node_id qualify sink_type);
 use App::PerlGraph::Grammar qw(:all);
 use App::PerlGraph::Pod;
 no warnings 'recursion';   # deep but bounded CST walks (after Moo re-enables warnings)
@@ -70,9 +70,11 @@ sub _edge ($self, $src, $tgt, $kind, %extra) {
 sub _walk ($self, $node, $cur_sub) {
     for my $child (@{ $node->{children} }) {
         my $t = $child->{type};
-        if ($t eq NODE_PACKAGE || $t eq NODE_CLASS) {
+        if ($t eq NODE_PACKAGE || $t eq NODE_CLASS || $t eq NODE_ROLE) {
             my $prev = $self->{_pkg};
-            $self->{_pkg} = $t eq NODE_CLASS ? $self->_handle_class($child) : $self->_handle_package($child);
+            # native `class` and Object::Pad `role` both scope methods/fields like a
+            # package and compose via :isa/:does -- handle both as a class-like container.
+            $self->{_pkg} = ($t eq NODE_CLASS || $t eq NODE_ROLE) ? $self->_handle_class($child) : $self->_handle_package($child);
             $self->_walk($child, $cur_sub);
             # Block form `package NAME { ... }` / `class NAME { ... }` scopes to its
             # block -> restore the outer package after it. Statement form has no
@@ -438,12 +440,25 @@ sub _constructor_class ($self, $node) {
     return $c =~ /\A\w+(?:::\w+)*\z/ ? $c : undef;              # a literal class, not a $var/expr
 }
 
+# The function name of a bareword-call expression `foo(...)` (a deferred type: $x's
+# class is foo's return type, resolved interprocedurally), or undef.
+sub _call_name ($self, $node) {
+    return undef unless $node && ($node->{type} // '') eq NODE_CALL;
+    my $fn = $node->{fields}{ +F_FUNCTION } or return undef;
+    my $name = $fn->{text} // '';
+    return $name =~ /\A\w+(?:::\w+)*\z/ ? $name : undef;
+}
+
 sub _infer_var_type ($self, $left, $right) {
-    my $cls = $self->_constructor_class($right) or return;
     my @scalars = $self->_descendants($left, 'scalar');
     return unless @scalars == 1;                                 # a single `my $x` (skip `my ($a,$b)` / arrays)
     my $vn = $self->_find_descendant($scalars[0], NODE_VARNAME) or return;
-    ($self->{_vartype} //= {})->{ '$' . $vn->{text} } = $cls;
+    if (my $cls = $self->_constructor_class($right)) {          # my $x = Class->new -> $x : Class
+        ($self->{_vartype} //= {})->{ '$' . $vn->{text} } = $cls;
+    }
+    elsif (my $fn = $self->_call_name($right)) {                # my $x = foo() -> $x : (return type of foo)
+        ($self->{_vartype} //= {})->{ '$' . $vn->{text} } = { call => $fn };
+    }
 }
 
 # The return type of a sub when it's a `Class->new` builder: the class of every
@@ -695,6 +710,8 @@ sub _handle_call ($self, $n, $cur_sub) {
         reference_name => $name, reference_kind => 'call',
         line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
     };
+    $self->_edge($self->_from_id($cur_sub), undef, 'sink', metadata => { sink => $_, name => $name })
+        for grep { defined } sink_type($name, 0);   # command-execution sink
 }
 
 # \&name -> a code reference. Record it as a `references` ref so callback-wired
@@ -720,8 +737,9 @@ sub _handle_method_call ($self, $n, $cur_sub) {
     my $recv = $inv ? $inv->{text} : undef;
     my %cand;
     $cand{receiver}      = $recv if defined $recv;
-    my $rtype = defined $recv ? ($self->{_vartype} // {})->{$recv} : undef;   # inferred via `my $recv = Class->new`
-    $cand{receiver_type} = $rtype if $rtype;
+    my $rtype = defined $recv ? ($self->{_vartype} // {})->{$recv} : undef;   # inferred via `my $recv = ...`
+    if    (ref $rtype eq 'HASH' && $rtype->{call}) { $cand{receiver_call} = $rtype->{call} }   # my $recv = foo()
+    elsif ($rtype)                                 { $cand{receiver_type} = $rtype }            # my $recv = Class->new
     # chained `BASE->attr->method`: type the inner BASE so the resolver can read
     # the intermediate accessor's declared return type (`has attr => isa => ...`).
     if ($inv && $inv->{type} eq NODE_METHOD_CALL) {
@@ -749,6 +767,8 @@ sub _handle_method_call ($self, $n, $cur_sub) {
         line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
         candidates => (%cand ? \%cand : undef),
     };
+    $self->_edge($self->_from_id($cur_sub), undef, 'sink', metadata => { sink => $_, name => $meth })
+        for grep { defined } sink_type($meth, 1);   # SQL-execution sink
 }
 
 sub _postprocess ($self) {

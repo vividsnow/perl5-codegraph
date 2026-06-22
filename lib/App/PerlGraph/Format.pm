@@ -1,6 +1,6 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use App::PerlGraph::Source;
 use App::PerlGraph::Model qw(package_of);
 use Cpanel::JSON::XS ();
@@ -55,6 +55,36 @@ sub explore ($query, $views, $base = '') {
     return "## Explore: $query\n\n" . join("\n", map { _view($_, $base) } @$views);
 }
 
+sub explain ($symbol, $dossiers, $base = '') {
+    return "## Explain: $symbol\n\n_not found_\n" unless @$dossiers;
+    my $out = "## Explain: $symbol\n\n";
+    for my $d (@$dossiers) {
+        $out .= _view($d, $base);                                  # def + source + callers + callees
+        $out .= sprintf "- blast radius: %d transitive caller(s)\n", $d->{impact};
+        $out .= @{ $d->{tests} }
+            ? "- covered by: " . join(', ', map { "`$_`" } @{ $d->{tests} }) . "\n"
+            : "- covered by: _no test statically reaches it_\n";
+        $out .= "\n";
+    }
+    return $out;
+}
+
+sub semantic ($query, $r) {
+    my $out = "## Semantic search: $query\n\n";
+    if (my $e = $r->{error} // '') {
+        return $out . ($e eq 'no_embeddings'
+            ? "_no embeddings yet_ -- run `pcg index --embed` (needs a local provider: set PCG_EMBED_CMD or run Ollama). Use `pcg search` for keyword search meanwhile.\n"
+            : "_embedding provider unavailable_ -- set PCG_EMBED_CMD or start a local Ollama to embed the query; use `pcg search` for keyword search meanwhile.\n");
+    }
+    my $res = $r->{results} // [];
+    return $out . "_no matches_\n" unless @$res;
+    $out .= join '', map {
+        sprintf "- `%s` (%s) -- %s -- score %.2f\n",
+            $_->{qualified_name} // $_->{name}, $_->{kind}, _loc($_), $_->{_score} // 0
+    } @$res;
+    return $out;
+}
+
 sub unused ($nodes) {
     my $out = "## Unreferenced symbols (no static callers)\n\n";
     return $out . "_none_\n" unless @$nodes;
@@ -94,6 +124,15 @@ sub review ($r) {
     $out .= @{ $r->{tests} }
         ? "### Tests to run (" . scalar(@{ $r->{tests} }) . ")\n\n" . join('', map { "- `$_`\n" } @{ $r->{tests} }) . "\n"
         : "### Tests to run\n\n_none statically reach the changed files_\n\n";
+    my $f = $r->{findings} // {};
+    if (@{ $f->{wide} // [] } || @{ $f->{untested} // [] }) {
+        $out .= "### Findings\n\n";
+        $out .= sprintf "- wide blast radius: `%s` has %d caller(s) -- change with care\n",
+            $_->{qualified_name}, ($_->{_callers} // 0) for @{ $f->{wide} };
+        $out .= sprintf "- untested change: `%s` -- no test statically reaches it; add coverage\n",
+            $_->{qualified_name} for @{ $f->{untested} };
+        $out .= "\n";
+    }
     return $out . diff($d, $r->{ref});   # the full structural diff
 }
 
@@ -266,6 +305,81 @@ sub cycles ($cycles) {
     my $out = "## Circular module dependencies\n\n";
     return $out . "_none found_\n" unless @$cycles;
     $out .= '- ' . join(' -> ', map { "`$_`" } @$_, $_->[0]) . "\n" for @$cycles;
+    return $out;
+}
+
+sub rename ($r) {
+    return "## Rename\n\n**error**: $r->{error}\n" if $r->{error};
+    my $out = "## Rename `$r->{old}` -> `$r->{new}`\n\n";
+    my $files = scalar @{ $r->{files} };
+    if ($r->{applied}) {
+        $out .= "Applied **$r->{applied}** edit(s) across $files file(s). Run `pcg sync` to refresh the graph.\n\n";
+    }
+    else {
+        $out .= scalar(@{ $r->{edits} }) . " edit(s) planned across $files file(s) (dry run -- add `--apply` / apply:true to write):\n";
+        my %byf; push @{ $byf{ $_->{file} } }, $_ for @{ $r->{edits} };
+        for my $f (sort keys %byf) {
+            $out .= "- `$f`\n";
+            $out .= sprintf "    L%d  %s`%s` -> `%s`\n", $_->{line}, ($_->{def} ? 'definition ' : ''), $_->{old}, $_->{new}
+                for sort { $a->{line} <=> $b->{line} } @{ $byf{$f} };
+        }
+        $out .= "\n";
+    }
+    if (@{ $r->{frontier} }) {
+        $out .= "**Manual review** -- " . scalar(@{ $r->{frontier} })
+              . " dynamic `\$obj->method` call(s) of the same name the resolver could NOT tie to this symbol"
+              . " (they may or may not be it):\n";
+        $out .= sprintf "- `%s` L%d  (receiver `%s`)\n", $_->{file}, $_->{line}, $_->{receiver} // '?'
+            for @{ $r->{frontier} };
+    }
+    return $out;
+}
+
+sub sinks ($r) {
+    my $out = "## Security sinks -- command / SQL execution\n\n";
+    return $out . "_none found_ (no system/exec or DBI do/execute/select* calls)\n" unless @{ $r->{sites} };
+    if (@{ $r->{reachable} }) {
+        $out .= "### Reachable from an endpoint (attack surface -- verify no tainted input / use placeholders)\n\n";
+        for my $e (@{ $r->{reachable} }) {
+            $out .= sprintf "- **%s** -> %s\n", $e->{route}{name},
+                join('; ', map { "$_->{type} `$_->{name}` in `$_->{sub}`" } @{ $e->{sinks} });
+        }
+        $out .= "\n";
+    }
+    $out .= "### All sink sites (" . scalar(@{ $r->{sites} }) . ")\n\n";
+    $out .= sprintf "- `%s` -- %s\n", $_->{sub},
+        join(', ', map { "$_->{type}:$_->{name}" } @{ $_->{sinks} }) for @{ $r->{sites} };
+    $out .= "\n(heuristic by call name -- a placeholdered DBI call is safe; these are sites to VERIFY, not confirmed bugs)\n";
+    return $out;
+}
+
+sub overview ($o) {
+    my $k = $o->{kinds};
+    my $subs = ($k->{function} // 0) + ($k->{method} // 0);
+    my $out  = "## Codebase map\n\n";
+    $out .= sprintf "**Scale**: %d files, %d packages/classes, %d subs (%d func, %d method), %d edges; %d unresolved\n",
+        ($k->{file} // 0), ($k->{package} // 0) + ($k->{class} // 0), $subs,
+        ($k->{function} // 0), ($k->{method} // 0), $o->{edges}, $o->{unresolved};
+    $out .= "**Edges by provenance**: " . join(', ', map { "$_->[0]=$_->[1]" } @{ $o->{prov} }) . "\n\n"
+        if @{ $o->{prov} };
+    $out .= "**Web routes**: $o->{routes}\n\n" if $o->{routes};
+
+    if (@{ $o->{scripts} }) {
+        my @s = @{ $o->{scripts} }; @s = (@s[0 .. 14], '...') if @s > 15;
+        $out .= "**Entry-point scripts**:\n" . join('', map { "- `$_`\n" } @s) . "\n";
+    }
+    if (@{ $o->{namespaces} }) {
+        $out .= "**Top namespaces** (by sub count):\n"
+              . join('', map { sprintf "- `%s` -- %d subs\n", $_->{ns}, $_->{subs} } @{ $o->{namespaces} }) . "\n";
+    }
+    if (@{ $o->{central} }) {
+        $out .= "**Most central** (highest fan-in -- change with care):\n"
+              . join('', map { sprintf "- `%s` -- %d callers\n", $_->{node}{qualified_name} // $_->{node}{name}, $_->{callers} } @{ $o->{central} }) . "\n";
+    }
+    if (@{ $o->{inherited} }) {
+        $out .= "**Most-subclassed**:\n"
+              . join('', map { sprintf "- `%s` -- %d subclass(es)\n", $_->{node}{qualified_name} // $_->{node}{name}, $_->{subclasses} } @{ $o->{inherited} });
+    }
     return $out;
 }
 

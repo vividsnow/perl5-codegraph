@@ -85,4 +85,22 @@ ok( (grep { $_->{kind} eq 'implements' && (($_->{metadata}||{})->{name}//'') eq 
         '$self->step() in a class method resolves to the sibling method (MRO works)' );
 }
 
+# --- Object::Pad `role`: methods scope to the role and compose into a :does class ---
+{
+    my $store = App::PerlGraph::Store->new(path => ':memory:'); $store->init;
+    my $out = extract("role Greet { method hello { 1 } }\nclass Person :does(Greet) { method run { \$self->hello } }\n", 'R.pm');
+    $store->insert_node($_)       for @{ $out->{nodes} };
+    $store->insert_edge($_)       for @{ $out->{edges} };
+    $store->insert_unresolved($_) for @{ $out->{refs} };
+    App::PerlGraph::Resolver->new(store => $store)->resolve_all;
+    my %q = by_q($out);
+    ok  $q{'Greet::hello'}, 'role method scopes to the role (not leaked to the file/main)';
+    ok !$q{'main::hello'},  '... and does NOT leak to main';
+    my ($run) = $store->nodes_by_qname('Person::run');
+    my @callees = map { $store->node($_->{target})->{qualified_name} }
+                  grep { $_->{target} } $store->outgoing_edges($run->{id}, 'calls');
+    ok( (grep { $_ eq 'Greet::hello' } @callees),
+        'class :does(Role): $self->method composes the role method via the MRO' );
+}
+
 done_testing;

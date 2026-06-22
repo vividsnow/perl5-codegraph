@@ -1,6 +1,6 @@
 package App::PerlGraph::Schema;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Exporter 'import';
 our @EXPORT_OK = qw(DDL);
 
@@ -40,6 +40,9 @@ create table if not exists resolutions (
 );
 create virtual table if not exists nodes_fts using fts5(
   id unindexed, name, qualified_name, docstring, tokenize='unicode61'
+);
+create table if not exists embeddings (
+  node_id text primary key, dim integer not null, vec blob not null
 );
 SQL
 1;

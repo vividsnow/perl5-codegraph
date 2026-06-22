@@ -1,17 +1,17 @@
 package App::PerlGraph::Model;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Exporter 'import';
 use Digest::SHA qw(sha1_hex);
 
 our @EXPORT_OK = qw(
-    node_id package_of qualify is_builtin is_external is_universal
+    node_id package_of qualify is_builtin is_external is_universal is_public sink_type
     NODE_KINDS EDGE_KINDS PROVENANCE
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 
 use constant NODE_KINDS => [qw(file package class function method field constant route)];
-use constant EDGE_KINDS => [qw(contains calls references imports extends implements overrides)];
+use constant EDGE_KINDS => [qw(contains calls references imports extends implements overrides sink)];
 use constant PROVENANCE => [qw(static inferred symtab optree mop xs framework heuristic llm)];
 
 my %BUILTIN = map { $_ => 1 } qw(
@@ -33,10 +33,27 @@ my %BUILTIN = map { $_ => 1 } qw(
 
 sub is_builtin ($name) { $BUILTIN{$name} ? 1 : 0 }
 
+# Security "sinks" -- calls where a tainted (e.g. request-derived) value is dangerous.
+# Command execution is a bareword call (system "...$x..."); SQL execution is a DBI-style
+# method call ($dbh->do("...$x...")). Heuristic by name: a placeholdered ->execute is
+# safe, so a reached sink is a site to VERIFY, not a confirmed bug.
+my %SINK_CMD = map { $_ => 1 } qw(system exec syscall);
+my %SINK_SQL = map { $_ => 1 } qw(do execute selectall_arrayref selectall_hashref
+                                  selectrow_array selectrow_arrayref selectrow_hashref selectcol_arrayref);
+sub sink_type ($name, $is_method) {
+    return 'command' if !$is_method && $SINK_CMD{$name};
+    return 'sql'     if  $is_method && $SINK_SQL{$name};
+    return undef;
+}
+
 # UNIVERSAL methods every object answers. An unresolved $obj->can/isa/... is core
 # noise, not a project method gap -- the resolver consumes it like a builtin.
 my %UNIVERSAL = map { $_ => 1 } qw(can isa DOES VERSION);
 sub is_universal ($name) { $UNIVERSAL{$name} ? 1 : 0 }
+
+# A node is "public" API if it's exported or not explicitly private (_-prefixed subs
+# get visibility 'private'). The single source of truth for diff/review/api surfaces.
+sub is_public ($node) { $node->{is_exported} || (($node->{visibility} // '') ne 'private') }
 
 # Well-known CPAN exports + qualified-call prefixes that are almost never project
 # symbols -- so a bareword/qualified call that doesn't resolve to a project node
@@ -93,7 +110,8 @@ App::PerlGraph::Model - node identity and name helpers
 =head1 DESCRIPTION
 
 Pure helpers shared across the graph: C<node_id>, C<qualify>, C<package_of>,
-C<is_builtin>, C<is_external>, C<is_universal>, and the C<NODE_KINDS>/C<EDGE_KINDS>/C<PROVENANCE> vocabularies.
+C<is_builtin>, C<is_external>, C<is_universal>, C<is_public>, C<sink_type>, and the
+C<NODE_KINDS>/C<EDGE_KINDS>/C<PROVENANCE> vocabularies.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
 C<pcg> command for the public interface.

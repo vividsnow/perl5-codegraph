@@ -1,8 +1,8 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
-use App::PerlGraph::Model qw(package_of);
+use App::PerlGraph::Model qw(package_of is_public);
 
 # Read-only graph queries over a Store. Symbols may be bare names ('run') or
 # qualified ('Foo::run').
@@ -14,6 +14,24 @@ sub _defs ($self, $symbol) {
 }
 
 sub search ($self, $query, $limit = 50) { $self->store->search($query, $limit) }
+
+# Semantic search: rank symbols by embedding similarity to the query (meaning, not
+# keyword). Needs embeddings (`pcg index --embed`) and a local provider to embed the
+# query. Returns { results => [nodes+_score] } or { error => ... } so the caller can
+# explain the missing piece and fall back to keyword search.
+sub semantic ($self, $query, $limit = 20) {
+    require App::PerlGraph::Embed;
+    my $s = $self->store;
+    my %emb = $s->all_embeddings;
+    return { error => 'no_embeddings' } unless %emb;          # never ran `index --embed`
+    my $qv = App::PerlGraph::Embed->embed([$query]);
+    return { error => 'no_provider' } unless $qv && @$qv;     # can't embed the query right now
+    $qv = $qv->[0];
+    my @ranked = sort { $b->{score} <=> $a->{score} || $a->{id} cmp $b->{id} }   # id tie-break -> reproducible across runs/platforms
+                 map  { +{ id => $_, score => App::PerlGraph::Embed::dot($qv, $emb{$_}) } } keys %emb;
+    @ranked = @ranked[0 .. $limit - 1] if @ranked > $limit;
+    return { results => [ map { my $n = $s->node($_->{id}); $n ? { %$n, _score => $_->{score} } : () } @ranked ] };
+}
 
 sub callees ($self, $symbol) {
     my $s = $self->store;
@@ -253,6 +271,89 @@ sub hotspots ($self, %opt) {
     };
 }
 
+# Security sinks (command / SQL execution) and which web endpoints can reach them.
+# A route's handler -> forward call closure; any reached sub with a sink edge is on
+# that endpoint's attack surface. Heuristic by call name -- a placeholdered DBI call
+# is safe -- so a hit is a site to VERIFY, not a confirmed bug.
+sub sinks ($self, %opt) {
+    my $s = $self->store;
+    my %by_sub;   # sub id -> { "type:name" => {type,name} }
+    for my $e ($s->edges_of_kind('sink')) {
+        next unless defined $e->{source};
+        my $m = $e->{metadata} // {};
+        $by_sub{ $e->{source} }{ "$m->{sink}:$m->{name}" } //= { type => $m->{sink} // '?', name => $m->{name} // '?' };
+    }
+    my @sites = map { my $n = $s->node($_); $n ? { sub => $n->{qualified_name} // $n->{name} // '?',
+                                                   sinks => [ values %{ $by_sub{$_} } ] } : () }
+                sort keys %by_sub;
+
+    my @reachable;
+    for my $route ($s->all_nodes('route')) {
+        my ($he) = grep { (($_->{metadata} // {})->{via} // '') eq 'route' } $s->outgoing_edges($route->{id}, 'references');
+        next unless $he && $he->{target};
+        my %seen = ($he->{target} => 1); my @q = ($he->{target}); my @hit; my $depth = 40;
+        while (@q && $depth-- > 0) {
+            my @next;
+            for my $id (@q) {
+                if ($by_sub{$id}) {
+                    my $n = $s->node($id);
+                    push @hit, map { { %$_, sub => ($n->{qualified_name} // $n->{name} // '?') } } values %{ $by_sub{$id} };
+                }
+                for my $e ($s->outgoing_edges($id, 'calls', 'references')) {
+                    push @next, $e->{target} if $e->{target} && !$seen{ $e->{target} }++;
+                }
+            }
+            @q = @next;
+        }
+        push @reachable, { route => $route, sinks => \@hit } if @hit;
+    }
+    return { reachable => \@reachable, sites => \@sites };
+}
+
+# A codebase orientation map for first contact with an unfamiliar project: scale,
+# frameworks, entry-point scripts, the most central symbols (highest fan-in), the
+# namespace breakdown, and the most-subclassed classes -- one call for "the lay of
+# the land", composed from the centrality data the graph already holds.
+sub overview ($self, %opt) {
+    my $s = $self->store;
+    my $limit = $opt{limit} // 12;
+    my %kinds = $s->kind_counts;
+    my ($edges)      = $s->dbh->selectrow_array('select count(*) from edges');
+    my ($unresolved) = $s->dbh->selectrow_array('select count(*) from unresolved_refs');
+    my $prov = $s->dbh->selectall_arrayref('select provenance, count(*) c from edges group by provenance order by c desc');
+
+    my @scripts = sort grep { defined && /\.(?:pl|psgi)\z/ }        # executable entry points
+        map { $_->{file_path} } $s->all_nodes('file');             # from file nodes (same source as the file count)
+
+    my @central;                                                    # most depended-upon symbols
+    for my $r ($s->top_fan_in($limit * 3)) {
+        my $n = $s->node($r->{id}) or next;
+        next unless ($n->{kind} // '') =~ /\A(?:function|method|constant)\z/;
+        push @central, { node => $n, callers => $r->{n} };
+        last if @central >= $limit;
+    }
+
+    my %ns;                                                         # subs grouped by top-2 namespace levels
+    for my $q ($s->qnames_of('function', 'method')) {
+        my @p = split /::/, $q;
+        next unless @p >= 2;                                        # qname is Package::sub
+        pop @p;                                                     # drop the sub -> the package
+        $ns{ @p >= 2 ? "$p[0]::$p[1]" : $p[0] }++;
+    }
+    my @ns_top = (sort { $ns{$b} <=> $ns{$a} || $a cmp $b } keys %ns)[0 .. $limit - 1];
+    my @namespaces = map { { ns => $_, subs => $ns{$_} } } grep { defined } @ns_top;
+
+    my @inherited;                                                  # most-subclassed classes
+    for my $r ($s->most_subclassed($limit)) {
+        my $n = $s->node($r->{id}) or next;
+        push @inherited, { node => $n, subclasses => $r->{n} };
+    }
+
+    return { kinds => \%kinds, edges => $edges, unresolved => $unresolved, prov => $prov,
+             routes => ($kinds{route} // 0), scripts => \@scripts,
+             central => \@central, namespaces => \@namespaces, inherited => \@inherited };
+}
+
 # LSP go-to-definition: the definition(s) a call/reference at $file line $line
 # resolves to -- including through dynamic dispatch the resolver tied down.
 sub definition_at ($self, $file, $line) {
@@ -433,7 +534,7 @@ sub api ($self, $module) {
         for my $e ($s->outgoing_edges($pkg->{id}, 'contains')) {
             my $n = $s->node($e->{target}) or next;
             next unless ($n->{kind} // '') =~ /function|method|constant/;
-            next unless $n->{is_exported} || ($n->{visibility} // '') ne 'private';
+            next unless is_public($n);
             push @out, $n;
         }
     }
@@ -560,6 +661,20 @@ sub resolve ($self, $resolutions) {
 }
 
 sub node_view ($self, $symbol) { map { $self->_view($_) } $self->_defs($symbol) }
+
+# A one-call dossier: the node view (source + immediate callers/callees) plus its
+# transitive blast radius and covering tests -- everything about a symbol at once.
+sub explain ($self, $symbol) {
+    my @out;
+    for my $node ($self->_defs($symbol)) {
+        my $v  = $self->_view($node);          # { node, callers, callees }
+        my $qn = $node->{qualified_name} // $node->{name};
+        $v->{impact} = defined $qn ? scalar($self->impact($qn, 50)) : 0;
+        $v->{tests}  = [ defined $qn ? $self->covers($qn) : () ];
+        push @out, $v;
+    }
+    return @out;
+}
 # explore omits whole-file nodes so it never dumps an entire file.
 sub explore ($self, $query, $max = 8) {
     map { $self->_view($_) } grep { ($_->{kind} // '') ne 'file' } $self->search($query, $max);

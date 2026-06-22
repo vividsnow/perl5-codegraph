@@ -1,6 +1,6 @@
 package App::PerlGraph::Installer;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);
@@ -47,17 +47,27 @@ routes/helpers, XSUBs), not text matches.
 - **pcg_status** reports graph health and how much is resolved.
 
 ## Pick the right tool
-- Orient on an area -> **pcg_explore** `<symbol-or-term>` (symbols + source + immediate
+- Land in an unfamiliar repo -> **pcg_overview** (scale, frameworks, entry-point scripts,
+  the most central symbols, top namespaces, most-subclassed classes -- the lay of the land
+  in one call).
+- Orient on a specific area -> **pcg_explore** `<symbol-or-term>` (symbols + source + immediate
   callers/callees in one call -- the best first stop; beats grep).
+- Everything about ONE symbol in one call (definition + source + callers/callees + transitive
+  blast radius + covering tests) -> **pcg_explain** `<symbol>` (saves separate node/impact/covers calls).
+- Find code by MEANING, not name ("where do we validate user input") -> **pcg_search** `semantic:true`
+  (needs `pcg_index embed:true` + a local embedding provider; if absent it says so -- use keyword search).
 - Who calls X / what X calls -> **pcg_callers** / **pcg_callees**.
 - Blast radius of changing X -> **pcg_impact**.  How A reaches B -> **pcg_path**.
 - A module's public surface -> **pcg_api**.  Deps / cycles -> **pcg_deps** / **pcg_cycles**.
 - Where's the risk/complexity (fan-in + blast radius / fan-out / cyclomatic complexity / module coupling) -> **pcg_hotspots** (review & refactor triage).
 - What's risky to change given git history (churn x fan-in) -> **pcg_risk**.
 - What changes together but has no static link (hidden coupling) -> **pcg_cochange**.
-- Review a branch/PR in one call (diff + blast radius + tests + breaking) -> **pcg_review** `<ref>`. Just the structural diff -> **pcg_diff**.
+- Review a branch/PR in one call (diff + blast radius + tests + breaking + findings) -> **pcg_review** `<ref>`. Just the structural diff -> **pcg_diff**.
+- Security attack surface (command/SQL execution sites + which web endpoints reach them) -> **pcg_sinks** (heuristic -- a reached sink is a site to VERIFY, not a confirmed bug).
 - Which tests exercise X -> **pcg_covers**.  Tests impacted by a diff -> **pcg_affected**.
 - Dead-code candidates -> **pcg_unused**.  Untested public API -> **pcg_untested**.
+- Rename a function/method across the codebase via the graph (the one WRITE tool; edits only the
+  call sites it can tie to the symbol, reports the dynamic ones) -> **pcg_rename** (dry-run unless apply:true; call pcg_sync after).
 
 ## Closing the unresolved frontier (high value)
 Opaque `$obj->method` dispatch that static analysis can't tie to a class (local

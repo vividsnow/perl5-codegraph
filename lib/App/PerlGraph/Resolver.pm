@@ -1,6 +1,6 @@
 package App::PerlGraph::Resolver;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
 use App::PerlGraph::Model qw(package_of qualify is_builtin is_external is_universal);
 
@@ -182,6 +182,13 @@ sub _resolve_method ($self, $ref) {
     my $recv = $cand->{receiver} // '';
     my ($start, $prov);
     if    ($cand->{receiver_type})          { $start = $cand->{receiver_type};    $prov = 'inferred'  }   # my $x = Class->new
+    elsif ($cand->{receiver_call}) {                                                                       # my $x = foo(); $x->m
+        # interprocedural: $x's type is the return type of foo(), so resolve foo and
+        # read its inferred `returns` (a `Class->new` builder).
+        my $fn = $self->_resolve_call({ reference_name => $cand->{receiver_call}, from_node_id => $ref->{from_node_id} });
+        $start = $fn ? ($fn->{metadata} || {})->{returns} : undef;
+        $prov  = 'inferred';
+    }
     elsif ($recv =~ /\A\$(?:self|class)\z/) { $start = $self->_from_package($ref); $prov = 'heuristic' }
     elsif ($recv =~ /\A[\w:]+\z/)           { $start = $recv;                      $prov = 'static'    }
     else                                    { return }   # unknown receiver ($obj, expression, chain)

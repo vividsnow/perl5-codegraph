@@ -1,6 +1,6 @@
 package App::PerlGraph;
 use v5.36;
-our $VERSION = '0.029';
+our $VERSION = '0.037';
 1;
 
 __END__
@@ -14,8 +14,10 @@ App::PerlGraph - a Perl-native code knowledge graph for AI agents
     pcg index .                       # build .pcg/graph.db for a Perl project
     pcg sync                          # incremental update (changed files + dependents)
     pcg watch                         # keep it fresh: re-index on file changes
+    pcg overview                      # codebase map: scale, frameworks, entry points, central symbols
     pcg explore Some::Module          # symbols with source + POD + relationships
     pcg node|search Some::thing       # a symbol's definition / symbol search
+    pcg explain Some::thing           # one-call dossier: source + callers/callees + blast radius + tests
     pcg callers|callees|impact X      # who calls X / what X calls / blast radius
     pcg path Foo::a Bar::z            # shortest call path between two symbols
     pcg unused                        # dead-code candidates (nothing references)
@@ -26,10 +28,14 @@ App::PerlGraph - a Perl-native code knowledge graph for AI agents
     pcg hotspots                      # fan-in / fan-out / complexity / coupling leaders
     pcg risk [--since main]           # git churn x fan-in (--since: churn on the current branch)
     pcg cochange                      # files that change together (logical coupling)
+    pcg sinks                         # command/SQL execution sites + which web endpoints reach them
     pcg diff main                     # structural diff vs a ref (added/removed/changed + breaking)
-    pcg review main                   # PR review: diff + blast radius + tests + breaking
+    pcg review main                   # PR review: diff + blast radius + tests + breaking + findings
+    pcg rename Foo::bar baz [--apply] # graph-driven rename within a package (dry-run by default)
+    pcg search --semantic "intent"    # rank symbols by meaning (needs `index --embed` + a local provider)
     pcg export --format mermaid       # render the graph (dot|mermaid|json)
     pcg index --deps                  # also resolve calls into used CPAN modules (@INC)
+    pcg index --embed                 # also compute semantic-search embeddings (optional local provider)
     pcg index --runtime               # also add runtime introspection (loads code)
     pcg install                       # register the MCP server with Claude Code
     pcg serve  --mcp                  # run the MCP server (stdio JSON-RPC 2.0)

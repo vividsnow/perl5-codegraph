@@ -1,6 +1,6 @@
 package App::PerlGraph::Indexer;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
 use Digest::SHA qw(sha1_hex);
 use Path::Iterator::Rule;
@@ -20,6 +20,7 @@ has root   => (is => 'ro', required => 1);
 has parser  => (is => 'lazy', builder => sub { App::PerlGraph::Parser->new });
 has runtime => (is => 'ro', default => 0);
 has deps    => (is => 'ro', default => 0);   # also index the public API of used CPAN modules (@INC)
+has embed   => (is => 'ro', default => 0);   # also compute semantic-search embeddings (optional local provider)
 has jobs          => (is => 'ro', default => 0);   # 0 = auto-detect; 1 = serial; N = N parse workers
 has max_file_size => (is => 'ro', default => 0);   # bytes; 0 = unlimited (index everything)
 
@@ -30,7 +31,7 @@ our $PERL_RX     = qr/\.(?:pl|pm|t|psgi|pod|xs)$/;
 # Bump when the extractor's output changes (new node/edge kinds, resolution rules)
 # so a `pcg index`/`sync` after an upgrade re-extracts unchanged files instead of
 # trusting their stale graph. Files carry the version they were extracted with.
-use constant EXTRACTION_VERSION => 2;
+use constant EXTRACTION_VERSION => 5;   # 5: interprocedural return-type inference
 
 # The dir-pruning rule shared by file and directory scans: the named IGNORE_DIRS,
 # plus any non-root subdir that is itself a git repo/worktree (its own .git) --
@@ -148,7 +149,43 @@ sub index_all ($self) {
     my $deps = $self->deps ? $self->_index_deps : 0;   # add CPAN API nodes before resolving
     App::PerlGraph::Resolver->new(store => $self->store)->resolve_all;
     $self->_enrich if $self->runtime;
-    return { files => scalar(@files), reindexed => $n, ($deps ? (deps => $deps) : ()) };
+    my $emb = $self->embed ? $self->_embed_all : 0;
+    return { files => scalar(@files), reindexed => $n, ($deps ? (deps => $deps) : ()), ($emb ? (embedded => $emb) : ()) };
+}
+
+# Compute semantic-search embeddings for the named symbols (function/method/package/
+# class/constant) from a short "document" -- the qualified name (its identifier words
+# carry meaning), signature, and docstring. Requires a local provider (App::PerlGraph::
+# Embed); if none is available it warns and skips rather than failing the index. Returns
+# the number of symbols embedded.
+sub _embed_all ($self) {
+    require App::PerlGraph::Embed;
+    unless (App::PerlGraph::Embed->available) {
+        warn "pcg: --embed skipped -- no local embedding provider (set PCG_EMBED_CMD or run Ollama; see docs)\n";
+        return 0;
+    }
+    my $s = $self->store;
+    my @nodes = grep { defined $_->{qualified_name} }
+                map  { $s->all_nodes($_) } qw(function method package class constant);
+    return 0 unless @nodes;
+    my @docs = map { _embed_doc($_) } @nodes;
+    my $total = 0;
+    # batch so a huge codebase doesn't build one giant provider request
+    for (my $i = 0; $i < @nodes; $i += 128) {
+        my $hi   = $i + 127 < $#nodes ? $i + 127 : $#nodes;
+        my $vecs = App::PerlGraph::Embed->embed([ @docs[$i .. $hi] ]);
+        unless ($vecs) { warn "pcg: embedding provider failed mid-run; stored $total so far\n"; last }
+        $s->upsert_embedding($nodes[$i + $_]{id}, $vecs->[$_]) for 0 .. $#$vecs;
+        $total += @$vecs;
+    }
+    $s->prune_embeddings;   # drop embeddings for symbols deleted since last --embed
+    return $total;
+}
+
+sub _embed_doc ($n) {
+    my $doc = join ' ', grep { defined && length } $n->{qualified_name}, $n->{signature}, $n->{docstring};
+    $doc =~ s/\s+/ /g;
+    return $doc;
 }
 
 # --- cross-distribution indexing (--deps) ------------------------------------

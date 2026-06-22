@@ -15,7 +15,7 @@ enrichers (`Devel::Symdump` / `B::` / Moo·Moose MOP) + framework-route
 ```
 tree-sitter-perl (via Text::Treesitter) → normalized tree → extractor
   → SQLite graph (nodes / edges / files + FTS5)
-  → resolver (::-scoping, Exporter, static @ISA / parent / base / Moo·Moose extends / Mojo::Base / with / native class :isa·:does)
+  → resolver (::-scoping, Exporter, static @ISA / parent / base / Moo·Moose extends / Mojo::Base / with / native class + Object::Pad role :isa·:does)
   → query / format / CLI
 ```
 
@@ -50,12 +50,16 @@ The grammar is built into `~/.cache/pcg/tree-sitter-perl` (override with
 pcg index .                       # build .pcg/graph.db (parallel parse; --jobs N to set workers)
 pcg index --deps                  # also index used CPAN modules' public API (@INC, no code run) so calls into deps resolve
                                   #   --max-file-size 1M skips huge generated-data files (e.g. Module::CoreList)
+pcg index --embed                 # also compute semantic-search embeddings (optional LOCAL provider; see below)
 pcg sync                          # incremental update (re-resolves changed files + dependents)
 pcg watch                         # keep it fresh: re-index on every file change (inotify/poll)
                                   #   --json emits a {added,changed,deleted,affected_tests} event per
                                   #   change, for an agent to monitor the stream and react
+pcg overview                      # codebase map: scale, frameworks, entry points, central symbols,
+                                  #   namespaces, most-subclassed (the lay of the land -- a good first stop)
 pcg explore Some::Module          # matching symbols with source + POD docs + relationships (one call)
 pcg node    Some::Module::thing   # a symbol's source + callers/callees
+pcg explain Some::Module::thing   # full dossier: source + callers/callees + blast radius + covering tests
 pcg callers Some::Module::thing
 pcg callees Some::Module::thing
 pcg impact  Some::Module::thing   # blast radius (transitive callers)
@@ -69,14 +73,19 @@ pcg hotspots                      # fan-in (+ blast radius) / fan-out / complexi
 pcg risk                          # git churn x fan-in: frequently-changed + widely-depended-upon code
 pcg risk --since main             #   ... weighted by churn on the current branch (commits since main)
 pcg cochange                      # files that change together (logical coupling, incl. hidden)
+pcg sinks                         # command/SQL execution sites + which web endpoints reach them (attack surface)
 pcg diff main                     # structural diff vs a git ref: added/removed/changed symbols (+ breaking)
-pcg review main                   # PR review: diff + blast radius + tests to run + breaking, in one report
+pcg review main                   # PR review: diff + blast radius + tests + breaking + findings
+                                  #   (untested public changes / wide blast radius), in one report
 pcg api     Some::Module          # a module's public/exported surface
 pcg covers  Some::Module::thing   # which tests exercise a symbol (reverse of affected --tests)
 pcg unresolved [--name M] [--limit N] [--by-receiver]   # opaque $obj->method calls with candidates;
                                   #   --by-receiver groups by receiver and suggests its class (the candidate-class intersection)
+pcg rename Foo::bar baz [--apply]   # graph-driven rename within a package; reports the dynamic
+                                  #   $obj->method sites it can't verify. Dry-run unless --apply
 pcg export --format mermaid --around Some::Module::run   # render the (sub)graph for docs/review (dot|mermaid|json)
 pcg search  thing
+pcg search --semantic "where do we validate user input"   # rank by meaning (needs `index --embed`)
 pcg status                        # setup health (parser/grammar/libtree-sitter) + graph counts
 pcg --version
 ```
@@ -111,11 +120,12 @@ reverses them:
 "mcpServers": { "pcg": { "type": "stdio", "command": "pcg", "args": ["serve", "--mcp"] } }
 ```
 
-Tools exposed (24): the read tools `pcg_explore`, `pcg_node`, `pcg_search`,
+Tools exposed (28): the read tools `pcg_overview`, `pcg_sinks`, `pcg_explore`, `pcg_explain`, `pcg_node`, `pcg_search`,
 `pcg_callers`, `pcg_callees`, `pcg_impact`, `pcg_path`, `pcg_unused`,
 `pcg_affected`, `pcg_deps`, `pcg_cycles`, `pcg_hotspots`, `pcg_risk`, `pcg_cochange`, `pcg_diff`, `pcg_review`, `pcg_api`, `pcg_covers`, `pcg_untested`,
-`pcg_unresolved`, `pcg_resolve`, plus lifecycle tools `pcg_index` (with
-`runtime` and `deps` options), `pcg_sync` and `pcg_status`. The
+`pcg_unresolved`, `pcg_resolve`, the one write tool `pcg_rename` (graph-driven rename codemod),
+plus lifecycle tools `pcg_index` (with
+`runtime`, `deps` and `embed` options), `pcg_sync` and `pcg_status`. The
 agent can therefore build and refresh the graph
 itself: on first use it calls `pcg_index`, and after editing code it calls
 `pcg_sync` — no separate `pcg index` run and no server restart. Run the server
@@ -134,6 +144,24 @@ tags/parser-based Perl LSP can't. It is read-only and stateless: the graph is th
 source of truth, so keep it fresh with `pcg watch` (or `pcg sync`) alongside the
 editor. Point your editor's LSP client at `pcg lsp` for the project root. (New;
 validated at the protocol level — editor-client testing is ongoing.)
+
+## Semantic search (`--embed`, optional)
+
+`pcg search --semantic "<intent>"` ranks symbols by *meaning* rather than keyword —
+useful when you know what code should *do* but not what it's *called*
+("where do we validate user input", "retry logic"). It is opt-in and runs entirely
+**locally** — no cloud dependency. Enable it in two steps:
+
+1. Provide a local embedding backend, either:
+   - `PCG_EMBED_CMD` — any command that reads one text per line on stdin and prints one
+     JSON array of floats per line (a llama.cpp / sentence-transformers wrapper, etc.), or
+   - an [Ollama](https://ollama.com)-compatible endpoint (the default): `PCG_EMBED_URL`
+     (default `http://localhost:11434`), `PCG_EMBED_MODEL` (default `nomic-embed-text`).
+2. `pcg index --embed` to embed every symbol (`pcg_index embed:true` from an agent).
+
+Without a provider, `--embed` is skipped with a note and `--semantic` falls back to
+guidance — keyword `pcg search` always works. Embeddings live in the graph DB
+(`embeddings` table) and are pruned for deleted symbols on the next `--embed`.
 
 ## Runtime enrichment (`--runtime`)
 

@@ -1,10 +1,11 @@
 package App::PerlGraph::Review;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
 use App::PerlGraph::Git;
 use App::PerlGraph::Diff;
 use App::PerlGraph::Query;
+use App::PerlGraph::Model qw(is_public);
 
 # Composes the change-oriented analyses into one branch/PR review: the structural
 # diff vs a git ref (added/removed/re-signatured symbols, breaking-API flagged),
@@ -26,12 +27,25 @@ sub review ($self) {
     for my $s (@{ $diff->{removed} }, (map { $_->{new} } @{ $diff->{changed} }), @{ $diff->{added} }) {
         $s->{_callers} = scalar $q->callers($s->{qualified_name} // '');
     }
+    # graph-derived findings the reviewer should act on, beyond the raw diff. Only
+    # CALLABLE symbols can be "untested" -- a package/class node has no test that
+    # reaches it directly, so it would be a vacuous (noisy) untested finding.
+    my (@untested, @wide);
+    for my $s (@{ $diff->{added} }, map { $_->{new} } @{ $diff->{changed} }) {   # added/changed public API no test reaches
+        next unless is_public($s) && defined $s->{qualified_name}
+                 && ($s->{kind} // '') =~ /\A(?:function|method|constant)\z/;
+        push @untested, $s unless scalar $q->covers($s->{qualified_name});
+    }
+    for my $s (@{ $diff->{removed} }, map { $_->{new} } @{ $diff->{changed} }) { # changed/removed symbol many things still call
+        push @wide, $s if is_public($s) && ($s->{_callers} // 0) >= 5;
+    }
     return {
         ref      => $self->ref,
         files    => \@files,
         diff     => $diff,
         affected => [ $q->affected(\@files) ],
         tests    => [ $q->affected(\@files, tests_only => 1) ],
+        findings => { untested => \@untested, wide => \@wide },
     };
 }
 

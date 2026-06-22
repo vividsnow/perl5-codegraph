@@ -19,7 +19,7 @@ is $mcp0->dispatch({ jsonrpc => '2.0', method => 'notifications/initialized' }),
 # --- tools/list ---
 my $tl = $mcp0->dispatch({ jsonrpc => '2.0', id => 2, method => 'tools/list' });
 my @tools = @{ $tl->{result}{tools} };
-is scalar(@tools), 24, 'twenty-four tools (21 read + index / sync / status)';
+is scalar(@tools), 28, 'twenty-eight tools (25 read + index / sync / status)';
 ok( (grep { $_->{name} eq 'pcg_callers'  } @tools), 'pcg_callers listed' );
 ok( (grep { $_->{name} eq 'pcg_hotspots' } @tools), 'pcg_hotspots listed' );
 ok( (grep { $_->{name} eq 'pcg_untested' } @tools), 'pcg_untested listed' );
@@ -83,6 +83,8 @@ sub _call ($name, $args) {
         params => { name => $name, arguments => $args } })->{result}{content}[0]{text};
 }
 like _call('pcg_node',    { symbol => 'P::run'  }), qr/P::run/,  'pcg_node dispatches';
+like _call('pcg_explain', { symbol => 'P::help' }), qr/Explain: P::help.*blast radius/s, 'pcg_explain returns a one-call dossier (blast radius incl.)';
+like _call('pcg_explain', { symbol => 'No::Such' }), qr/_not found_/, 'pcg_explain on an unknown symbol -> not found (no crash)';
 like _call('pcg_explore', { query  => 'run'     }), qr/P::run/,  'pcg_explore dispatches';
 like _call('pcg_callees', { symbol => 'P::run'  }), qr/P::help/, 'pcg_callees dispatches';
 like _call('pcg_impact',  { symbol => 'P::help' }), qr/P::run/,  'pcg_impact dispatches';
@@ -90,6 +92,10 @@ like _call('pcg_api',     { module => 'P' }),       qr/P::run/,                 
 like _call('pcg_deps',    { module => 'P' }),       qr/imports.*Dep/,                 'pcg_deps dispatches (module dependencies)';
 like _call('pcg_cycles',  {}),                      qr/Circular module dependencies/, 'pcg_cycles dispatches';
 like _call('pcg_covers',  { symbol => 'P::help' }), qr/Tests covering P::help/,       'pcg_covers dispatches';
+like _call('pcg_overview', {}),                     qr/Codebase map/,                 'pcg_overview dispatches';
+like _call('pcg_sinks',    {}),                     qr/Security sinks/,               'pcg_sinks dispatches';
+like _call('pcg_rename', { old => 'No::Such', new => 'x' }), qr/no function/i,        'pcg_rename dispatches (handler wiring + error path)';
+like _call('pcg_search', { query => 'run', semantic => 1 }), qr/Semantic search/,      'pcg_search semantic:true routes to the semantic handler (not keyword)';
 like _call('pcg_unresolved', {}),                   qr/Unresolved method calls/,       'pcg_unresolved dispatches';
 like _call('pcg_resolve', { resolutions => [] }),   qr/applied 0/,                     'pcg_resolve dispatches (empty input)';
 like _call('pcg_resolve', { resolutions => [{ caller => 'P::run', method => 'm', receiver => '$x', target => 'No::Such' }] }),

@@ -3,6 +3,7 @@ Changes
 cpanfile
 lib/App/PerlGraph.pm
 lib/App/PerlGraph/CLI.pm
+lib/App/PerlGraph/Embed.pm
 lib/App/PerlGraph/Diff.pm
 lib/App/PerlGraph/Extractor.pm
 lib/App/PerlGraph/Format.pm
@@ -15,6 +16,7 @@ lib/App/PerlGraph/MCP.pm
 lib/App/PerlGraph/Model.pm
 lib/App/PerlGraph/Parser.pm
 lib/App/PerlGraph/Pod.pm
+lib/App/PerlGraph/Refactor.pm
 lib/App/PerlGraph/Query.pm
 lib/App/PerlGraph/Resolver.pm
 lib/App/PerlGraph/Review.pm
@@ -104,6 +106,10 @@ t/71-review.t
 t/72-resolution.t
 t/73-deps.t
 t/74-resolve-type.t
+t/80-semantic.t
+t/78-sinks.t
+t/77-rename.t
+t/76-overview.t
 t/75-cli-git.t
 t/corpus/dist/lib/Foo.pm
 t/corpus/dist/lib/Foo/Bar.pm

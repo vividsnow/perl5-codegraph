@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Path::Tiny qw(path);
 use Cpanel::JSON::XS ();
 use App::PerlGraph::Store;
@@ -37,16 +37,21 @@ sub _query ($root) {
 
 my $USAGE = <<'U';
 usage: pcg <command> [args] [path]
-  index [--runtime] [--deps] [--jobs N] [--max-file-size SZ]  build/refresh the graph
+  index [--runtime] [--deps] [--embed] [--jobs N] [--max-file-size SZ]  build/refresh the graph
         (--deps: also index the public API of used CPAN modules from @INC, so calls
-         into dependencies resolve; --jobs: parse workers; --max-file-size 1M: skip huge files)
+         into dependencies resolve; --embed: also compute semantic-search embeddings via a
+         local provider (PCG_EMBED_CMD or Ollama); --jobs: parse workers; --max-file-size 1M: skip huge files)
   sync  [--runtime]     incremental update
   watch [--interval N] [--poll] [--json] [--once]  re-index on change (inotify on Linux,
         else poll; Ctrl-C to stop; --once syncs a single time and exits). --json emits one
         {added,changed,deleted,affected_tests} event per change for an agent to react to
+  overview [--limit N]  codebase map: scale, frameworks, entry points, central symbols,
+                        namespaces, most-subclassed (the lay of the land -- a good first stop)
   explore <query>       matching symbols with source + relationships
   node <symbol>         a symbol's source + callers/callees
-  search <query>        symbol search (locations)
+  explain <symbol>      full dossier: source + callers/callees + blast radius + covering tests
+  search [--semantic] <query>   symbol search (locations); --semantic ranks by meaning
+                        (needs `index --embed` + a local embedding provider)
   callers|callees|impact <symbol>
   path <A> <B>          shortest call path from A to B
   affected [--tests] [--stdin] [--since REF] [--path DIR] <files>   files/tests impacted by a change
@@ -59,13 +64,17 @@ usage: pcg <command> [args] [path]
   risk [--limit N] [--since REF]   git churn x fan-in: frequently-changed + widely-depended-upon code
         (--since REF: count only churn from commits since REF -- risk on the current branch)
   cochange [--min-support N] [--limit N] [--max-files N]   files that change together (logical coupling)
+  sinks                 command/SQL execution sites + which web endpoints reach them (attack surface)
   diff <ref>            structural diff vs a git ref: added/removed/re-signatured symbols (+ breaking)
-  review <ref>          PR review: diff + blast radius + tests to run + breaking changes, in one report
+  review <ref>          PR review: diff + blast radius + tests to run + breaking changes
+                        + findings (untested public changes / wide blast radius), in one report
   api <module>          a module's public/exported surface
   covers <symbol>       which tests exercise a symbol (reverse of affected --tests)
   unresolved [--name M] [--limit N] [--by-receiver]   opaque $obj->method calls with
                         candidate definitions (an agent resolves these via the MCP pcg_resolve
                         tool); --by-receiver groups by receiver + suggests its class
+  rename <Old::sub> <new> [--apply] [path]   rename a sub/method in its package using the graph
+                        (dry-run by default; reports dynamic $obj->method sites it can't verify)
   export [--format dot|mermaid|json] [--around SYM] [--depth N]   render the graph
   status                node/edge/provenance counts
   serve --mcp [--watch] [path]   run the MCP server (stdio JSON-RPC; --watch auto-syncs)
@@ -87,6 +96,7 @@ sub run ($class, @argv) {
         lsp     => \&_cmd_lsp,
         search  => \&_cmd_search,
         node    => \&_cmd_node,
+        explain => \&_cmd_explain,
         explore => \&_cmd_explore,
         callers => \&_cmd_callers,
         callees => \&_cmd_callees,
@@ -97,6 +107,9 @@ sub run ($class, @argv) {
         untested  => \&_cmd_untested,
         deps      => \&_cmd_deps,
         cycles    => \&_cmd_cycles,
+        overview  => \&_cmd_overview,
+        sinks     => \&_cmd_sinks,
+        rename    => \&_cmd_rename,
         hotspots  => \&_cmd_hotspots,
         risk      => \&_cmd_risk,
         cochange  => \&_cmd_cochange,
@@ -117,8 +130,9 @@ sub run ($class, @argv) {
 sub _cmd_index (@args) {
     my $runtime = grep { $_ eq '--runtime' } @args;
     my $deps    = grep { $_ eq '--deps' } @args;
+    my $embed   = grep { $_ eq '--embed' } @args;
     my ($jobs, $maxsz, @rest);
-    for (my @a = grep { $_ ne '--runtime' && $_ ne '--deps' } @args; @a; ) {
+    for (my @a = grep { $_ ne '--runtime' && $_ ne '--deps' && $_ ne '--embed' } @args; @a; ) {
         my $x = shift @a;
         if    ($x eq '--jobs')          { $jobs = shift @a; return _usage() unless defined $jobs && $jobs =~ /^[0-9]+$/ && $jobs >= 1 }
         elsif ($x eq '--max-file-size') { my $v = shift @a; return _usage() unless defined $v && $v =~ /^(\d+(?:\.\d+)?)([KMG]?)$/i;
@@ -129,9 +143,10 @@ sub _cmd_index (@args) {
     my ($root) = @rest;
     $root //= '.';
     my $stats = App::PerlGraph::Indexer->new(store => _store($root), root => $root,
-        runtime => $runtime, deps => $deps, ($jobs ? (jobs => $jobs) : ()), ($maxsz ? (max_file_size => $maxsz) : ()))->index_all;
+        runtime => $runtime, deps => $deps, embed => $embed, ($jobs ? (jobs => $jobs) : ()), ($maxsz ? (max_file_size => $maxsz) : ()))->index_all;
     say "indexed $stats->{files} files ($stats->{reindexed} (re)parsed)"
-        . ($stats->{deps} ? " + $stats->{deps} CPAN deps" : "") . ($runtime ? " + runtime enrichment" : "");
+        . ($stats->{deps} ? " + $stats->{deps} CPAN deps" : "") . ($runtime ? " + runtime enrichment" : "")
+        . ($stats->{embedded} ? " + $stats->{embedded} embeddings" : "");
     return 0;
 }
 
@@ -227,10 +242,13 @@ sub _cmd_lsp (@args) {
     return 0;
 }
 
-sub _cmd_search ($query = undef, $root = '.') {
+sub _cmd_search (@args) {
+    my $semantic = grep { $_ eq '--semantic' } @args;
+    my ($query, $root) = grep { $_ ne '--semantic' } @args;
     return _usage() unless defined $query;
-    my $q = _query($root) or return 1;
-    print App::PerlGraph::Format::search($query, [ $q->search($query) ]);
+    my $q = _query($root // '.') or return 1;
+    print $semantic ? App::PerlGraph::Format::semantic($query, $q->semantic($query))
+                    : App::PerlGraph::Format::search($query, [ $q->search($query) ]);
     return 0;
 }
 
@@ -238,6 +256,13 @@ sub _cmd_node ($symbol = undef, $root = '.') {
     return _usage() unless defined $symbol;
     my $q = _query($root) or return 1;
     print App::PerlGraph::Format::node_view($symbol, [ $q->node_view($symbol) ], $root);
+    return 0;
+}
+
+sub _cmd_explain ($symbol = undef, $root = '.') {
+    return _usage() unless defined $symbol;
+    my $q = _query($root) or return 1;
+    print App::PerlGraph::Format::explain($symbol, [ $q->explain($symbol) ], $root);
     return 0;
 }
 
@@ -327,6 +352,44 @@ sub _cmd_untested ($module = undef, $root = '.') {
 sub _cmd_cycles ($root = '.') {
     my $q = _query($root) or return 1;
     print App::PerlGraph::Format::cycles([ $q->cycles ]);
+    return 0;
+}
+
+sub _cmd_rename (@args) {
+    my ($apply, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--apply') { $apply = 1 } else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my ($old, $new, $root) = @pos;
+    return _usage() unless defined $old && length $old && defined $new && length $new;
+    my $q = _query($root // '.') or return 1;
+    require App::PerlGraph::Refactor;
+    my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
+        ->rename($old, $new, ($apply ? (apply => 1) : ()));
+    print App::PerlGraph::Format::rename($plan);
+    return $plan->{error} ? 1 : 0;
+}
+
+sub _cmd_sinks (@args) {
+    return _usage() if grep { /^--/ } @args;
+    my $q = _query($args[0] // '.') or return 1;
+    print App::PerlGraph::Format::sinks($q->sinks);
+    return 0;
+}
+
+sub _cmd_overview (@args) {
+    my (%opt, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--limit') { $opt{limit} = shift @args;
+            return _usage() unless defined $opt{limit} && $opt{limit} =~ /^\d+$/ && $opt{limit} >= 1 }
+        else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my $q = _query($pos[0] // '.') or return 1;
+    print App::PerlGraph::Format::overview($q->overview(%opt));
     return 0;
 }
 
@@ -511,9 +574,10 @@ App::PerlGraph::CLI - the pcg command-line dispatcher
 =head1 DESCRIPTION
 
 Parses @ARGV and dispatches to the pcg subcommands: index, sync, watch, the
-read queries (search, node, explore, callers, callees, impact, path, affected,
-unused, untested, deps, cycles, hotspots, risk, cochange, diff, review, api,
-covers, unresolved), export, status, serve and install/uninstall.
+read queries (overview, search, node, explain, explore, callers, callees, impact,
+path, affected, unused, untested, deps, cycles, hotspots, risk, cochange, sinks,
+diff, review, api, covers, unresolved), the graph-driven rename codemod, export,
+status, serve and install/uninstall.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
 C<pcg> command for the public interface.

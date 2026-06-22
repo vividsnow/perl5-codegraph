@@ -1,6 +1,6 @@
 package App::PerlGraph::Store;
 use v5.36;
-our $VERSION = q{0.029};
+our $VERSION = q{0.037};
 use Moo;
 use DBI;
 use Cpanel::JSON::XS ();
@@ -297,9 +297,26 @@ sub delete_file_nodes ($self, $path) {
         # delete only edges originating here; inbound edges survive (stable ids).
         $self->dbh->do("delete from edges where source in ($ph)", undef, @ids);
         $self->dbh->do("delete from nodes_fts where id in ($ph)", undef, @ids);
+        $self->dbh->do("delete from embeddings where node_id in ($ph)", undef, @ids);
         $self->dbh->do("delete from nodes where id in ($ph)", undef, @ids);
     }
     $self->dbh->do('delete from unresolved_refs where file_path = ?', undef, $path);
+}
+
+# --- semantic-search embeddings (optional; built by `pcg index --embed`) ------
+sub upsert_embedding ($self, $node_id, $vec) {
+    $self->dbh->do('insert or replace into embeddings (node_id, dim, vec) values (?,?,?)',
+        undef, $node_id, scalar(@$vec), pack('f*', @$vec));
+}
+# node_id => [floats]; the packed blob is unpacked back to a Perl vector.
+sub all_embeddings ($self) {
+    map { ($_->{node_id} => [ unpack 'f*', $_->{vec} ]) }
+        $self->_rows('select node_id, vec from embeddings');
+}
+sub embedding_count ($self) { ($self->_rows('select count(*) n from embeddings'))[0]{n} }
+# Drop embeddings whose node is gone (a symbol deleted since the last --embed).
+sub prune_embeddings ($self) {
+    $self->dbh->do('delete from embeddings where node_id not in (select id from nodes)');
 }
 
 sub file_paths   ($self) { map { $_->{path} } $self->_rows('select path from files') }
@@ -340,6 +357,7 @@ sub forget_file ($self, $path) {
         my $ph = join ',', ('?') x @ids;
         $self->dbh->do("delete from edges where source in ($ph) or target in ($ph)", undef, @ids, @ids);
         $self->dbh->do("delete from nodes_fts where id in ($ph)", undef, @ids);
+        $self->dbh->do("delete from embeddings where node_id in ($ph)", undef, @ids);
         $self->dbh->do("delete from nodes where id in ($ph)", undef, @ids);
     }
     $self->dbh->do('delete from unresolved_refs where file_path = ?', undef, $path);
@@ -352,6 +370,19 @@ sub all_nodes ($self, @kinds) {
 }
 sub package_nodes ($self) { $self->_nodes("select * from nodes where kind in ('package','class')") }
 sub module_files  ($self) { map { $_->{path} } $self->_rows("select path from files where path like '%.pm'") }
+
+# --- codebase-overview aggregations (pcg overview / pcg_overview) ---
+sub kind_counts ($self) { map { ($_->{kind} => $_->{n}) } $self->_rows('select kind, count(*) n from nodes group by kind') }
+# classes ranked by how many subclasses extend them (incoming extends edges).
+sub most_subclassed ($self, $limit) {
+    $self->_rows("select target as id, count(*) as n from edges where kind = 'extends' and target is not null
+        group by target order by n desc, id limit ?", $limit);
+}
+# qualified names of the given kinds only -- lightweight, for namespace grouping.
+sub qnames_of ($self, @kinds) {
+    map { $_->{qualified_name} } grep { defined $_->{qualified_name} }
+        $self->_rows('select qualified_name from nodes where kind in (' . join(',', ('?') x @kinds) . ')', @kinds);
+}
 
 # Dead-code support: function nodes with no inbound calls/references/overrides
 # edge (the structural `contains` from the owning package is ignored). Skips

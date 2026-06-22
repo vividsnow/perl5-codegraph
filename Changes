@@ -1,5 +1,128 @@
 Revision history for App-PerlGraph
 
+0.037     2026-06-22
+          - New: optional, LOCAL semantic search -- `pcg search --semantic <intent>` /
+            pcg_search semantic:true ranks symbols by MEANING (embedding cosine similarity),
+            for when you know what code should do but not what it is called ("where do we
+            validate user input"). NO cloud dependency: a local provider via PCG_EMBED_CMD (any
+            command emitting one JSON float-array per input line) or an Ollama-compatible
+            endpoint (PCG_EMBED_URL / PCG_EMBED_MODEL). `pcg index --embed` (pcg_index
+            embed:true) embeds every named symbol from its qualified-name + signature +
+            docstring into a new `embeddings` table; the query is embedded at search time and
+            ranked by dot product (vectors stored L2-normalized, so cosine == dot). Degrades
+            gracefully -- no provider -> --embed is skipped with a note and --semantic returns
+            guidance, so keyword `pcg search` always works. Embeddings persist by stable node
+            id and stale ones (deleted symbols) are pruned on re-embed. New App::PerlGraph::
+            Embed; Schema embeddings table; Store upsert/all/count/prune; Query::semantic;
+            Format::semantic; CLI `search --semantic` + `index --embed`.
+          - Tests +10 (1037 total): t/80 drives the whole pipeline with a deterministic fake
+            PCG_EMBED_CMD (no network/model) -- ranking, the no-provider/no-embeddings
+            fallbacks, and stale-embedding pruning.
+          - Pre-release review (13-pass multi-agent review->fix->amend loop over the whole
+            0.030-0.037 wave; stopped after 5 consecutive defect-free passes). Real fixes:
+            a `pcg rename` CORRUPTION -- a greedy `->method` match renamed the wrong call on a
+            line with two same-named methods (`$self->m($x->m)`), now non-greedy + a regression
+            test; Embed `path(Path::Tiny->tempfile)` dropped the File::Temp guard (tempfile
+            leak); embeddings weren't deleted on `forget_file` (sync of a removed file leaked
+            them); `pcg review` flagged package/class nodes as "untested" (kind-filtered to
+            callables); rename of a qualified `Pkg::new` name was silently stripped (now
+            rejected); `is_public` was triplicated (-> Model::is_public, shared by Diff/Review/
+            Query); semantic ranking made deterministic (id tie-break) -- fixed a real macOS CI
+            flake; a `$^X`-unquoted test portability bug. Doc sync: pcg_explain added to the
+            MCP INSTRUCTIONS, README tool list corrected (rename is the WRITE tool; index has
+            `embed`), `syscall` added to the pcg_sinks sink list, the App::PerlGraph SYNOPSIS /
+            CLI POD / installed skill / Model POD all brought up to date with the 8 features.
+            Tests +18 more (1055 total); perlcritic-clean; CI matrix green.
+
+0.036     2026-06-22
+          - New: `pcg explain <symbol>` / pcg_explain -- a one-call dossier bundling a symbol's
+            definition + verbatim source, its immediate callers and callees, its transitive
+            blast radius (how many callers depend on it), and which tests cover it. Saves an
+            agent the separate pcg_node + pcg_impact + pcg_covers round-trips. New
+            Query::explain + Format::explain (reuse the node view); CLI `pcg explain`;
+            pcg_explain (28 MCP tools).
+          - Tests +1 (1027 total): t/15 (pcg_explain dispatch returns the dossier).
+
+0.035     2026-06-22
+          - Interprocedural type inference: `my $x = foo(); $x->method` now resolves when
+            foo() has an inferred return type (a `Class->new` builder). The extractor already
+            inferred a sub's return type (metadata.returns) and used it for chained
+            `func()->m`, but an assignment-from-call did not propagate that type to the
+            variable -- so $x->method stayed opaque. Now `my $x = foo()` records a deferred
+            "return-of-foo" type and the resolver resolves foo + reads its returns to type $x
+            (provenance `inferred`; never fabricates a method the class lacks). Shrinks the
+            opaque-dispatch frontier one hop further, across a call boundary. New
+            Extractor::_call_name + the receiver_call candidate; Resolver receiver_call path.
+            EXTRACTION_VERSION 4->5.
+          - Tests +2 (1026 total): t/59 (interprocedural resolve + that it picks the producer
+            return type over a globally-ambiguous same-named method).
+
+0.034     2026-06-22
+          - Modern-OO recall: Object::Pad `role NAME { ... }` is now recognized. It is
+            structurally identical to a native `class` but the role_statement node was
+            unhandled, so a role's methods leaked to the file/main; roles now scope their
+            methods + fields like a class and compose into a consuming class via :does(Role)
+            / with, so $self->role_method resolves up the MRO. (Native 5.38 `class` -- block
+            and statement form, field / :reader / :isa / :does / ADJUST -- was already
+            handled; this closes the one remaining Object::Pad gap.) New Grammar NODE_ROLE;
+            EXTRACTION_VERSION 3->4 (a sync after upgrade re-extracts).
+          - Tests +3 (1024 total): t/40 (role method scoping, no main leak, :does composition).
+
+0.033     2026-06-22
+          - pcg review / pcg_review now adds graph-derived FINDINGS beyond the raw diff: (1)
+            untested changes -- added/changed PUBLIC symbols that no test statically reaches
+            (write coverage); and (2) wide blast radius -- a changed or removed public symbol
+            that >=5 things still call (change with care). Turns the review from "what changed
+            + which tests to run" into actionable review notes. New Review findings +
+            Format::review Findings section.
+          - Tests +3 (1021 total): t/71 (the untested-change finding + its rendering).
+
+0.032     2026-06-22
+          - New: security attack-surface analysis -- `pcg sinks` / pcg_sinks. At extraction
+            time it marks command-execution (system/exec/syscall) and SQL-execution (DBI
+            do/execute/select*) call sites as `sink` edges, then for a web app computes which
+            routes/endpoints can transitively REACH each sink (route handler -> forward call
+            closure). On a Mojo::Lite/Dancer2 app it reports e.g. "GET /run -> command system
+            in main::do_thing" -- the endpoints where a tainted request value could reach a
+            dangerous call. Heuristic by call name (a placeholdered DBI call is safe), so a
+            reached sink is a site to VERIFY, not a confirmed bug; sink sites with no reaching
+            route are still listed. New Model::sink_type + the `sink` edge kind; Query::sinks;
+            CLI `pcg sinks`; pcg_sinks (27 MCP tools). EXTRACTION_VERSION 2->3 (a sync after
+            upgrade re-extracts to add the sink edges).
+          - Tests +12 (1018 total): t/78 (command + sql sink typing, route->sink reachability,
+            a sink-free route excluded, the non-web no-route case, the rendered report).
+
+0.031     2026-06-22
+          - New: graph-driven rename codemod -- `pcg rename Old::sub new` / pcg_rename. Renames
+            a function/method within its package by using the resolved graph to find every
+            reference precisely and the RESOLVER to decide which call sites actually target
+            it: the definition, qualified calls (Foo::bar), bareword calls (bar()), and
+            $self->method dispatch the heuristic tied to the symbol are all renamed -- while a
+            same-named method on a DIFFERENT class, and dynamic $obj->method dispatch the
+            resolver cannot tie to this symbol, are left alone and REPORTED for manual review
+            (a rename that knows what it cannot see). Each affected file is re-parsed for
+            byte-precise positions and every edit is re-validated against the current bytes
+            before writing (a stale index skips a site rather than corrupting it). Dry-run by
+            default; --apply / apply:true writes, then call pcg sync. New App::PerlGraph::
+            Refactor; CLI `pcg rename`; pcg_rename -- the first WRITE tool (26 MCP tools).
+          - Tests +20 (1006 total): t/77 (def/qualified/bareword/resolved-method renamed,
+            other-class + dynamic-dispatch sites untouched, dry-run vs --apply, the renamed
+            file still parses, the error/collision paths).
+
+0.030     2026-06-22
+          - New: `pcg overview` / pcg_overview -- a codebase orientation map for first contact
+            with an unfamiliar project, in ONE call: scale (files/packages/subs/edges,
+            unresolved, provenance mix), web-route count, entry-point scripts (.pl/.psgi),
+            the top namespaces by sub count, the most central symbols (highest fan-in --
+            change with care), and the most-subclassed classes. Composed from the centrality
+            data already in the graph; it is now the recommended FIRST call when an agent
+            lands in a repo (added to the MCP INSTRUCTIONS + the perl-codegraph skill as the
+            orientation step). On jakutia it surfaces the app structure at a glance
+            (Jakutia::Provider 848 subs / Model 603 / Controller 475; Jakutia::db = 522
+            callers). New Store kind_counts/most_subclassed/qnames_of; 25 MCP tools (was 24).
+          - Tests +10 (986 total): t/76 (scale, entry-point scripts, central symbols,
+            namespace grouping, most-subclassed, and the rendered map).
+
 0.029     2026-06-21
           - Pre-release review (multi-agent, several passes over the whole dist). Fixes:
             * CORRECTNESS (pcg diff / review on non-ASCII code): the working-tree side read
