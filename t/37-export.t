@@ -77,4 +77,22 @@ is $rc, 2, 'unknown --format is a usage error';
   is App::PerlGraph::CLI->run('export', '--format'), 2, '--format with no value is a usage error';
 }
 
+# --- empty-result branches ---
+is [ $q->cycles ], [], 'cycles: empty list when there are no import/inheritance cycles';
+like App::PerlGraph::Format::cycles([]), qr/_none found_/, 'format cycles: no-cycles message';
+is $q->graph(around => 'P::does_not_exist'), { nodes => [], edges => [] },
+   'graph(around => unknown symbol) returns an empty graph';
+like App::PerlGraph::Format::export({ nodes => [], edges => [] }, 'mermaid'), qr/graph TD/,
+   'mermaid export of an empty graph is still valid';
+
+# dot escapes a special char in a node label (the route node carries a `"`)
+like $dot, qr/P GET \/a\\"b/, 'dot: escapes a " inside a node name';
+
+# CLI export flag validation (error paths)
+{ open my $fh,'>',\my $err; local *STDERR=$fh;
+  is App::PerlGraph::CLI->run('export', '--depth'),      2, 'export --depth with no value is a usage error';
+  is App::PerlGraph::CLI->run('export', '--depth', 'x'), 2, 'export --depth non-numeric is a usage error';
+  is App::PerlGraph::CLI->run('export', '--around'),     2, 'export --around with no value is a usage error';
+}
+
 done_testing;

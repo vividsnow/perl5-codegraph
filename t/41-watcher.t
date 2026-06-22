@@ -51,7 +51,7 @@ SKIP: {
 
 # --- inotify backend: live detection via a forked writer ---------------------
 SKIP: {
-    skip "not linux / no Linux::Inotify2", 3 unless $HAVE_INOTIFY;
+    skip "not linux / no Linux::Inotify2", 5 unless $HAVE_INOTIFY;
 
     my ($dir, $idx) = setup({ 'A.pm' => "package A; 1;\n" });
     my $w = App::PerlGraph::Watcher->new(indexer => $idx);
@@ -73,6 +73,15 @@ SKIP: {
     # a non-perl change should not wake the inotify backend either
     $pid = $writer->(sub { path($dir, 'ignore.log')->spew("noise") });
     is $w->wait_for_change(timeout => 2), 0, 'inotify ignores a non-perl file change';
+    waitpid $pid, 0;
+
+    # delete + recreate a watched subdir: it must be re-watched (the IN_IGNORED
+    # cleanup drops the stale watch entry so the new dir at the same path is caught)
+    $pid = $writer->(sub { path($dir, 'deep')->remove_tree });
+    is $w->wait_for_change(timeout => 5), 1, 'inotify detects the watched subdir being deleted';
+    waitpid $pid, 0;
+    $pid = $writer->(sub { my $p = path($dir, 'deep', 'D.pm'); $p->parent->mkpath; $p->spew("package D; 1;\n") });
+    is $w->wait_for_change(timeout => 5), 1, 'a recreated subdir is re-watched (a file inside it is detected)';
     waitpid $pid, 0;
 }
 

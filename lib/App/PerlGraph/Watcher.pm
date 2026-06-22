@@ -1,6 +1,6 @@
 package App::PerlGraph::Watcher;
 use v5.36;
-our $VERSION = q{0.002};
+our $VERSION = q{0.029};
 use Moo;
 use App::PerlGraph::Indexer ();   # shared $PERL_RX / @IGNORE_DIRS / ->dirs
 
@@ -95,6 +95,7 @@ sub _coalesce ($self) {
         select(my $r = $rin, undef, undef, 0.15) or last;   # 150ms of quiet ends the burst
         my @ev = $in->read or last;
         for my $e (@ev) {
+            if ($e->IN_IGNORED) { delete $self->_watched->{ $e->fullname }; next }
             $self->_watch_tree($e->fullname) if $e->IN_ISDIR && ($e->IN_CREATE || $e->IN_MOVED_TO);
         }
     }
@@ -113,6 +114,9 @@ sub _wait_inotify ($self, $timeout) {
         my $relevant = 0;
         for my $e ($in->read) {
             if ($e->IN_Q_OVERFLOW) { $relevant = 1; next }   # kernel dropped events -> resync
+            # the kernel auto-removed this watch (dir deleted/moved) -> drop the
+            # stale entry so the dir is re-watched if it comes back at the same path.
+            if ($e->IN_IGNORED) { delete $self->_watched->{ $e->fullname }; next }
             if ($e->IN_ISDIR) {
                 # a new directory: watch it (files may already be inside) and resync
                 $self->_watch_tree($e->fullname), $relevant = 1
@@ -132,7 +136,9 @@ sub _wait_inotify ($self, $timeout) {
 # A cheap change fingerprint: every Perl file's path + mtime. Avoids re-hashing
 # contents when nothing has moved (sync does the precise hash-diff once woken).
 sub _signature ($self) {
-    join "\0", map { "$_:" . ((stat $_)[9] // 0) } sort $self->indexer->_perl_files;
+    my $idx = $self->indexer;
+    # _perl_files yields canonical (root-relative) keys -> stat the on-disk path.
+    join "\0", map { "$_:" . ((stat $idx->_disk_path($_))[9] // 0) } sort $idx->_perl_files;
 }
 
 sub _wait_poll ($self, $timeout) {

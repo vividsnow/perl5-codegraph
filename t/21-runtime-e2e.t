@@ -35,7 +35,9 @@ is $sc{ $sound->{id} }, 'heuristic', 'static index resolves $self->sound as heur
 # MOP (Moose) attribute -> field node, if Moose is installed
 SKIP: {
     skip "Moose not installed", 1 unless eval { require Moose; 1 };
-    my ($size) = $store->nodes_by_qname('Widget::size');
-    ok $size && $size->{kind} eq 'field', 'MOP: Moose has-attribute -> field node (Widget::size)';
+    # `has 'size'` now also yields a static accessor *method* node of the same
+    # qname (so $self->size resolves without --runtime); select the MOP field.
+    my ($size) = grep { $_->{kind} eq 'field' } $store->nodes_by_qname('Widget::size');
+    ok $size, 'MOP: Moose has-attribute -> field node (Widget::size)';
 }
 done_testing;

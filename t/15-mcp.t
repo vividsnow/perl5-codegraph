@@ -3,6 +3,7 @@ use Test2::V0;
 use App::PerlGraph::Store;
 use App::PerlGraph::Query;
 use App::PerlGraph::MCP;
+use Path::Tiny ();
 
 # --- initialize ---
 my $mcp0 = App::PerlGraph::MCP->new;   # no query / no index
@@ -18,12 +19,20 @@ is $mcp0->dispatch({ jsonrpc => '2.0', method => 'notifications/initialized' }),
 # --- tools/list ---
 my $tl = $mcp0->dispatch({ jsonrpc => '2.0', id => 2, method => 'tools/list' });
 my @tools = @{ $tl->{result}{tools} };
-is scalar(@tools), 12, 'twelve tools (9 read + index / sync / status)';
+is scalar(@tools), 24, 'twenty-four tools (21 read + index / sync / status)';
 ok( (grep { $_->{name} eq 'pcg_callers'  } @tools), 'pcg_callers listed' );
+ok( (grep { $_->{name} eq 'pcg_hotspots' } @tools), 'pcg_hotspots listed' );
+ok( (grep { $_->{name} eq 'pcg_untested' } @tools), 'pcg_untested listed' );
+ok( (grep { $_->{name} eq 'pcg_risk'     } @tools), 'pcg_risk listed' );
+ok( (grep { $_->{name} eq 'pcg_cochange' } @tools), 'pcg_cochange listed' );
+ok( (grep { $_->{name} eq 'pcg_diff'     } @tools), 'pcg_diff listed' );
+ok( (grep { $_->{name} eq 'pcg_review'   } @tools), 'pcg_review listed' );
 ok( (grep { $_->{name} eq 'pcg_explore'  } @tools), 'pcg_explore listed' );
 ok( (grep { $_->{name} eq 'pcg_unused'   } @tools), 'pcg_unused listed' );
 ok( (grep { $_->{name} eq 'pcg_path'     } @tools), 'pcg_path listed' );
 ok( (grep { $_->{name} eq 'pcg_affected' } @tools), 'pcg_affected listed' );
+ok( (grep { $_->{name} eq 'pcg_deps'     } @tools), 'pcg_deps listed' );
+ok( (grep { $_->{name} eq 'pcg_api'      } @tools), 'pcg_api listed' );
 is $tools[0]{inputSchema}{type}, 'object', 'inputSchema is an object';
 
 # --- tools/call against a real index ---
@@ -31,6 +40,11 @@ my $s = App::PerlGraph::Store->new(path => ':memory:'); $s->init;
 $s->insert_node({ id => 'r', kind => 'function', name => 'run',  qualified_name => 'P::run',  file_path => 'f', start_line => 2 });
 $s->insert_node({ id => 'h', kind => 'function', name => 'help', qualified_name => 'P::help', file_path => 'f', start_line => 5 });
 $s->insert_edge({ source => 'r', target => 'h', kind => 'calls', provenance => 'static' });
+# a package node + containment / import edges, for the module-level tools
+$s->insert_node({ id => 'p', kind => 'package', name => 'P', qualified_name => 'P', file_path => 'f', start_line => 1 });
+$s->insert_edge({ source => 'p', target => 'r', kind => 'contains', provenance => 'static' });
+$s->insert_edge({ source => 'p', target => 'h', kind => 'contains', provenance => 'static' });
+$s->insert_edge({ source => 'p', target => undef, kind => 'imports', provenance => 'static', metadata => { via => 'use', module => 'Dep' } });
 my $mcp = App::PerlGraph::MCP->new(query => App::PerlGraph::Query->new(store => $s));
 
 my $call = $mcp->dispatch({ jsonrpc => '2.0', id => 3, method => 'tools/call',
@@ -54,6 +68,13 @@ my $path = $mcp->dispatch({ jsonrpc => '2.0', id => 9, method => 'tools/call',
     params => { name => 'pcg_path', arguments => { from => 'P::run', to => 'P::help' } } });
 like $path->{result}{content}[0]{text}, qr/Path: P::run -> P::help/, 'pcg_path renders the chain';
 like $path->{result}{content}[0]{text}, qr/1 hop\b/,                  'pcg_path reports hop count';
+
+# pcg_hotspots: help() is most depended-upon (1 caller); run() makes the most calls
+my $hot = $mcp->dispatch({ jsonrpc => '2.0', id => 10, method => 'tools/call',
+    params => { name => 'pcg_hotspots', arguments => { limit => 5 } } });
+like $hot->{result}{content}[0]{text}, qr/Most depended-upon.*`P::help`/s, 'pcg_hotspots ranks the called fn by fan-in';
+like $hot->{result}{content}[0]{text}, qr/fan-out.*`P::run`/s,             'pcg_hotspots ranks the calling fn by fan-out';
+ok !$hot->{result}{isError}, 'pcg_hotspots: no error flag';
 ok !$path->{result}{isError}, 'pcg_path: no error flag';
 
 # the remaining tool handlers also dispatch correctly through tools/call
@@ -65,6 +86,32 @@ like _call('pcg_node',    { symbol => 'P::run'  }), qr/P::run/,  'pcg_node dispa
 like _call('pcg_explore', { query  => 'run'     }), qr/P::run/,  'pcg_explore dispatches';
 like _call('pcg_callees', { symbol => 'P::run'  }), qr/P::help/, 'pcg_callees dispatches';
 like _call('pcg_impact',  { symbol => 'P::help' }), qr/P::run/,  'pcg_impact dispatches';
+like _call('pcg_api',     { module => 'P' }),       qr/P::run/,                       'pcg_api dispatches (public surface)';
+like _call('pcg_deps',    { module => 'P' }),       qr/imports.*Dep/,                 'pcg_deps dispatches (module dependencies)';
+like _call('pcg_cycles',  {}),                      qr/Circular module dependencies/, 'pcg_cycles dispatches';
+like _call('pcg_covers',  { symbol => 'P::help' }), qr/Tests covering P::help/,       'pcg_covers dispatches';
+like _call('pcg_unresolved', {}),                   qr/Unresolved method calls/,       'pcg_unresolved dispatches';
+like _call('pcg_resolve', { resolutions => [] }),   qr/applied 0/,                     'pcg_resolve dispatches (empty input)';
+like _call('pcg_resolve', { resolutions => [{ caller => 'P::run', method => 'm', receiver => '$x', target => 'No::Such' }] }),
+     qr/rejected/, 'pcg_resolve rejects a hallucinated target';
+like _call('pcg_resolve', { resolutions => [{ caller => 'P::run', method => 'help' }] }),
+     qr/missing/, 'pcg_resolve rejects a resolution missing required fields (MCP wiring)';
+
+# an opaque method call with a real candidate (P::help) -> exercise the surface filters
+$s->insert_unresolved({ from_node_id => 'r', reference_name => 'help', reference_kind => 'method_call',
+    file_path => 'f', line => 3, candidates => { receiver => '$x' } });
+like   _call('pcg_unresolved', {}),                  qr/\$x->help/, 'pcg_unresolved surfaces an opaque call with its candidate';
+like   _call('pcg_unresolved', { name => 'help' }),  qr/\$x->help/, 'pcg_unresolved name filter threads through (MCP)';
+unlike _call('pcg_unresolved', { name => 'nomatch' }), qr/\$x->/,   'pcg_unresolved name filter excludes non-matching';
+like   _call('pcg_unresolved', { limit => 0 }),      qr/_none_/,    'pcg_unresolved limit:0 is honored (MCP)';
+# by_receiver groups by receiver and suggests the candidate-class intersection (P::help -> P)
+like   _call('pcg_unresolved', { by_receiver => 1 }), qr/Resolve hints.*\$x.*type as `P`/s,
+       'pcg_unresolved by_receiver suggests the unique class for the receiver';
+
+# status splits the unresolved count into your-code vs tests (a .t-path ref)
+$s->insert_unresolved({ from_node_id => 'r', reference_name => 'help', reference_kind => 'method_call',
+    file_path => 't/x.t', line => 1, candidates => { receiver => '$y' } });
+like   _call('pcg_status', {}), qr/in tests/, 'pcg_status splits unresolved into your-code vs tests';
 
 # pcg_affected: changing file 'f' affects 'f' (run calls help, both live in f)
 my $aff = $mcp->dispatch({ jsonrpc => '2.0', id => 14, method => 'tools/call',
@@ -117,5 +164,14 @@ like $thrown->{result}{content}[0]{text}, qr/boom/,  'isError carries the messag
 
 # --- a known method sent without an id is a notification (no reply) ---
 is $mcp0->dispatch({ jsonrpc => '2.0', method => 'tools/list' }), undef, 'no-id request is a notification';
+
+# --- pcg_diff is NOT gated behind the index (it parses git directly, like the CLI) ---
+# Pointed at a non-git dir with no index, it reports the git requirement -- proving it
+# passed the index gate -- rather than the "no index" message the graph tools return.
+my $ng = Path::Tiny->tempdir;
+my $diff_txt = App::PerlGraph::MCP->new(base => "$ng")->dispatch({ jsonrpc => '2.0', id => 20,
+    method => 'tools/call', params => { name => 'pcg_diff', arguments => { ref => 'HEAD' } } })->{result}{content}[0]{text};
+unlike $diff_txt, qr/no index/i,     'pcg_diff is not blocked by the missing-index gate';
+like   $diff_txt, qr/git work tree/, 'pcg_diff without git reports the git requirement (it passed the gate)';
 
 done_testing;

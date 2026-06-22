@@ -1,6 +1,6 @@
 package App::PerlGraph::Schema;
 use v5.36;
-our $VERSION = q{0.002};
+our $VERSION = q{0.029};
 use Exporter 'import';
 our @EXPORT_OK = qw(DDL);
 
@@ -33,6 +33,11 @@ create table if not exists unresolved_refs (
   file_path text, candidates text
 );
 create index if not exists idx_unresolved_name on unresolved_refs(reference_name);
+create table if not exists resolutions (
+  caller_qname text not null, method text not null, receiver text not null,
+  target_qname text not null, provenance text default 'llm',
+  primary key (caller_qname, method, receiver)
+);
 create virtual table if not exists nodes_fts using fts5(
   id unindexed, name, qualified_name, docstring, tokenize='unicode61'
 );
@@ -47,7 +52,8 @@ App::PerlGraph::Schema - the SQLite DDL for the graph
 
 =head1 DESCRIPTION
 
-CREATE statements for the nodes, edges, unresolved_refs and files tables plus their indexes and the FTS5 search table.
+CREATE statements for the nodes, edges, unresolved_refs, resolutions and files
+tables plus their indexes and the FTS5 search table.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
 C<pcg> command for the public interface.

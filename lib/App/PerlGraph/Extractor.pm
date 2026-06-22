@@ -1,6 +1,6 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.002};
+our $VERSION = q{0.029};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify);
 use App::PerlGraph::Grammar qw(:all);
@@ -34,8 +34,15 @@ my %ROUTE_VERB = map { $_ => 1 } qw(get post put del delete patch options any);
 my %CAT_ATTR   = map { $_ => 1 } qw(Path Local Global Chained Args Method Private Regex LocalRegex);
 my %MOOSEY     = map { $_ => 1 } qw(Moo Moose Moo::Role Moose::Role Mouse Mouse::Role);
 my %MODIFIER   = map { $_ => 1 } qw(before after around);
+# field attributes that generate a getter (`field $x :reader` -> `$self->x`)
+my %FIELD_ACCESSOR = map { $_ => 1 } qw(reader accessor mutator);
 # native-class / Object::Pad class attributes -> edge kind
 my %CLASS_ATTR = (isa => 'extends', does => 'implements');
+# CST node types that each add one branch -> cyclomatic complexity. The keyword
+# nodes cover both block and statement-modifier forms (`if (..) {}` and `.. if ..`);
+# tree-sitter exposes short-circuit operators with the operator string as the type.
+my %DECISION = map { $_ => 1 } qw(if unless elsif while until for foreach when
+                                  conditional_expression && || // and or);
 
 sub extract ($self, $tree) {
     my $file = $self->_emit({ kind => 'file', name => $self->file_path,
@@ -74,6 +81,7 @@ sub _walk ($self, $node, $cur_sub) {
         }
         elsif ($t eq NODE_SUB || $t eq NODE_METHOD_DECL) {
             my $snode = $self->_handle_sub($child);
+            local $self->{_vartype} = {};   # fresh `my $x = Class->new` -> Class scope per sub body
             $self->_walk($child, $snode // $cur_sub);
         }
         elsif ($t eq NODE_VAR_DECL) {
@@ -94,8 +102,8 @@ sub _walk ($self, $node, $cur_sub) {
             $self->_walk($child, $cur_sub);
         }
         elsif ($t eq NODE_METHOD_CALL) {
-            $self->_handle_method_call($child, $cur_sub);
-            $self->_walk($child, $cur_sub);
+            if ($self->_mojo_app && $self->_handle_helper($child)) { }   # $app->helper(...) -- body walked inside
+            else { $self->_handle_method_call($child, $cur_sub); $self->_walk($child, $cur_sub) }
         }
         elsif ($t eq NODE_REFGEN) {
             $self->_handle_refgen($child, $cur_sub);
@@ -103,8 +111,11 @@ sub _walk ($self, $node, $cur_sub) {
         }
         elsif (grep { $_ eq $t } @{ +CALL_TYPES }) {
             if    ($self->_framework_now && $self->_handle_route($child, $cur_sub))    {}
+            elsif ($self->_mojo_app      && $self->_handle_helper($child))             {}
             elsif ($self->_moosey_now    && $self->_handle_modifier($child, $cur_sub)) {}
-            elsif ($self->_moosey_now    && ($self->_handle_isa_fn($child, 'with',    'implements')
+            elsif (($self->_moosey_now || $self->_mojo_now) && $self->_handle_has($child)) {}
+            elsif (($self->_moosey_now || $self->_mojo_now)                       # Mojo::Base composes roles with `with` too
+                                          && ($self->_handle_isa_fn($child, 'with',    'implements')
                                           || $self->_handle_isa_fn($child, 'extends', 'extends')))     {}
             else  { $self->_handle_call($child, $cur_sub); $self->_walk($child, $cur_sub) }
         }
@@ -118,6 +129,8 @@ sub _src_id ($self) { $self->{_pkg} ? $self->{_pkg}{id} : $self->{_file}{id} }
 
 sub _framework_now ($self) { ($self->{_pkg} && $self->{_pkg}{_framework}) || $self->{_framework_file} }
 sub _moosey_now    ($self) { ($self->{_pkg} && $self->{_pkg}{_moosey})    || $self->{_moosey_file} }
+sub _mojo_now      ($self) { ($self->{_pkg} && $self->{_pkg}{_mojo})      || $self->{_mojo_file} }
+sub _mojo_app      ($self) { $self->_mojo_now || (($self->_framework_now // '') eq 'mojo') }
 
 sub _handle_package ($self, $n) {
     my $nm = $n->{fields}{ +F_NAME };
@@ -132,6 +145,9 @@ sub _handle_package ($self, $n) {
 # Native `class NAME :isa(Parent) { ... }` (perl 5.38 feature 'class' / Object::Pad).
 # Mirrors _handle_package but emits a class node and turns :isa into an extends edge
 # (null target, resolved by name later -- same shape as `use parent` / @ISA).
+# an attribute_value arrives as a raw token (`(Parent)`, `'Parent'`); strip the wrapping
+sub _attr_value ($v) { (my $t = $v->{text} // '') =~ s/\A[\s('"]+|[\s)'"]+\z//g; $t }
+
 sub _handle_class ($self, $n) {
     my $nm = $n->{fields}{ +F_NAME };
     my $name = $nm ? $nm->{text} : 'main';
@@ -145,7 +161,7 @@ sub _handle_class ($self, $n) {
             my $an = $a->{fields}{ +F_NAME } or next;
             my $kind = $CLASS_ATTR{ $an->{text} } or next;   # :isa -> extends, :does -> implements
             my $v = $a->{fields}{ +F_VALUE } or next;
-            (my $base = $v->{text}) =~ s/^[\s('"]+|[\s)'"]+$//g;   # attribute_value is a raw token
+            my $base = _attr_value($v);
             $self->_edge($cnode->{id}, undef, $kind, metadata => { via => $an->{text}, name => $base })
                 if length $base;
         }
@@ -165,6 +181,25 @@ sub _handle_field ($self, $n) {
         start_line => $n->{sl}, end_line => $n->{el},
         visibility => ($name =~ /^_/ ? 'private' : 'public') });
     $self->_edge($pkg->{id}, $node->{id}, 'contains');
+    # `:reader` / `:accessor` / `:mutator` generate a getter method (named after the
+    # field, or `:reader(custom)` -> custom) so `$self->x` resolves statically.
+    my ($attrlist) = grep { $_->{type} eq 'attrlist' } @{ $n->{children} };
+    my @attrs = $attrlist ? grep { $_->{type} eq NODE_ATTRIBUTE } @{ $attrlist->{children} } : ();
+    # `:isa(Class)` gives any generated getter a return type (so `$self->x->m` chains).
+    my $returns;
+    for my $a (@attrs) {
+        my $an = $a->{fields}{ +F_NAME } or next;
+        next unless ($an->{text} // '') eq 'isa';
+        my $v = $a->{fields}{ +F_VALUE } or next;
+        $returns = _attr_value($v); last;
+    }
+    for my $a (@attrs) {
+        my $an = $a->{fields}{ +F_NAME } or next;
+        next unless $FIELD_ACCESSOR{ $an->{text} };
+        my $acc = $name;
+        if (my $v = $a->{fields}{ +F_VALUE }) { (my $t = $v->{text}) =~ s/\A\s+|\s+\z//g; $acc = $t if length $t }
+        $self->_emit_accessor($pkg, $acc, $n, $returns);
+    }
 }
 
 sub _handle_sub ($self, $n) {
@@ -174,6 +209,10 @@ sub _handle_sub ($self, $n) {
     my $pkgq = $pkg ? $pkg->{qualified_name} : 'main';
     my $sig;
     for my $c (@{ $n->{children} }) { $sig = $c->{text}, last if $c->{type} eq 'signature' }
+    my $cx = $self->_complexity($n);
+    my %meta;
+    $meta{complexity} = $cx if $cx > 1;                         # omit the trivial cx=1
+    if (my $r = $self->_return_class($n)) { $meta{returns} = $r }   # a `Class->new` builder
     my $snode = $self->_emit({
         kind           => ($n->{type} eq NODE_METHOD_DECL ? 'method' : 'function'),
         name           => $name,
@@ -181,10 +220,23 @@ sub _handle_sub ($self, $n) {
         start_line     => $n->{sl}, end_line => $n->{el},
         signature      => $sig,
         visibility     => ($name =~ /^_/ ? 'private' : 'public'),
+        (%meta ? (metadata => \%meta) : ()),
     });
     $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $snode->{id}, 'contains');
     $self->_handle_catalyst($n, $snode);
     return $snode;
+}
+
+# Cyclomatic complexity of a sub: 1 + the decision points in its body (branches,
+# loops, ternaries, short-circuit logical ops). A cheap CST node-type count.
+sub _complexity ($self, $node) {
+    my $c = 1;
+    my @stack = ($node);
+    while (my $n = shift @stack) {
+        $c++ if $DECISION{ $n->{type} // '' };
+        push @stack, @{ $n->{children} // [] };
+    }
+    return $c;
 }
 
 # Dancer2/Mojo::Lite: `get '/x' => sub {...}` -> route node + anon handler (scoped).
@@ -248,7 +300,7 @@ sub _handle_catalyst ($self, $n, $snode) {
         next unless $CAT_ATTR{ $aname->{text} };
         push @routing, $aname->{text};
         if ($aname->{text} eq 'Path' && (my $v = $a->{fields}{ +F_VALUE })) {
-            (my $t = $v->{text}) =~ s/^[\s('"]+|[\s)'"]+$//g;     # attribute_value is a raw token
+            my $t = _attr_value($v);
             $path //= $t if length $t;
         }
     }
@@ -291,9 +343,18 @@ sub _handle_use ($self, $n) {
         }
         # Mojo::Base always declares a class, even `use Mojo::Base -base;` (no parent).
         $self->{_pkg}{_is_class} = 1 if $self->{_pkg} && ($module eq 'Mojo::Base' || @bases);
+        # Mojo::Base classes declare attributes with `has` (always a rw accessor
+        # named after the attribute; the optional 2nd arg is a default, not options).
+        if ($module eq 'Mojo::Base') {
+            if ($self->{_pkg}) { $self->{_pkg}{_mojo} = 1 } else { $self->{_mojo_file} = 1 }
+        }
     }
     elsif (!$PRAGMA{$module}) {
-        $self->_edge($self->_src_id, undef, 'imports', metadata => { via => 'use', module => $module });
+        # record the explicitly-imported symbols (`use Foo qw(a b)` / `use Foo 'a'`)
+        # so the resolver can resolve a later bareword `a()` to Foo::a in this scope.
+        my @syms; $self->_collect_strings($n, \@syms);
+        $self->_edge($self->_src_id, undef, 'imports',
+            metadata => { via => 'use', module => $module, (@syms ? (symbols => \@syms) : ()) });
     }
 }
 
@@ -342,8 +403,9 @@ sub _handle_require ($self, $n) {
 }
 
 sub _handle_assign ($self, $n) {
-    my $pkg  = $self->{_pkg} or return;
     my $left = $n->{fields}{ +F_LEFT } or return;
+    $self->_infer_var_type($left, $n->{fields}{ +F_RIGHT });   # `my $x = Class->new` -> remember $x : Class
+    my $pkg  = $self->{_pkg} or return;
     # Require an array (@-sigil) container, so a scalar like `my $ISA = ...` is
     # NOT mistaken for @ISA / @EXPORT.
     my $arr  = $self->_find_descendant($left, 'array') or return;
@@ -360,6 +422,61 @@ sub _handle_assign ($self, $n) {
     else {  # EXPORT / EXPORT_OK
         $self->_exports->{$_} = 1 for @vals;
     }
+}
+
+# Local type inference: `my $x = Class->new(...)` -> remember the lexical's class
+# in the current sub's scope, so a later `$x->method` resolves against Class's MRO
+# (deterministic, not a guess). Only the literal-class `->new` constructor idiom
+# (high precision); the scope is reset per sub by `local $self->{_vartype}`.
+# The class of a `Class->new(...)` literal-constructor expression, or undef.
+sub _constructor_class ($self, $node) {
+    return undef unless $node && ($node->{type} // '') eq NODE_METHOD_CALL;
+    my $m = $node->{fields}{ +F_METHOD } or return undef;
+    return undef unless ($m->{text} // '') eq 'new';            # constructor convention
+    my $inv = $node->{fields}{ +F_INVOCANT } or return undef;
+    my $c = $inv->{text} // '';
+    return $c =~ /\A\w+(?:::\w+)*\z/ ? $c : undef;              # a literal class, not a $var/expr
+}
+
+sub _infer_var_type ($self, $left, $right) {
+    my $cls = $self->_constructor_class($right) or return;
+    my @scalars = $self->_descendants($left, 'scalar');
+    return unless @scalars == 1;                                 # a single `my $x` (skip `my ($a,$b)` / arrays)
+    my $vn = $self->_find_descendant($scalars[0], NODE_VARNAME) or return;
+    ($self->{_vartype} //= {})->{ '$' . $vn->{text} } = $cls;
+}
+
+# The return type of a sub when it's a `Class->new` builder: the class of every
+# `return Class->new` plus the implicit-return last statement, if they all agree.
+sub _return_class ($self, $sub) {
+    my ($block) = grep { ($_->{type} // '') eq NODE_BLOCK } @{ $sub->{children} // [] };
+    return undef unless $block;
+    my %cls;
+    # explicit `return Class->new` anywhere in the body (statements are wrapped
+    # in expression_statement; the constructor sits under a return_expression)
+    for my $re ($self->_descendants($block, 'return_expression')) {
+        my ($mc) = grep { ($_->{type} // '') eq NODE_METHOD_CALL } @{ $re->{children} // [] };
+        my $c = $self->_constructor_class($mc); $cls{$c}++ if defined $c;
+    }
+    # implicit return: the last meaningful statement's top expression is Class->new
+    my @stmts = grep { ($_->{type} // '') !~ /\A[{}();,;]\z/ } @{ $block->{children} // [] };
+    if (my $last = $stmts[-1]) {
+        my $expr = ($last->{type} // '') eq NODE_METHOD_CALL ? $last
+                 : (grep { ($_->{type} // '') eq NODE_METHOD_CALL } @{ $last->{children} // [] })[0];
+        my $c = $self->_constructor_class($expr); $cls{$c}++ if defined $c;
+    }
+    my @c = keys %cls;
+    return @c == 1 ? $c[0] : undef;                              # only when unambiguous
+}
+
+sub _descendants ($self, $node, $type) {
+    my @out;
+    my @stack = ($node);
+    while (my $n = shift @stack) {
+        push @out, $n if ($n->{type} // '') eq $type;
+        push @stack, @{ $n->{children} // [] };
+    }
+    return @out;
 }
 
 # Gather string values from a subtree: string_literal contents, and qw(...) words.
@@ -411,6 +528,120 @@ sub _role_names ($self, $node, $acc) {
     if ($t eq NODE_QW)             { my $c = $node->{fields}{ +F_CONTENT }; push @$acc, split ' ', $c->{text} if $c; return }
     if ($t eq NODE_STRING_CONTENT) { push @$acc, $node->{text}; return }
     $self->_role_names($_, $acc) for @{ $node->{children} };
+}
+
+# `has 'x' => (...)` -> accessor method node(s), so `$self->x` resolves statically.
+# Moo/Moose: honors reader/writer/accessor renames and `is => 'bare'` so we never
+# emit an accessor that doesn't exist (the runtime MOP pass also finds these, as
+# `mop`). Mojo::Base: always a rw accessor named after the attribute.
+sub _handle_has ($self, $n) {
+    my $fn = $n->{fields}{ +F_FUNCTION } or return 0;
+    return 0 unless ($fn->{text} // '') eq 'has';
+    my $pkg  = $self->{_pkg} or return 0;
+    my $args = $n->{fields}{ +F_ARGUMENTS } or return 0;
+    # `has 'x'` / `has [qw(a b)]` pass the attribute spec directly; `has x => (...)`
+    # / `has x => $default` wrap the args in a list_expression (spec is child 0).
+    my $list  = ($args->{type} // '') eq 'list_expression';
+    my @attrs = $self->_has_names($list ? $args->{children}[0] : $args) or return 0;
+    # Mojo::Base `has` always generates a rw accessor named after each attribute
+    # (no is/reader/writer -- the optional 2nd arg is a default value).
+    if ($self->_mojo_now) {
+        $self->_emit_accessor($pkg, $_, $n) for grep { /\A\w+\z/ } @attrs;
+        $pkg->{_is_class} = 1;
+        return 1;
+    }
+    my %opt    = $self->_has_options($list ? $args->{children} : []);
+    my $single = @attrs == 1;        # reader/writer/accessor renames apply to a single attribute only
+    for my $attr (@attrs) {
+        next unless $attr =~ /\A\w+\z/;
+        my @acc;
+        if    ($single && defined $opt{accessor}) { @acc = ($opt{accessor}) }
+        elsif ($single && defined $opt{reader})   { @acc = ($opt{reader}) }
+        elsif (defined $opt{is} && $opt{is} ne 'bare') { @acc = ($attr) }   # default accessor = attribute name (needs an `is`)
+        push @acc, $opt{writer} if $single && defined $opt{writer};
+        $self->_emit_accessor($pkg, $_, $n, $opt{isa}) for grep { defined && /\A\w+\z/ } @acc;
+    }
+    $pkg->{_is_class} = 1;
+    return 1;
+}
+
+# attribute name(s) from `has`'s first argument: a string, an autoquoted bareword,
+# or an array ref of them (`has [qw(a b)] => ...`).
+sub _has_names ($self, $spec) {
+    return () unless $spec;
+    my $t = $spec->{type};
+    return ($spec->{text}) if $t eq 'autoquoted_bareword';
+    if ($t eq NODE_STRING_LIT || $t eq NODE_INTERP_STRING) {
+        my $sc = $self->_find_descendant($spec, NODE_STRING_CONTENT);
+        return $sc ? ($sc->{text}) : ();
+    }
+    if ($t eq 'anonymous_array_expression') { my @n; $self->_collect_strings($spec, \@n); return @n }
+    return ();
+}
+
+# accessor-naming options (is / reader / writer / accessor) -> their string values.
+sub _has_options ($self, $kids) { my %o; $self->_scan_opts($_, \%o) for @$kids; return %o }
+sub _scan_opts ($self, $node, $opt) {
+    # never mine option pairs out of a VALUE container -- a default/builder sub or
+    # a hashref/arrayref default can contain `accessor => '...'` that is not a has
+    # option (real has-options are flat in the argument list).
+    return if $node->{type} eq NODE_ANON_SUB
+           || $node->{type} eq 'anonymous_hash_expression'
+           || $node->{type} eq 'anonymous_array_expression';
+    my @c = @{ $node->{children} // [] };
+    for my $i (0 .. $#c) {
+        my $key = $self->_word($c[$i]) // next;
+        next unless $key =~ /\A(?:is|reader|writer|accessor|isa)\z/;   # isa => 'Class' gives the accessor a return type
+        next unless $i < $#c && (($c[$i+1]{text} // '') eq '=>');
+        my $val = $self->_word($c[$i+2]) // next;
+        $opt->{$key} //= $val;
+    }
+    $self->_scan_opts($_, $opt) for @c;
+}
+# literal value of a string-literal / autoquoted-bareword node, else undef
+sub _word ($self, $node) {
+    return undef unless $node;
+    my $t = $node->{type};
+    return $node->{text} if $t eq 'autoquoted_bareword';
+    if ($t eq NODE_STRING_LIT || $t eq NODE_INTERP_STRING) {
+        my $sc = $self->_find_descendant($node, NODE_STRING_CONTENT);
+        return $sc ? $sc->{text} : undef;
+    }
+    return undef;
+}
+
+sub _emit_accessor ($self, $pkg, $name, $n, $returns = undef) {
+    my %meta = (accessor => 1);
+    $meta{returns} = $returns if defined $returns && $returns =~ /\A\w+(?:::\w+)*\z/;   # a literal class -> getter return type
+    my $node = $self->_emit({ kind => 'method', name => $name,
+        qualified_name => qualify($pkg->{qualified_name}, $name),
+        start_line => $n->{sl}, end_line => $n->{el},
+        visibility => ($name =~ /^_/ ? 'private' : 'public'),
+        metadata => \%meta });
+    $self->_edge($pkg->{id}, $node->{id}, 'contains');
+    return $node;
+}
+
+# Mojolicious helper registration: `helper name => sub {...}` or
+# `$app->helper(name => sub {...})`. A helper is callable as `$c->name` on any
+# controller, so it becomes a method node the resolver matches by name (framework
+# provenance). Only simple (non-dotted) helper names are handled.
+sub _handle_helper ($self, $n) {
+    my $kw = $n->{fields}{ +F_FUNCTION } // $n->{fields}{ +F_METHOD };
+    return 0 unless $kw && ($kw->{text} // '') eq 'helper';
+    my $args = $n->{fields}{ +F_ARGUMENTS } or return 0;
+    my $name = $self->_method_arg($args);
+    return 0 unless defined $name && $name =~ /\A\w+\z/;
+    my $handler = $self->_find_descendant($args, NODE_ANON_SUB);
+    my $pkg  = $self->{_pkg};
+    my $pkgq = $pkg ? $pkg->{qualified_name} : 'main';
+    my $node = $self->_emit({ kind => 'method', name => $name,
+        qualified_name => qualify($pkgq, $name),
+        start_line => ($handler // $n)->{sl}, end_line => ($handler // $n)->{el},
+        metadata => { provenance => 'framework', helper => 1 } });
+    $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $node->{id}, 'contains', provenance => 'framework');
+    if ($handler && (my $body = $handler->{fields}{ +F_BODY })) { $self->_walk($body, $node) }
+    return 1;
 }
 
 sub _handle_modifier ($self, $n, $cur_sub) {
@@ -487,11 +718,36 @@ sub _handle_method_call ($self, $n, $cur_sub) {
     return unless defined $meth && length $meth;
     my $inv  = $n->{fields}{ +F_INVOCANT };
     my $recv = $inv ? $inv->{text} : undef;
+    my %cand;
+    $cand{receiver}      = $recv if defined $recv;
+    my $rtype = defined $recv ? ($self->{_vartype} // {})->{$recv} : undef;   # inferred via `my $recv = Class->new`
+    $cand{receiver_type} = $rtype if $rtype;
+    # chained `BASE->attr->method`: type the inner BASE so the resolver can read
+    # the intermediate accessor's declared return type (`has attr => isa => ...`).
+    if ($inv && $inv->{type} eq NODE_METHOD_CALL) {
+        my $bm = $inv->{fields}{ +F_METHOD };
+        my $bi = $inv->{fields}{ +F_INVOCANT };
+        my $bt = $bi ? ($bi->{text} // '') : '';
+        if ($bm && length($bm->{text} // '') && length $bt) {
+            my %ch = (method => $bm->{text});
+            if    ($bt =~ /\A\$(?:self|class)\z/)            { $ch{base_self} = 1 }
+            elsif ($bt =~ /\A\w+(?:::\w+)*\z/)               { $ch{base_type} = $bt }
+            elsif (my $t = ($self->{_vartype} // {})->{$bt}) { $ch{base_type} = $t }
+            $cand{chain} = \%ch if $ch{base_self} || $ch{base_type};
+        }
+    }
+    # chained `func()->method`: the resolver reads func's inferred return type.
+    elsif ($inv && ($inv->{type} // '') eq NODE_CALL) {
+        my $fn = $inv->{fields}{ +F_FUNCTION }
+              // (grep { ($_->{type} // '') eq NODE_FUNCTION } @{ $inv->{children} // [] })[0];
+        $cand{chain} = { base_func => $fn->{text} }
+            if $fn && ($fn->{text} // '') =~ /\A[\w:]+\z/;
+    }
     push @{ $self->_refs }, {
         from_node_id   => $self->_from_id($cur_sub),
         reference_name => $meth, reference_kind => 'method_call',
         line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
-        candidates => (defined $recv ? { receiver => $recv } : undef),
+        candidates => (%cand ? \%cand : undef),
     };
 }
 

@@ -19,8 +19,8 @@ tree-sitter-perl (via Text::Treesitter) → normalized tree → extractor
   → query / format / CLI
 ```
 
-Every edge records a `provenance` (`static` here; `symtab`/`optree`/`mop`/`xs`/
-`framework` as later layers add them) so partial coverage stays honest.
+Every edge records a `provenance` (`static`/`heuristic` here; `inferred`/`llm`/`symtab`/`optree`/`mop`/
+`xs`/`framework` as later layers add them) so partial coverage stays honest.
 
 ## Install (dev)
 
@@ -48,17 +48,33 @@ The grammar is built into `~/.cache/pcg/tree-sitter-perl` (override with
 
 ```bash
 pcg index .                       # build .pcg/graph.db (parallel parse; --jobs N to set workers)
+pcg index --deps                  # also index used CPAN modules' public API (@INC, no code run) so calls into deps resolve
                                   #   --max-file-size 1M skips huge generated-data files (e.g. Module::CoreList)
 pcg sync                          # incremental update (re-resolves changed files + dependents)
-pcg watch                         # keep it fresh: re-index on every file change (poll)
+pcg watch                         # keep it fresh: re-index on every file change (inotify/poll)
+                                  #   --json emits a {added,changed,deleted,affected_tests} event per
+                                  #   change, for an agent to monitor the stream and react
 pcg explore Some::Module          # matching symbols with source + POD docs + relationships (one call)
 pcg node    Some::Module::thing   # a symbol's source + callers/callees
 pcg callers Some::Module::thing
 pcg callees Some::Module::thing
 pcg impact  Some::Module::thing   # blast radius (transitive callers)
 pcg path    Foo::a Bar::z         # shortest call path: how Foo::a reaches Bar::z
-pcg affected lib/Foo.pm           # files/tests impacted by a change (CI: git diff --name-only | pcg affected --stdin --tests)
+pcg affected lib/Foo.pm           # files/tests impacted by a change (CI: pcg affected --since main --tests)
 pcg unused                        # dead-code candidates: subs nothing references (--all keeps exported/lifecycle subs)
+pcg untested                      # public API symbols no test statically reaches
+pcg deps    Some::Module          # module dependency graph: what it imports / inherits (omit for the whole project)
+pcg cycles                        # circular module dependencies
+pcg hotspots                      # fan-in (+ blast radius) / fan-out / complexity / most-coupled-modules triage
+pcg risk                          # git churn x fan-in: frequently-changed + widely-depended-upon code
+pcg risk --since main             #   ... weighted by churn on the current branch (commits since main)
+pcg cochange                      # files that change together (logical coupling, incl. hidden)
+pcg diff main                     # structural diff vs a git ref: added/removed/changed symbols (+ breaking)
+pcg review main                   # PR review: diff + blast radius + tests to run + breaking, in one report
+pcg api     Some::Module          # a module's public/exported surface
+pcg covers  Some::Module::thing   # which tests exercise a symbol (reverse of affected --tests)
+pcg unresolved [--name M] [--limit N] [--by-receiver]   # opaque $obj->method calls with candidates;
+                                  #   --by-receiver groups by receiver and suggests its class (the candidate-class intersection)
 pcg export --format mermaid --around Some::Module::run   # render the (sub)graph for docs/review (dot|mermaid|json)
 pcg search  thing
 pcg status                        # setup health (parser/grammar/libtree-sitter) + graph counts
@@ -71,8 +87,8 @@ Example:
 $ pcg callees Foo::run
 ## Callees of Foo::run
 
-- `Foo::Bar::help` (function) — lib/Foo/Bar.pm:2
-- `Foo::shout` (function) — lib/Foo.pm:4
+- `Foo::Bar::help` (function) -- lib/Foo/Bar.pm:2
+- `Foo::shout` (function) -- lib/Foo.pm:4
 ```
 
 ## Use with AI agents (MCP)
@@ -85,23 +101,39 @@ pcg index .          # build the graph first
 pcg install          # register the MCP server with Claude Code, then restart it
 ```
 
-`pcg install` adds a stdio entry to `~/.claude.json` and allow-lists the tools in
-`~/.claude/settings.json` (both edits preserve any existing config; `pcg
-uninstall` reverses them):
+`pcg install` adds a stdio entry to `~/.claude.json`, allow-lists the tools in
+`~/.claude/settings.json`, and deploys a `perl-codegraph` skill to
+`~/.claude/skills/` so an agent automatically prefers the graph (and uses it
+wisely) on any Perl codebase. All edits preserve existing config; `pcg uninstall`
+reverses them:
 
 ```json
 "mcpServers": { "pcg": { "type": "stdio", "command": "pcg", "args": ["serve", "--mcp"] } }
 ```
 
-Tools exposed (12): the read tools `pcg_explore`, `pcg_node`, `pcg_search`,
+Tools exposed (24): the read tools `pcg_explore`, `pcg_node`, `pcg_search`,
 `pcg_callers`, `pcg_callees`, `pcg_impact`, `pcg_path`, `pcg_unused`,
-`pcg_affected`, plus lifecycle tools `pcg_index` (with a `runtime` option),
-`pcg_sync` and `pcg_status`. The agent can therefore build and refresh the graph
+`pcg_affected`, `pcg_deps`, `pcg_cycles`, `pcg_hotspots`, `pcg_risk`, `pcg_cochange`, `pcg_diff`, `pcg_review`, `pcg_api`, `pcg_covers`, `pcg_untested`,
+`pcg_unresolved`, `pcg_resolve`, plus lifecycle tools `pcg_index` (with
+`runtime` and `deps` options), `pcg_sync` and `pcg_status`. The
+agent can therefore build and refresh the graph
 itself: on first use it calls `pcg_index`, and after editing code it calls
 `pcg_sync` — no separate `pcg index` run and no server restart. Run the server
 by hand with `pcg serve --mcp [--watch] [path]` (`--watch` also lazily re-indexes
 before tool calls) (newline-delimited JSON-RPC 2.0 over stdio, protocol
 `2024-11-05`).
+
+## Editor integration (LSP)
+
+`pcg lsp [path]` runs a small Language Server over the graph (stdio, LSP base
+protocol). It answers **go-to-definition**, **find-references**, **hover**,
+**document symbols** and **workspace symbol** search from the *resolved* call
+graph — so go-to-def follows the
+`$obj->method` dispatch the resolver (and `--runtime`) tied down, which a
+tags/parser-based Perl LSP can't. It is read-only and stateless: the graph is the
+source of truth, so keep it fresh with `pcg watch` (or `pcg sync`) alongside the
+editor. Point your editor's LSP client at `pcg lsp` for the project root. (New;
+validated at the protocol level — editor-client testing is ongoing.)
 
 ## Runtime enrichment (`--runtime`)
 
@@ -125,35 +157,79 @@ provenance:
 Provenance shows in query output (`-- lib/Animal.pm:5 [optree]`) and in
 `pcg status`, so you always know how a relationship was derived.
 
+## Resolving opaque dispatch (agent-mediated)
+
+Most "unresolved" relationships are opaque `$obj->method` calls static analysis
+can't tie to a class. When you can't (or won't) run the code, the consuming agent
+can resolve them — it's already an LLM with full context:
+
+- **`pcg_unresolved`** lists the opaque method calls that *do* match real
+  candidate methods in the graph (variable receivers only — a literal
+  `Class->method` that didn't resolve is external), each with its candidates and
+  how often it's called. With **`by_receiver`** (CLI `--by-receiver`) it instead
+  groups by `(caller, receiver)` and intersects the classes defining *every* method
+  called on that receiver — a unique intersection is a near-certain type, so pcg does
+  the candidate-narrowing and the agent just confirms it.
+- The agent infers each receiver's class (reading the code as needed) and calls
+  **`pcg_resolve`**. Prefer the **`{ caller, receiver, class }`** form: it types a
+  receiver *once* and resolves *every* method call on it at that site against the
+  class's MRO — so one entry handles `$db->query`, `$db->fetch`, … (far cheaper than
+  the per-call `{ caller, method, receiver, target }` form, which is still accepted).
+  pcg validates the class/target is real (hallucinations are rejected), never
+  fabricates a method the class lacks, writes the edges with **`llm` provenance** (the
+  lowest rank — a later static/runtime resolution always overrides it), and records
+  them in a `resolutions` table so they survive reindex.
+
+So the graph stays honest: LLM-inferred edges are marked `[llm]` and never
+masquerade as proven. `pcg unresolved` shows the same surface for humans.
+
 ## Frameworks & XS
 
-Two static resolvers connect indirection that plain parsing misses (provenance
+Static resolvers connect indirection that plain parsing misses (provenance
 `framework` / `xs`):
 
 - **Web routes** → `route` nodes linked to handlers: Dancer2/Dancer and
   Mojolicious::Lite verb routes (`get '/x' => sub {…}`, with the handler body
   attributed to it), and Catalyst attribute actions (`sub foo :Path :Args(0)`).
+- **Mojolicious** → `Mojo::Base` `has` attributes become accessor methods (so
+  `$self->attr` resolves, including up the MRO), and `helper name => sub` /
+  `$app->helper(...)` registrations become methods that a `$c->name` call
+  resolves to.
 - **XS/C bridge** → `.xs` files are scanned for XSUBs, emitting `language=xs`
   function nodes so Perl calls into C (`Foo::add(...)`) resolve to the XSUB.
 
 ## Scope & limitations (MVP)
 
 - **Static resolution covers idiomatic OO without running code** — bareword
-  calls, `Class->method`, `\&name` references, and `$self`/`$class` method calls
+  calls (including symbols imported via `use Mod qw(name)`), `Class->method`,
+  `\&name` references, and `$self`/`$class` method calls
   (resolved against the enclosing package, the transitive MRO — inheritance via
   `@ISA`/`parent`/`base`/Moo·Moose `extends`/`Mojo::Base`/native `class :isa`, plus
   composed `with`/`:does` roles) all
   become edges — the `$self`/`$class`/role ones as `heuristic` provenance.
-  Moo/Moose modifiers (`before`/`after`/`around`)
-  link as `overrides`.
+  Attribute accessors resolve too: Moo/Moose `has` and native `field :reader`
+  emit accessor methods, so `$self->attr` links statically. Moo/Moose modifiers
+  (`before`/`after`/`around`) link as `overrides`.
+- **Type inference** — when a receiver's class is known statically, its method
+  call resolves against that class's MRO deterministically (provenance
+  `inferred`), closing a chunk of opaque `$obj->method` dispatch with no runtime
+  and no LLM. Sources: a local constructor (`my $db = Store->new; …; $db->save`),
+  a chain through a typed accessor (`has db => (isa => 'Store')` or native
+  `field $db :reader :isa(Store)`, so `$self->db->save` resolves), and a
+  `Class->new` builder's return type (`sub make_db { Store->new }`, so
+  `make_db()->save` and `$self->make_db->save` resolve). Never a method the class
+  lacks — recall without false edges.
 - **`pcg index --runtime` resolves the rest** — true dynamic dispatch (`B::`
   optree), the real runtime `@ISA`, generated subs (`Devel::Symdump`), and
-  Moose/Moo roles & attributes (MOP) — and upgrades `heuristic` edges to
+  Moose/Moo roles & attributes (MOP) — and upgrades `heuristic`/`inferred` edges to
   authoritative `optree`/`mop`. Still partial without it: `AUTOLOAD`,
-  string-dispatched methods (`$obj->$name`), and `$obj->method` on opaque receivers.
+  string-dispatched methods (`$obj->$name`), and `$obj->method` on receivers
+  whose class isn't locally inferable (injected, returned, or from another sub).
 - **Incremental `sync`** re-resolves changed files *and their dependents* (the
   files that call/reference them), so renames and removals don't leave stale
-  cross-file edges — no full `pcg index` needed for correctness.
+  cross-file edges — no full `pcg index` needed for correctness. After a `pcg`
+  *upgrade*, the first `index`/`sync` also re-extracts any file extracted by an
+  older version (even if unchanged), so extraction improvements take effect at once.
 
 ## Tests
 

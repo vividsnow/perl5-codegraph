@@ -1,5 +1,458 @@
 Revision history for App-PerlGraph
 
+0.029     2026-06-21
+          - Pre-release review (multi-agent, several passes over the whole dist). Fixes:
+            * CORRECTNESS (pcg diff / review on non-ASCII code): the working-tree side read
+              the file with slurp_utf8 (decoded characters) while the git side (git show)
+              and every other parse site use raw bytes -- so a sub whose name contains
+              non-ASCII (or any unicode identifier) keyed differently on each side and an
+              UNCHANGED such sub was reported as both removed AND added (a phantom breaking
+              change). Diff now reads raw bytes, matching git show. (t/70)
+            * CORRECTNESS (pcg lsp): a well-framed but MALFORMED JSON message body killed
+              the server -- the decode failure returned undef, which the read loop treats as
+              EOF, so one bad frame ended the session. A malformed frame is now skipped (the
+              server keeps serving); only a true EOF stops it. (t/63)
+            * ROBUSTNESS (pcg install / uninstall): a malformed ~/.claude.json or
+              ~/.claude/settings.json crashed the command with a raw JSON exception;
+              _read_json now reports a clear "cannot parse FILE" error and leaves the file
+              untouched (rather than risk clobbering it). (t/16)
+            * ROBUSTNESS (parallel-indexer fork-safety): the child's extraction loop sat
+              OUTSIDE its eval guard, so a worker that died mid-extract could unwind past
+              the fork block and run on as a rogue process -- under the long-lived MCP
+              server, a second server writing on the shared stdout. The whole child body
+              is now eval-wrapped so any failure reaches POSIX::_exit; the parent already
+              redoes a failed chunk serially. (t/42)
+            * ROBUSTNESS (--runtime on a THREADED perl -- the common distro/macOS build):
+              the optree enricher read a method_named op's name via meth_sv, which is a
+              null B::SPECIAL on a threaded perl, so dynamic `$self->method` calls never
+              resolved to authoritative `optree` edges (they stayed at the static
+              `heuristic`). The name lives in the CV's pad at op->targ there; new
+              Runtime::_meth_name reads it (mirrors the gv-in-pad _find_gv fix, but METHOP
+              uses ->targ not ->padix). Caught by the threaded CI matrix entry running for
+              the first time. (t/20, t/21)
+            * Removed dead code: Store::file_hashes -- orphaned when _index_parallel
+              switched to file_states in 0.027 (zero callers).
+            * Docs synced: `pcg unresolved --by-receiver` added to bin/pcg POD + README
+              (the README never listed `pcg unresolved` at all); a note that a pcg upgrade
+              re-extracts unchanged files (extraction_version); the by_receiver workflow in
+              the agent-mediated resolve section. A comprehensive audit of every MCP tool
+              description against its actual output corrected three agent-facing inaccuracies:
+              pcg_hotspots said "most complex (fan-out)" (it returns FOUR lists -- fan-in,
+              fan-out, cyclomatic complexity, efferent coupling; the CLI/POD/README lines too);
+              pcg_review claimed it "composes ... impact" (it composes the affected-file
+              closure, not the impact query) and a caller count for "each touched symbol" (only
+              breaking ones are shown); pcg_diff omitted `class` from its kind list. The other
+              21 tool descriptions audited accurate.
+            * `pcg unresolved --by-receiver --name M` (and the MCP by_receiver+name) now
+              narrows to the receivers that call method M -- previously --name was silently
+              ignored in by-receiver mode. Added `--by-receiver` to the SYNOPSIS too. The
+              by-receiver list defaults to limit 50, matching plain `unresolved` and the
+              documented pcg_unresolved default (was an undocumented 40).
+            * Tests +28 (976 total): the regressions above (non-ASCII diff t/70, LSP
+              malformed-frame t/63, malformed-config install t/16, parallel fork-fault t/42);
+              new coverage for CLI
+              happy-paths of the git commands risk / cochange / diff / review incl.
+              risk --since (t/75, which previously covered only their no-git error paths),
+              a fresh-home install (t/16), and `index --runtime` flag-through (t/58);
+              extraction_version re-extract in the PARALLEL path (t/42), resolve_targets
+              multi-class intersection + ranking + the --name filter (t/74), pcg_unresolved
+              by_receiver via MCP + the status lib/test split (t/15), CLI `unresolved
+              --by-receiver` (t/58).
+
+0.028     2026-06-21
+          - LLM resolution, guided: pcg_unresolved gains a by_receiver mode (CLI
+            `pcg unresolved --by-receiver`) that groups opaque $obj->method calls by
+            (caller, receiver) and intersects the classes defining EVERY method called on
+            that receiver. A UNIQUE intersection is a near-certain type -- pcg does the
+            candidate-narrowing so the agent confirms rather than derives, then resolves
+            the whole receiver with one pcg_resolve { caller, receiver, class }. On jakutia
+            309 receivers (of 2146 multi-method) pin a unique class; the top ones ($g/6
+            methods -> Model::Graphite, $rtb/9 -> Role::Data::User) cover dozens of calls
+            each. New Query::resolve_targets + Format::resolve_targets; pcg_unresolved
+            by_receiver option (still 24 MCP tools).
+          - `pcg status` (+ pcg_status) now splits unresolved into "in your code" vs
+            "in tests" -- on Feersum, 437 of 4432 are in lib and 3995 in tests (opaque
+            CPAN-client dispatch, the expected frontier), so the headline number stops
+            making a well-resolved lib look bad.
+          - Tests +4 (948 total): resolve_targets unique/narrow-class intersection + format.
+
+0.027     2026-06-21
+          - UX/recall improvements from re-evaluating on three real codebases
+            (jakutia/Mojo, torus/plain-OO, Feersum/XS):
+            * External-call recognition extended to the modern test+util stack
+              (Test2::Tools::Compare D/U/hash/array/item/in_set/match/validator/...,
+              Ref::Util is_plain_*, POSIX/Time::HiRes/Encode barewords) -- these were
+              left as phantom "unresolved". On jakutia this clears ~2370 of 4352
+              unresolved barewords (55%%), so pcg_status/unresolved/unused stop
+              reporting CPAN noise as project gaps.
+            * `with q{Role}` role composition is now recognized in Mojo::Base classes
+              (Role::Tiny), not just Moo/Moose -- jakutia gains 97 implements edges and
+              the role methods become reachable up the MRO (so $self->role_method
+              resolves). The `with` calls are no longer phantom-unresolved.
+            * extraction_version wired: a file is re-extracted on the next index/sync
+              when the extractor version bumped, even if its bytes are unchanged -- so an
+              extraction upgrade (like the `with` fix) actually reaches existing indexes
+              instead of being silently skipped by the hash check. New Store::file_fresh/
+              file_states; the schema column was previously inert.
+          - Re-eval confirmed query latency is fine (0.13-0.54s on jakutia's 34k graph),
+            Perl->XS resolution works (264 calls into XS on Feersum), and Feersum's high
+            unresolved is concentrated in test files (opaque CPAN-client dispatch).
+          - Tests +36 (944 total): t/57 (modern-stack external recognition), t/52 (Mojo
+            `with` roles), t/11 (extraction_version re-extract).
+
+0.026     2026-06-21
+          - Pre-release review (multi-agent: correctness / consistency / cleanliness /
+            security / performance; findings adversarially verified). Fixes:
+            * SECURITY (git argument injection -> arbitrary file write): a ref/`--since`
+              value beginning with `-` was passed bare to git, so e.g.
+              `pcg review --output=FILE` (or the pcg_review/pcg_diff/pcg_affected MCP
+              tools, which an agent may drive on untrusted input) ran
+              `git diff ... --output=FILE`, writing an arbitrary file. Git refs can
+              never start with `-`, so Git::changed/show/churn now reject such values
+              at the chokepoint (Git::_safe_ref).
+            * Format::resolved no longer garbles the receiver-type pcg_resolve form
+              ({caller,receiver,class}): it carries no method/target keys, which produced
+              uninitialized-value warnings and a blank "->" line. Now rendered as
+              "`caller` `receiver` is `Class` -- N call(s) resolved".
+            * pcg_diff via MCP no longer requires an index (it parses git directly, like
+              the CLI `pcg diff`); pcg_review still needs one.
+            * Git::_run no longer permanently silences STDERR when the save-dup fails -- it
+              only redirects to /dev/null when it can later restore (matters for the
+              long-lived MCP/LSP servers).
+            * `pcg risk --since REF` (+ pcg_risk since) weights risk by churn on the current
+              branch -- wiring Git::churn's `since`, previously dead. MCP reached CLI parity:
+              pcg_cochange gained max_files, pcg_affected gained `since` (CI triage -- tests
+              to run for the diff vs main -- in one MCP call).
+            * _index_parallel reaps already-forked workers if a later fork fails (no zombies
+              in the long-lived server). Query::resolve persists each learned method once,
+              not once per call site. Format::unresolved points at the preferred form.
+            * CLI `pcg affected --since` now uses git `--relative` (like diff/review/risk),
+              fixing it for a project nested in a larger repo, and shares Git::changed --
+              removing a duplicate git wrapper (`_git_changed`) that also skipped the
+              Perl-file filter.
+            * Runtime optree enricher (`pcg index --runtime`): _find_gv resolved named
+              function calls only on a NON-threaded perl (gv = B::SVOP); on a THREADED
+              perl -- the default Debian/Ubuntu/Fedora/macOS build -- gv ops are B::PADOP
+              (the GV lives in the pad, not the op), so every optree function-call edge
+              was silently dropped. Now reads the GV from the CV's pad via op->padix; a
+              threaded CI matrix entry now exercises that path.
+          - Cleanliness: Resolver SUPER computes the enclosing package once; _resolve_call
+            uses a single callable closure (was three copies of the same grep); Extractor
+            _attr_value and Runtime _cv_owner de-dup repeated idioms; Format::_breaking_count.
+            Fixed a stranded doc-comment that mislabeled Query::hotspots, and strengthened
+            t/00's vacuous version assertion.
+          - Performance (large-graph N+1s): resolve_all memoizes the enclosing-package
+            lookup per node (was one node() query per unresolved ref -- 30k on jakutia);
+            pcg_unresolved batches its caller-name and candidate-method lookups into two
+            queries (was O(refs)+O(methods)) via new Store node_qnames/callables_by_name.
+          - Packaging: cpanfile now `recommends` Linux::Inotify2 (parity with Makefile.PL,
+            so `cpanm --installdeps` surfaces the event-driven `pcg watch` option).
+          - Docs synced: README (pcg_index deps, risk --since, full provenance list, grammar),
+            bin/pcg + App::PerlGraph SYNOPSIS, CLI + Model POD, USAGE.
+          - Tests +39 (908 total): the git argument-injection reject, Format::resolved
+            (both forms, no warnings), receiver-type error paths, UNIVERSAL DOES/VERSION,
+            SUPER:: with no parent, CPAN untested filter, review caller-count, pcg_diff not
+            index-gated, symbols_like LIKE-escape, churn(since), cochange max_files, the CLI
+            no-git error paths for risk/cochange/diff/review (new t/75), and Diff over
+            whole-file add/delete; strengthened t/00's vacuous version assertion (and fixed
+            a stale skip-count in t/68). Usage/concurrency/packaging/perf passes confirmed
+            the @INC / --runtime / git / SQL / MCP boundaries hold, the documented examples
+            are faithful, and the dist is release-ready.
+            (Rejected false-positives: repeated `pcg index --deps` is idempotent; Diff
+            omitting docstrings is correct -- it diffs signatures, not POD.)
+
+0.025     2026-06-21
+          - LLM resolution at scale: pcg_resolve gains a receiver-TYPE form
+            { caller, receiver, class } -- infer a receiver variable's class ONCE and
+            every opaque method call on it in that caller resolves against the class's
+            MRO at once (one entry handles $db->query, $db->fetch, ...), instead of a
+            per-call { caller, method, receiver, target }. Both forms write `llm` edges,
+            never fabricate a method the class lacks, and persist across reindex. Turns
+            "resolve 25k calls" into "type a few thousand receivers" (on jakutia 87%% of
+            the 29k opaque calls have a real candidate, 13.8k a unique one). New
+            Resolver::method_in_mro. t/74 covers the type form, the no-fabrication
+            guard, persistence, and the still-supported explicit form.
+
+0.024     2026-06-21
+          - Cross-distribution resolution: `pcg index --deps` (and pcg_index deps:true)
+            also indexes the PUBLIC API of the CPAN modules the project use's /
+            inherits from -- located in @INC WITHOUT running any code -- so calls into
+            dependencies resolve. Foo->new->bar, a literal CPAN::Class->method, and
+            inherited $self->method (up the MRO into an indexed parent like
+            Mojolicious::Controller) all link to real nodes. CPAN nodes carry
+            metadata.cpan and are excluded from unused/untested; only public subs +
+            inheritance edges are kept (no internal call graph), crawled with a cap
+            and fail-soft per module. On jakutia (a Mojo app): 223 deps indexed,
+            ~1973 previously-opaque calls resolved.
+          - New Indexer deps flag + _index_deps/_external_targets/_find_inc; t/73
+            covers constructor/bareword/inherited resolution into a fake @INC dep.
+
+0.023     2026-06-21
+          - Resolution recall: `$self->SUPER::method` now resolves to the method on
+            the enclosing class's ancestors (static @ISA, in MRO order). And
+            UNIVERSAL method calls ($obj->can/isa/DOES/VERSION) are recognized as
+            core methods and consumed, not left as phantom "unresolved" project gaps.
+            New Model::is_universal. On jakutia this resolves ~50 SUPER calls and
+            clears ~110 UNIVERSAL non-gaps.
+          - Analysis note: the remaining unresolved is overwhelmingly opaque dispatch
+            into CPAN classes and dynamic/runtime mechanisms -- the static ceiling for
+            a framework app; `pcg index --runtime` (and a future cross-distribution
+            `--deps` pass) are the real levers there.
+          - t/72 covers SUPER resolution, UNIVERSAL consumption, and that a genuine
+            opaque call is not over-consumed.
+
+0.022     2026-06-21
+          - New `pcg review <ref>` command + `pcg_review` MCP tool (24 tools), and
+            App::PerlGraph::Review. One call composes the change analyses into a
+            branch/PR review: the structural diff vs the ref (added/removed/
+            re-signatured symbols, breaking PUBLIC API flagged), the blast radius
+            (files affected), the tests to run, and each touched symbol's caller
+            count. The agent-native "review this branch" operation -- diff +
+            affected + impact in one report.
+          - t/71 covers the composition (breaking detection, affected tests, format).
+
+0.021     2026-06-20
+          - New `pcg diff <ref>` command + `pcg_diff` MCP tool (23 tools), and a new
+            App::PerlGraph::Diff module. Structural ("semantic") diff vs a git ref:
+            which functions/methods/constants/packages were added, removed, or had
+            their signature change between the ref and the working tree -- with
+            breaking changes (removed or re-signatured PUBLIC API) flagged. Both
+            sides are parsed fresh (the ref via `git show`), so it is independent
+            of how stale the on-disk graph is. Ideal for reviewing a branch/PR.
+            Git module gained changed/show/prefix (subdir-aware) and now silences
+            git's own diagnostics. t/70 covers add/remove/signature-change, the
+            breaking flag, private exclusion, and the format.
+
+0.020     2026-06-20
+          - New `pcg cochange` command + `pcg_cochange` MCP tool (22 tools): logical
+            (temporal) coupling -- code files that change together in git history,
+            ranked by Jaccard of their commit sets. Each pair is flagged [no static
+            link] when the call graph has no edge between them, so the high-coupling
+            unlinked pairs are HIDDEN dependencies static analysis can't see.
+            --min-support / --max-files (skip sweeping commits like version bumps).
+          - App::PerlGraph::Git now passes --relative so churn/co-change paths are
+            relative to the indexed root (matching the graph) even when the project
+            is a subdir of a larger git repo -- this also fixes `pcg risk` there.
+            New Store::files_statically_linked.
+          - t/69 covers the mining, the hidden-vs-linked flag, support filtering,
+            non-code exclusion, and the format.
+
+0.019     2026-06-20
+          - New `pcg risk` command + `pcg_risk` MCP tool (21 tools), and a new
+            App::PerlGraph::Git module (read-only `git log` wrapper). History-aware
+            risk: symbols ranked by churn (commits touching their file) x fan-in
+            (how many depend on them) -- the frequently-changed AND widely-depended-
+            upon code that is the top refactor/test target (the CodeScene-style
+            heuristic, over pcg's resolved call graph). Each row shows churn,
+            callers, complexity and the score; on the pcg repo it surfaces
+            Store::init (churned 18x, 55 callers). Degrades cleanly outside a git
+            work tree. Query::risk takes the churn map, staying git-agnostic.
+          - t/68 covers the Git module (churn/transactions/availability) and
+            Query::risk + Format::risk.
+
+0.018     2026-06-20
+          - Interprocedural return-type inference: a `Class->new` builder sub
+            (`sub make_db { Store->new }` / `return Store->new`) records its return
+            type, so `make_db()->save` and `$self->make_db->save` resolve against
+            Store's MRO (`inferred`). Composes with the local + attribute type
+            inference; same precision (only a literal-class constructor, only when
+            the method exists there). New Extractor _constructor_class/_return_class;
+            the resolver chain handler gained a base_func (func()->m) case.
+          - t/67 covers the capture (implicit + explicit returns, the ambiguous/
+            non-constructor negatives) and both chain forms.
+
+0.017     2026-06-20
+          - Cyclomatic complexity per sub: the extractor counts decision points
+            (if/elsif/unless/while/until/for/foreach/when, ternary, &&/||////and/or)
+            in each sub's CST and stores metadata.complexity (omitted when trivially
+            1). Surfaced three ways: in `pcg node`/`explore` headers, as a `cx N`
+            annotation on hotspots fan-in rows (complex AND widely-used = top risk),
+            and a new "Most complex (cyclomatic)" hotspots section (Store::top_complex).
+            On torus it flags main::_run_physics_worker at cx 78. (Picked up on the
+            next full reindex / file change.)
+          - t/66 covers the metric + node-view/hotspots rendering; t/61 the ranking.
+
+0.016     2026-06-20
+          - New `pcg untested` command + `pcg_untested` MCP tool (20 tools): the
+            public API surface (exported / non-_ functions, methods, constants)
+            that no test file statically reaches. One cheap forward closure from
+            the test files, then api() minus what was reached. Omit the module for
+            the whole project. (A symbol exercised only via opaque $obj->method
+            dispatch from a test is invisible to static analysis and may appear.)
+          - New Store::node_file_paths (distinct file_paths from nodes, works on
+            in-memory graphs). t/65 covers the gap detection, private exclusion,
+            format, and module scoping.
+
+0.015     2026-06-20
+          - Added a portable end-to-end LSP test (t/64): indexes a project with the
+            real CLI, then drives the actual `pcg lsp` binary over Content-Length-
+            framed stdio the way an editor does (initialize, the initialized +
+            didOpen notifications, a position-based textDocument/definition, exit)
+            and asserts go-to-def resolves across files to the right line. Hardens
+            the editor-readiness claim short of a GUI client.
+
+0.014     2026-06-20
+          - `pcg hotspots` deepened: each fan-in row now shows its transitive
+            blast radius (reverse-reachable callers, for the shown rows), so a
+            low-fan-in / high-reach symbol stops hiding -- on torus,
+            Torus::Math::torus_dist has 7 direct callers but 20 transitive. Plus a
+            new "most coupled modules" section (efferent coupling: packages that
+            depend on the most other modules, reusing deps()).
+          - t/61 covers the blast-radius annotation and the coupling ranking (+5).
+
+0.013     2026-06-20
+          - LSP: `workspace/symbol` (the editor's project-wide "go to symbol") --
+            a case-insensitive substring match over every symbol in the graph,
+            backed by a new Store::symbols_like (LIKE on name/qualified_name,
+            shortest-first). Advertised via `workspaceSymbolProvider`.
+          - LSP hardened for real clients: the notification stream an editor
+            sends (textDocument/didOpen / didChange / didClose, $/setTrace, ...) is
+            silently ignored, never answered. t/63 covers both additions (+6).
+
+0.012     2026-06-20
+          - New `pcg lsp`: a minimal Language Server over the graph (stdio, LSP
+            base protocol). go-to-definition, find-references, hover and document
+            symbols, answered from the RESOLVED call graph -- so go-to-def follows
+            the `$obj->method` dispatch the resolver (and `--runtime`) tied down,
+            which a tags/parser-based Perl LSP can't. Read-only and stateless; keep
+            the graph fresh with `pcg watch`. New App::PerlGraph::LSP plus Store
+            position lookups (edges_at_source / node_at_start / node_covering) and
+            Query navigation (definition_at / references_at / symbol_at).
+          - t/62 covers the position queries; t/63 the LSP protocol -- initialize
+            capabilities, the four navigation methods, shutdown/unknown/notification
+            edges, and the Content-Length framing both directions. Protocol-level
+            validated; editor-client testing still pending.
+
+0.011     2026-06-20
+          - New `pcg hotspots` command + `pcg_hotspots` MCP tool (19 tools total):
+            call-graph centrality for review/refactor triage -- the most
+            depended-upon symbols (highest fan-in -> high blast radius) and the
+            most complex (highest fan-out), each with its degree and location.
+            `--limit N` (default 15). Cheap SQL aggregates over the existing
+            calls/references edges; codebase-independent (unlike the type-inference
+            work, every graph has a call structure to rank).
+          - t/61 covers the ranking, callable-only filter, format, and CLI/MCP glue.
+
+0.010     2026-06-20
+          - Attribute-type inference (chained dispatch): an accessor with a
+            declared class type -- Moo/Moose `has x => (isa => 'Class')` or native
+            `field $x :reader :isa(Class)` -- gives `$self->x` a return type, so
+            the chained `$self->x->method` resolves against Class's MRO
+            (`inferred`). Composes with the 0.009 local inference, e.g.
+            `my $o = App->new; $o->x->method`. High precision: only a literal-class
+            type, only when the method exists there, never a fabricated edge.
+            (Helps typed-OO codebases; plain-OO / untyped-Mojo apps declare no
+            such types, so no effect there.)
+          - Resolver MRO walk factored into `_method_in`. t/60 covers Moo isa,
+            native field :isa, the untyped/non-class negatives, and the compose.
+
+0.009     2026-06-20
+          - Local (intraprocedural) type inference: `my $x = Class->new; ...;
+            $x->method` now resolves `$x->method` against Class's MRO
+            deterministically -- new `inferred` provenance, ranked above
+            `heuristic` and below `static` (runtime optree/MOP still upgrades it).
+            High precision: only the literal-class `->new` idiom, scoped per sub,
+            and never an edge to a method the class lacks. Closes a chunk of opaque
+            `$obj->method` dispatch with no --runtime and no LLM (+20 call edges,
+            ~10% of the call graph, on a plain-OO codebase; correctly 0 where the
+            local constructors are all CPAN classes).
+          - Docs/skill note the new provenance; t/59 covers the happy path,
+            per-sub scoping, ambiguity-without-false-positives, and non-fabrication.
+
+0.008     2026-06-19
+          - Review-pass fixes: `has` accessor extraction no longer mines
+            option-looking keys (accessor/reader/writer/is) out of a default
+            sub or hashref/arrayref value (could emit a wrongly-named accessor);
+            `pcg watch` rejects an unknown --flag instead of treating it as the
+            root (which could silently enter the watch loop); `Query::resolve`
+            fetches the unresolved set once, not once per resolution in a batch.
+          - pcg_unresolved honors limit:0; the MCP status hint points at
+            pcg_index runtime:true / pcg_resolve; PROVENANCE includes `llm`;
+            README tool list/count corrected (18). New `Store::ref_anchor` helper
+            de-duplicates the (caller, method, receiver) extraction.
+          - Test coverage added: CLI deps/cycles/api/covers/unresolved glue,
+            resolve missing-field + name/limit filters, has writer, watch --json
+            added/deleted events, project-defined qualified-external resolution.
+
+0.007     2026-06-19
+          - Known-external call recognition: bareword/qualified calls to common
+            CPAN exports (Test::More/Test2/Test::Fatal, Carp, List::Util,
+            Scalar::Util, JSON) and qualified externals (AE::/EV::/POSIX::/...)
+            that don't resolve to a project symbol are now recognized as external
+            instead of inflating the "unresolved" count. A bare name the project
+            itself defines is never mistaken for a CPAN export. On real codebases
+            this cut bareword-unresolved ~95% (torus 389->19, Feersum 3736->187),
+            so `pcg status`'s remaining unresolved is the real method-dispatch
+            frontier, not test/CPAN noise.
+          - `pcg install` now deploys a `perl-codegraph` Claude Code skill to
+            ~/.claude/skills/ (removed by `pcg uninstall`), so an agent
+            automatically prefers the graph -- and uses it wisely -- when working
+            on a Perl codebase. The MCP server's own instructions remain the
+            always-loaded usage doc.
+
+0.006     2026-06-19
+          - Fixed a path-keying bug: file paths were keyed by the root *spelling*,
+            so indexing a project as `.` and as its absolute path produced
+            different keys -- a sync under the other spelling saw every file as
+            deleted+new (a spurious full reindex). Paths are now stored canonically
+            (relative to the root); the on-disk path is reconstructed where needed.
+            This matters when a `pcg watch /abs/path` and `pcg serve --mcp` (root
+            `.`) run on the same project.
+          - `pcg watch --json`: emit one structured event per change --
+            { added, changed, deleted, affected_tests } -- so an agent can monitor
+            the stream and react (e.g. re-run the affected tests). Plain `pcg watch`
+            now also reports deletions (it previously printed only on reindex>0).
+          - sync() returns the add/change/delete file lists, not just counts.
+
+0.005     2026-06-19
+          - Agent-mediated resolution of opaque method dispatch. `pcg_unresolved`
+            (MCP) / `pcg unresolved` (CLI) surfaces the `$obj->method` calls that
+            static analysis can't tie to a class but which DO match real candidate
+            methods in the graph, each with its candidates and call frequency.
+            The agent infers each receiver's class and calls `pcg_resolve` to
+            record it: a call edge with `llm` provenance (lowest rank, so any
+            later static/runtime resolution overrides it), validated against real
+            nodes (hallucinated targets rejected). Resolutions persist in a new
+            `resolutions` table and are re-applied after every reindex.
+          - Only variable receivers ($x, $self->{x}) are surfaced -- a literal
+            `Class->method` that didn't resolve is external, not inferrable.
+
+0.004     2026-06-19
+          - Mojolicious support (found by auditing real Mojo codebases):
+            * Mojo::Base `has` attributes now emit accessor methods (all forms:
+              `has 'x'`, `has [qw(a b)]`, `has x => default/sub`), so `$self->x`
+              resolves -- including inherited accessors up the MRO.
+            * `helper name => sub` / `$app->helper(name => sub)` registrations
+              become method nodes; a matching `$c->name` call resolves to the
+              helper (framework provenance).
+          - Completed the builtin list (pack/unpack/glob/fork/waitpid/unlink/
+            system/exec/stat/socket/... and more), so core functions no longer
+            masquerade as unresolved calls. The builtin filter now applies only
+            to bareword calls -- `$obj->print` stays a method, not the builtin.
+          - Indexer skips more noise: `.vscode` / `.idea`, and any nested git
+            repo or `git worktree` (a non-root subdir with its own .git) -- these
+            duplicated or bloated the graph (8x fewer files on one real tree).
+          - `pcg status` / pcg_status break unresolved down into dynamic
+            method-dispatch vs bareword calls, so the number is interpretable.
+
+0.003     2026-06-19
+          - Imported-symbol resolution: a bareword call to a symbol brought in by
+            `use Some::Module qw(name)` now resolves to Some::Module::name even
+            when the name is globally ambiguous (a local definition still wins).
+          - Attribute accessors are resolved statically (no --runtime needed):
+            Moo/Moose `has 'x' => (is => ...)` and native/Object::Pad
+            `field $x :reader` emit accessor *method* nodes, so `$self->x`
+            resolves. Honors reader/writer/accessor renames and `is => 'bare'`
+            (no false accessors). A runtime MOP `field` now coexists with its
+            static accessor method.
+          - New queries / tools: `pcg deps` (module dependency graph),
+            `pcg cycles` (circular dependencies), `pcg api` (a module's
+            public/exported surface), `pcg covers` (which tests exercise a
+            symbol). Exposed over MCP as pcg_deps / pcg_cycles / pcg_api /
+            pcg_covers (sixteen tools total; re-run `pcg install`).
+          - `pcg affected --since REF` takes its changed-file list from
+            `git diff --name-only REF` (CI triage in one command).
+
 0.002     2026-06-19
           - MCP lifecycle tools: pcg_index (with runtime option), pcg_sync and
             pcg_status. The server now bootstraps and refreshes its own graph

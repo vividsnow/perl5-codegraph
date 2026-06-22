@@ -1,6 +1,6 @@
 package App::PerlGraph::Parser;
 use v5.36;
-our $VERSION = q{0.002};
+our $VERSION = q{0.029};
 use Moo;
 use Text::Treesitter;
 no warnings 'recursion';                 # deep but bounded CST walks (after Moo re-enables warnings)
@@ -25,11 +25,6 @@ sub raw_parse ($self, $src) { return $self->_ts->parse_string($src); }
 sub parse_string ($self, $src) {
     my $tree = $self->raw_parse($src);
     return $self->_normalize($tree->root_node);
-}
-
-sub parse_file ($self, $path) {
-    my $src = do { open my $fh, '<:encoding(UTF-8)', $path or die "$path: $!"; local $/; <$fh> };
-    return wantarray ? ($self->parse_string($src), $src) : $self->parse_string($src);
 }
 
 # Convert a Text::Treesitter::Node into a plain hashtree. All 3rd-party Node

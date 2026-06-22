@@ -49,4 +49,20 @@ XS
 my @fns = grep { $_->{kind} eq 'function' } @{ $g->{nodes} };
 is scalar(@fns), 1,      'only the real XSUB detected, not the post-label call';
 is $fns[0]{name}, 'go',  'XSUB is go';
+
+# PREFIX strips the C-function prefix down to the Perl-callable name
+my $pfx = App::PerlGraph::XS->scan('P.xs', "MODULE = Foo    PACKAGE = Foo    PREFIX = foo_\n\nint\nfoo_add(a, b)\n");
+is [ map { $_->{qualified_name} } grep { $_->{kind} eq 'function' } @{ $pfx->{nodes} } ],
+   ['Foo::add'], 'PREFIX = foo_ : foo_add -> Foo::add (the Perl-callable name, so the call resolves)';
+
+# MODULE without an inline PACKAGE uses the module name as the package
+my $np = App::PerlGraph::XS->scan('M.xs', "MODULE = My::Module\n\nint\nadd()\n");
+my ($mpkg) = grep { $_->{kind} eq 'package' } @{ $np->{nodes} };
+is $mpkg->{qualified_name}, 'My::Module', 'MODULE without PACKAGE uses the module name as the package';
+
+# a bare PACKAGE switch mid-file reassigns subsequent XSUBs
+my $sw = App::PerlGraph::XS->scan('S.xs', "MODULE = A    PACKAGE = A\n\nint\na()\n\nPACKAGE = B\n\nint\nb()\n");
+is [ sort map { $_->{qualified_name} } grep { $_->{kind} eq 'function' } @{ $sw->{nodes} } ],
+   ['A::a', 'B::b'], 'a bare PACKAGE switch reassigns the following XSUBs';
+
 done_testing;

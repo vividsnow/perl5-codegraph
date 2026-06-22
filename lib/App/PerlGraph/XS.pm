@@ -1,6 +1,6 @@
 package App::PerlGraph::XS;
 use v5.36;
-our $VERSION = q{0.002};
+our $VERSION = q{0.029};
 use App::PerlGraph::Model qw(node_id);
 
 # Scan an XS (.xs) source into { nodes, edges, refs }: a package node + a
@@ -15,7 +15,7 @@ my %XS_KW = map { $_ => 1 } qw(
 
 sub scan ($class, $file_path, $src) {
     my (@nodes, @edges, %pkg_node, $pkg, $in_xs, $in_body, $lineno);
-    my $prev = ''; $in_xs = 0; $in_body = 0; $lineno = 0;
+    my $prev = ''; $in_xs = 0; $in_body = 0; $lineno = 0; my $prefix = '';
     my $ensure_pkg = sub ($p) {
         $pkg_node{$p} //= _emit(\@nodes, { kind => 'package', name => $p, qualified_name => $p,
             file_path => $file_path, language => 'xs', start_line => $lineno,
@@ -24,16 +24,18 @@ sub scan ($class, $file_path, $src) {
 
     for my $line (split /\n/, $src, -1) {
         $lineno++;
-        if ($line =~ /^\s*MODULE\s*=\s*(\S+)/) {                   # MODULE = X [PACKAGE = Y]
+        if ($line =~ /^\s*MODULE\s*=\s*(\S+)/) {                   # MODULE = X [PACKAGE = Y] [PREFIX = z_]
             $in_xs = 1; $in_body = 0; $prev = '';
             my $mod = $1;
             my ($p) = $line =~ /PACKAGE\s*=\s*(\S+)/;
             $pkg = $p // $mod;
+            ($prefix) = $line =~ /PREFIX\s*=\s*(\S+)/; $prefix //= '';
             $ensure_pkg->($pkg);
             next;
         }
-        if ($in_xs && $line =~ /^\s*PACKAGE\s*=\s*(\S+)/) {        # bare PACKAGE switch
-            $pkg = $1; $ensure_pkg->($pkg); $in_body = 0; $prev = ''; next;
+        if ($in_xs && $line =~ /^\s*PACKAGE\s*=\s*(\S+)/) {        # bare PACKAGE [PREFIX] switch
+            $pkg = $1; ($prefix) = $line =~ /PREFIX\s*=\s*(\S+)/; $prefix //= '';
+            $ensure_pkg->($pkg); $in_body = 0; $prev = ''; next;
         }
         if ($line !~ /\S/) { $in_body = 0; $prev = ''; next; }     # blank line ends an XSUB body
 
@@ -42,8 +44,10 @@ sub scan ($class, $file_path, $src) {
             if (!$XS_KW{$name}
                 && $prev =~ /^[A-Za-z_][\w\s:*&]*$/                # previous line looks like a return type
                 && $prev !~ /[;{}=]/ && $prev !~ /:\s*\z/) {       # ...not a C stmt or section label
-                my $node = _emit(\@nodes, { kind => 'function', name => $name,
-                    qualified_name => "${pkg}::${name}", file_path => $file_path, language => 'xs',
+                my $perl = $name;
+                $perl =~ s/\A\Q$prefix\E// if length $prefix;   # PREFIX strips to the Perl-callable name
+                my $node = _emit(\@nodes, { kind => 'function', name => $perl,
+                    qualified_name => "${pkg}::${perl}", file_path => $file_path, language => 'xs',
                     start_line => $lineno, metadata => { provenance => 'xs' } });
                 push @edges, { source => $pkg_node{$pkg}{id}, target => $node->{id},
                     kind => 'contains', provenance => 'xs' } if $pkg_node{$pkg};

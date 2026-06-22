@@ -13,6 +13,8 @@ requires 'Exporter';
 # Runtime introspection (`pcg index --runtime`) — optional; loaded only when used.
 recommends 'Devel::Symdump';
 recommends 'Class::MOP';
+# Event-driven `pcg watch` on Linux — optional; falls back to mtime polling without it.
+recommends 'Linux::Inotify2';
 
 on 'test' => sub {
     requires 'Test2::V0';

@@ -23,4 +23,11 @@ ok $tgt{ $shout->{id} }, 'same-file call resolved run -> shout';
 
 my $s2 = $idx->sync;
 is $s2->{reindexed}, 0, 'no files reindexed when unchanged';
+
+# extraction_version: a file extracted by an OLDER pcg (stale version) is re-extracted on
+# the next sync even when its bytes are unchanged -- so an extraction upgrade takes effect.
+$store->dbh->do('update files set extraction_version = 0');   # simulate an older extractor
+ok $idx->sync->{reindexed} >= 1, 'a version-stale file is re-extracted on sync (upgrade takes effect)';
+is $idx->sync->{reindexed}, 0,   '... and is fresh again afterwards (back to incremental)';
+
 done_testing;

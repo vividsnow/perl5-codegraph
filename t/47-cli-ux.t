@@ -39,4 +39,15 @@ SKIP: {
     like $out2, qr/graph:\s+nodes=[1-9]/, 'status reports node/edge counts once indexed';
 }
 
+# index flag validation (error paths -- rejected before any work, no grammar needed)
+{
+    my $dir = tempdir;
+    my ($j0)  = $cap_err->(sub { App::PerlGraph::CLI->run('index', '--jobs', '0',   "$dir") });
+    my ($jb)  = $cap_err->(sub { App::PerlGraph::CLI->run('index', '--jobs', 'bad', "$dir") });
+    my ($msz) = $cap_err->(sub { App::PerlGraph::CLI->run('index', '--max-file-size', 'bad', "$dir") });
+    is $j0,  2, 'index --jobs 0 is a usage error';
+    is $jb,  2, 'index --jobs non-numeric is a usage error';
+    is $msz, 2, 'index --max-file-size bad value is a usage error';
+}
+
 done_testing;

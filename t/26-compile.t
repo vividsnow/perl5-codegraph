@@ -9,7 +9,8 @@ my @mods = qw(
     App::PerlGraph::Resolver  App::PerlGraph::Indexer  App::PerlGraph::Query
     App::PerlGraph::Format    App::PerlGraph::Source   App::PerlGraph::MCP
     App::PerlGraph::Installer App::PerlGraph::CLI      App::PerlGraph::Runtime
-    App::PerlGraph::XS
+    App::PerlGraph::XS        App::PerlGraph::Watcher  App::PerlGraph::Pod
+    App::PerlGraph::LSP       App::PerlGraph::Git       App::PerlGraph::Diff       App::PerlGraph::Review
 );
 for my $m (@mods) {
     my $loaded = eval "require $m; 1";

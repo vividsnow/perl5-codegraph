@@ -13,9 +13,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         perl: ['5.36', '5.38', '5.40']
-    name: "${{ matrix.os }} / perl ${{ matrix.perl }}"
+        include:
+          # one threaded build so the --runtime optree enricher's B::PADOP path
+          # (gv lives in the pad, not the op) is exercised -- actions-setup-perl
+          # builds a non-threaded perl by default.
+          - os: ubuntu-latest
+            perl: '5.40'
+            threaded: true
+    name: "${{ matrix.os }} / perl ${{ matrix.perl }}${{ matrix.threaded && ' (threaded)' || '' }}"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build tree-sitter runtime from source (Linux)
         if: runner.os == 'Linux'
@@ -36,6 +43,7 @@ jobs:
         uses: shogo82148/actions-setup-perl@v1
         with:
           perl-version: ${{ matrix.perl }}
+          multi-thread: ${{ matrix.threaded == true }}
 
       - name: Install dependencies
         run: |

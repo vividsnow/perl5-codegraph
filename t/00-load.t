@@ -1,5 +1,5 @@
 use v5.36;
 use Test2::V0;
 use App::PerlGraph;
-ok defined $App::PerlGraph::VERSION, 'version defined';
+like $App::PerlGraph::VERSION, qr/\A\d+\.\d+/, 'VERSION is a dotted version string';
 done_testing;

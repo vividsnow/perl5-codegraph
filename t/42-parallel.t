@@ -48,6 +48,11 @@ is $par4->{stats}{files}, 16, 'all files counted';
     my $again = $idx->index_all;
     is $first->{reindexed}, 16, 'first parallel index processes every file';
     is $again->{reindexed}, 0,  'second parallel index skips unchanged files (hash-skip preserved)';
+
+    # a stale extraction_version (an older pcg) forces re-extraction even under parallelism
+    $s->dbh->do('update files set extraction_version = 0');
+    is $idx->index_all->{reindexed}, 16, 'a version-stale graph is fully re-extracted in the parallel path';
+    is $idx->index_all->{reindexed}, 0,  '... and is fresh again afterwards';
 }
 
 # the parallel path is actually selected for explicit --jobs (not silently serial)
@@ -59,5 +64,25 @@ is $par4->{stats}{files}, 16, 'all files counted';
     is $mk->(1)->_effective_jobs(9999), 1, 'jobs=1 forces serial';
     is $mk->(0)->_effective_jobs(10),   1, 'auto mode keeps a small tree serial';
 }
+
+# fork-safety: a worker that DIES mid-extract must exit via POSIX::_exit, never escape
+# the child block to run on as a rogue process. (Without the guard the child would
+# unwind past the fork block and re-enter this test harness as a second runner.) We make
+# extraction die for one file in a forced-parallel run and confirm the failure surfaces
+# in the single PARENT process -- the test itself completing once proves no child ran on.
+{
+    package DieMidExtract;
+    use parent -norequire, 'App::PerlGraph::Indexer';
+    sub _extract_src ($self, $path, $src, $hash) {
+        die "boom\n" if $path =~ /die_here/;
+        return $self->SUPER::_extract_src($path, $src, $hash);
+    }
+}
+my $fd = Path::Tiny->tempdir; $fd->child('lib')->mkpath;
+$fd->child('lib/die_here.pm')->spew_utf8("package DieHere;\nsub x { 1 }\n1;\n");
+$fd->child("lib/Ok$_.pm")->spew_utf8("package Ok$_;\nsub y { 1 }\n1;\n") for 1 .. 70;   # >=64 -> parallel
+my $fs = App::PerlGraph::Store->new(path => ':memory:'); $fs->init;
+my $survived = eval { DieMidExtract->new(store => $fs, root => "$fd", jobs => 2)->index_all; 1 };
+ok !$survived, 'a worker dying mid-extract surfaces in the parent (clean _exit), not as a rogue child';
 
 done_testing;

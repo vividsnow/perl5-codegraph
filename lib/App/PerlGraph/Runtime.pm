@@ -1,6 +1,6 @@
 package App::PerlGraph::Runtime;
 use v5.36;
-our $VERSION = q{0.002};
+our $VERSION = q{0.029};
 use Moo;
 use Cpanel::JSON::XS ();
 use POSIX ();
@@ -103,13 +103,16 @@ sub _introspect ($self, $packages) {
 
 sub _pkg_exists ($pkg) { no strict 'refs'; return scalar keys %{"${pkg}::"} }
 
+# the package a CODE ref actually belongs to (its GV's stash), or undef
+sub _cv_owner ($code) { eval { B::svref_2object($code)->GV->STASH->NAME } }
+
 # Subs whose CV actually belongs to $pkg (excludes imported/inherited).
 sub _own_subs ($pkg) {
     my @subs;
     for my $qsub (Devel::Symdump->new($pkg)->functions) {
         my ($name) = $qsub =~ /::(\w+)\z/ or next;
         my $code = do { no strict 'refs'; *{$qsub}{CODE} } or next;
-        my $owner = eval { B::svref_2object($code)->GV->STASH->NAME };
+        my $owner = _cv_owner($code);
         push @subs, $name if defined $owner && $owner eq $pkg;
     }
     return sort @subs;
@@ -118,7 +121,7 @@ sub _own_subs ($pkg) {
 # Resolve a method name along $pkg's real MRO to its defining Pkg::method.
 sub _method_owner ($pkg, $method) {
     my $code = $pkg->can($method) or return undef;
-    my $owner = eval { B::svref_2object($code)->GV->STASH->NAME };
+    my $owner = _cv_owner($code);
     return defined $owner ? "${owner}::${method}" : undef;
 }
 
@@ -148,6 +151,17 @@ sub _optree_calls ($cv) {
     return @calls;
 }
 
+# The method name of a method_named op. Non-threaded: the name SV hangs off the op
+# (meth_sv). Threaded: meth_sv is a null B::SPECIAL and the name lives in the CV's pad
+# VALUES at op->targ (mirrors the gv-in-pad case in _find_gv, but METHOP uses ->targ,
+# not ->padix). eval-guarded so an unexpected shape degrades to undef, not a die.
+sub _meth_name ($op, $cv) {
+    my $sv = eval { $op->meth_sv };
+    return $sv->PV if ref $sv && $sv->can('PV');
+    my $pad = eval { (($cv->PADLIST->ARRAY)[1]->ARRAY)[$op->targ] };
+    return (ref $pad && $pad->can('PV')) ? $pad->PV : undef;
+}
+
 sub _walk_op ($op, $ctx, $calls) {
     return unless ref $op && $$op;
     $ctx->{line} = $op->line if $op->isa('B::COP');
@@ -156,13 +170,13 @@ sub _walk_op ($op, $ctx, $calls) {
         my @kids; for (my $k = $op->first; ref $k && $$k; $k = $k->sibling) { push @kids, $k }
         my $last = $kids[-1];
         if ($last && $last->name eq 'method_named') {
-            my $meth = eval { $last->meth_sv->PV };
+            my $meth = _meth_name($last, $ctx->{cv});
             push @$calls, { type => 'method', name => $meth, line => $ctx->{line},
                 recv => _invocant($kids[1], $ctx->{cv}) }       # kids[0] is pushmark
                 if defined $meth && length $meth;
         }
         elsif ($last) {
-            my $tgt = _find_gv($last);
+            my $tgt = _find_gv($last, $ctx->{cv});
             push @$calls, { type => 'func', name => $tgt, line => $ctx->{line} } if defined $tgt;
         }
     }
@@ -194,15 +208,21 @@ sub _pad_name ($cv, $targ) {
     return (ref $nv && $nv->can('PVX')) ? $nv->PVX : undef;
 }
 
-sub _find_gv ($op) {
+sub _find_gv ($op, $cv = undef) {
     return undef unless ref $op && $$op;
     if ($op->name eq 'gv') {
-        my $gv = $op->isa('B::SVOP') ? $op->gv : undef;   # non-threaded perl
+        # the GV is in the op on a non-threaded perl (B::SVOP), or in the CV's pad at
+        # op->padix on a threaded perl (B::PADOP -- the common distro/macOS build, where
+        # PADOP->gv returns a null B::SPECIAL, not the GV). eval-guarded -> any unexpected
+        # shape degrades to undef rather than dying inside the forked enricher.
+        my $gv = $op->isa('B::SVOP')  ? eval { $op->gv }
+               : $op->isa('B::PADOP') ? eval { (($cv->PADLIST->ARRAY)[1]->ARRAY)[$op->padix] }
+               :                        undef;
         return (ref $gv && $gv->can('STASH')) ? $gv->STASH->NAME . '::' . $gv->NAME : undef;
     }
     if ($op->can('flags') && ($op->flags & B::OPf_KIDS())) {
         for (my $k = $op->first; ref $k && $$k; $k = $k->sibling) {
-            my $r = _find_gv($k); return $r if defined $r;
+            my $r = _find_gv($k, $cv); return $r if defined $r;
         }
     }
     return undef;

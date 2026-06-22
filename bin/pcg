@@ -22,24 +22,41 @@ pcg - Perl code knowledge graph for AI agents
 
 =head1 SYNOPSIS
 
-    pcg index [--runtime] [--jobs N] [--max-file-size SZ] [path]   build / refresh the graph
-                                              (--max-file-size 1M skips huge generated-data files)
+    pcg index [--runtime] [--deps] [--jobs N] [--max-file-size SZ] [path]   build / refresh the graph
+                                              (--deps also indexes used CPAN modules' API; --max-file-size 1M skips huge files)
     pcg sync  [--runtime] [path]      incremental update
-    pcg watch [--interval N] [--poll] [path]  re-index on change (inotify on Linux, else poll)
+    pcg watch [--interval N] [--poll] [--json] [--once] [path]  re-index on change (inotify on Linux, else poll)
     pcg explore <query> [path]        symbols + source + relationships, in one call
     pcg node    <symbol> [path]       a symbol's source + callers/callees
     pcg search  <query>  [path]       symbol search (locations)
     pcg callers|callees|impact <symbol> [path]
     pcg path <A> <B> [path]           shortest call path from A to B
-    pcg affected [--tests] [--stdin] [--path DIR] <files>
+    pcg affected [--tests] [--stdin] [--since REF] [--path DIR] <files>   files/tests impacted by a change
     pcg unused [--all] [path]         dead-code candidates
+    pcg untested [module] [path]      public API symbols no test reaches
+    pcg deps [module] / cycles [path]   module dependency graph / import cycles
+    pcg hotspots [--limit N] [path]   call-graph fan-in / fan-out / complexity / coupling leaders
+    pcg risk [--limit N] [--since REF] [path]   git churn x fan-in (top refactor/test risk)
+    pcg cochange [--min-support N] [--limit N] [--max-files N] [path]   files that change together
+    pcg diff <ref> / review <ref> [path]   structural diff / one-call PR review vs a git ref
+    pcg api <module> / covers <symbol> [path]   public surface / tests covering a symbol
+    pcg unresolved [--name M] [--limit N] [--by-receiver] [path]   opaque $obj->method calls
+                                              (--by-receiver groups by receiver + suggests its class)
     pcg export [--format dot|mermaid|json] [--around SYM] [--depth N] [path]
     pcg status  [path]                node/edge/provenance counts
     pcg serve   --mcp [--watch] [path]   run the MCP server (stdio JSON-RPC)
+    pcg lsp     [path]                run a Language Server (go-to-def / find-refs / hover)
     pcg install | uninstall           (de)register the MCP server with Claude Code
 
 =head1 DESCRIPTION
 
-See L<App::PerlGraph>.
+C<pcg> builds and queries a knowledge graph of a Perl codebase -- packages, subs,
+calls, imports and inheritance -- parsed with tree-sitter into a local SQLite
+database (C<.pcg/graph.db>). It answers structural questions (callers, callees,
+blast radius, dead code, dependency cycles, churn-weighted risk, structural diffs)
+more reliably than grep, and serves the same graph to AI agents over MCP
+(C<pcg install> / C<pcg serve --mcp>) and to editors over LSP (C<pcg lsp>).
+
+See L<App::PerlGraph> for the architecture, the resolver, and the provenance model.
 
 =cut
