@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.037};
+our $VERSION = q{0.047};
 use Path::Tiny qw(path);
 use Cpanel::JSON::XS ();
 use App::PerlGraph::Store;
@@ -50,6 +50,10 @@ usage: pcg <command> [args] [path]
   explore <query>       matching symbols with source + relationships
   node <symbol>         a symbol's source + callers/callees
   explain <symbol>      full dossier: source + callers/callees + blast radius + covering tests
+  context <symbol-or-"query"> [--budget N]   a paste-ready working set for an LLM: the focus
+                        symbol(s) + their callers/callees + covering tests + the SOURCE of each
+                        project callee, capped at N chars (default 16000). A non-symbol arg is
+                        treated as a semantic/keyword query for the focus
   search [--semantic] <query>   symbol search (locations); --semantic ranks by meaning
                         (needs `index --embed` + a local embedding provider)
   callers|callees|impact <symbol>
@@ -58,14 +62,19 @@ usage: pcg <command> [args] [path]
         (--since REF: take the changed files from `git diff --name-only REF`)
   unused [--all]        subs nothing references (dead-code candidates)
   untested [module]     public API symbols no test statically reaches
+  undocumented [module] public API symbols (function/method/constant) with no POD
   deps [module]         module dependency graph (imports / inheritance)
+  prereqs               declared CPAN prereqs (META/cpanfile/Makefile.PL) vs actually use'd: missing / unused
   cycles                circular module dependencies
+  layers                architecture stratification: modules grouped by dependency depth + cyclic violations
   hotspots [--limit N]  fan-in (+ blast radius), fan-out, cyclomatic-complexity, and most-coupled-module leaders
   risk [--limit N] [--since REF]   git churn x fan-in: frequently-changed + widely-depended-upon code
         (--since REF: count only churn from commits since REF -- risk on the current branch)
   cochange [--min-support N] [--limit N] [--max-files N]   files that change together (logical coupling)
+  owners [--limit N]    code ownership x importance: each file's primary author + bus-factor risks
   sinks                 command/SQL execution sites + which web endpoints reach them (attack surface)
   diff <ref>            structural diff vs a git ref: added/removed/re-signatured symbols (+ breaking)
+  semver <ref>          recommend a major/minor/patch bump from the diff (breaking->major, new public->minor)
   review <ref>          PR review: diff + blast radius + tests to run + breaking changes
                         + findings (untested public changes / wide blast radius), in one report
   api <module>          a module's public/exported surface
@@ -75,7 +84,9 @@ usage: pcg <command> [args] [path]
                         tool); --by-receiver groups by receiver + suggests its class
   rename <Old::sub> <new> [--apply] [path]   rename a sub/method in its package using the graph
                         (dry-run by default; reports dynamic $obj->method sites it can't verify)
-  export [--format dot|mermaid|json] [--around SYM] [--depth N]   render the graph
+  move <Old::sub> <NewPkg> [--apply] [path]   move a sub to another (existing) package: relocate its
+                        source + requalify call sites to NewPkg::sub. Dry-run by default
+  export [--format dot|mermaid|json|html] [--around SYM] [--depth N]   render the graph
   status                node/edge/provenance counts
   serve --mcp [--watch] [path]   run the MCP server (stdio JSON-RPC; --watch auto-syncs)
   lsp [path]            run a Language Server (go-to-def / find-refs / hover, over stdio)
@@ -97,6 +108,7 @@ sub run ($class, @argv) {
         search  => \&_cmd_search,
         node    => \&_cmd_node,
         explain => \&_cmd_explain,
+        context => \&_cmd_context,
         explore => \&_cmd_explore,
         callers => \&_cmd_callers,
         callees => \&_cmd_callees,
@@ -107,13 +119,19 @@ sub run ($class, @argv) {
         untested  => \&_cmd_untested,
         deps      => \&_cmd_deps,
         cycles    => \&_cmd_cycles,
+        layers    => \&_cmd_layers,
+        undocumented => \&_cmd_undocumented,
         overview  => \&_cmd_overview,
         sinks     => \&_cmd_sinks,
+        prereqs   => \&_cmd_prereqs,
         rename    => \&_cmd_rename,
+        move      => \&_cmd_move,
         hotspots  => \&_cmd_hotspots,
         risk      => \&_cmd_risk,
+        owners    => \&_cmd_owners,
         cochange  => \&_cmd_cochange,
         diff      => \&_cmd_diff,
+        semver    => \&_cmd_semver,
         review    => \&_cmd_review,
         api       => \&_cmd_api,
         covers    => \&_cmd_covers,
@@ -266,6 +284,22 @@ sub _cmd_explain ($symbol = undef, $root = '.') {
     return 0;
 }
 
+sub _cmd_context (@args) {
+    my $budget = 16000;
+    my @rest;
+    for (my @a = @args; @a;) {
+        my $x = shift @a;
+        if ($x eq '--budget') { $budget = shift @a; return _usage() unless defined $budget && $budget =~ /^[0-9]+$/ }
+        else { push @rest, $x }
+    }
+    my $symbol = shift @rest;
+    return _usage() unless defined $symbol;
+    my $root = shift(@rest) // '.';
+    my $q = _query($root) or return 1;
+    print App::PerlGraph::Format::context($q->context($symbol), $root, $budget);
+    return 0;
+}
+
 sub _cmd_explore ($query = undef, $root = '.') {
     return _usage() unless defined $query;
     my $q = _query($root) or return 1;
@@ -349,9 +383,21 @@ sub _cmd_untested ($module = undef, $root = '.') {
     return 0;
 }
 
+sub _cmd_undocumented ($module = undef, $root = '.') {
+    my $q = _query($root) or return 1;
+    print App::PerlGraph::Format::undocumented([ $q->undocumented($module) ]);
+    return 0;
+}
+
 sub _cmd_cycles ($root = '.') {
     my $q = _query($root) or return 1;
     print App::PerlGraph::Format::cycles([ $q->cycles ]);
+    return 0;
+}
+
+sub _cmd_layers ($root = '.') {
+    my $q = _query($root) or return 1;
+    print App::PerlGraph::Format::layers($q->layers);
     return 0;
 }
 
@@ -372,10 +418,35 @@ sub _cmd_rename (@args) {
     return $plan->{error} ? 1 : 0;
 }
 
+sub _cmd_move (@args) {
+    my ($apply, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--apply') { $apply = 1 } else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my ($old, $pkg, $root) = @pos;
+    return _usage() unless defined $old && length $old && defined $pkg && length $pkg;
+    my $q = _query($root // '.') or return 1;
+    require App::PerlGraph::Refactor;
+    my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
+        ->move($old, $pkg, ($apply ? (apply => 1) : ()));
+    print App::PerlGraph::Format::move($plan);
+    return $plan->{error} ? 1 : 0;
+}
+
 sub _cmd_sinks (@args) {
     return _usage() if grep { /^--/ } @args;
     my $q = _query($args[0] // '.') or return 1;
     print App::PerlGraph::Format::sinks($q->sinks);
+    return 0;
+}
+
+sub _cmd_prereqs (@args) {
+    return _usage() if grep { /^--/ } @args;
+    my $root = $args[0] // '.';
+    my $q = _query($root) or return 1;
+    print App::PerlGraph::Format::prereqs($q->prereqs($root));
     return 0;
 }
 
@@ -427,6 +498,24 @@ sub _cmd_risk (@args) {
     return 0;
 }
 
+sub _cmd_owners (@args) {
+    my (%opt, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--limit') { $opt{limit} = shift @args;
+            return _usage() unless defined $opt{limit} && $opt{limit} =~ /^\d+$/ && $opt{limit} >= 1 }
+        else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my $root = $pos[0] // '.';
+    my $q = _query($root) or return 1;
+    require App::PerlGraph::Git;
+    my $git = App::PerlGraph::Git->new(root => $root);
+    unless ($git->available) { print STDERR "Not a git repository: $root (owners needs git history).\n"; return 1 }
+    print App::PerlGraph::Format::owners($q->owners($git->authors, %opt));
+    return 0;
+}
+
 sub _cmd_review (@args) {
     return _usage() if grep { /^--/ } @args;
     my ($ref, $root) = @args;
@@ -455,6 +544,21 @@ sub _cmd_diff (@args) {
     require App::PerlGraph::Diff;
     my $d = App::PerlGraph::Diff->new(root => $root, ref => $ref, parser => $parser)->diff;
     print App::PerlGraph::Format::diff($d, $ref);
+    return 0;
+}
+
+sub _cmd_semver (@args) {
+    return _usage() if grep { /^--/ } @args;
+    my ($ref, $root) = @args;
+    return _usage() unless defined $ref && length $ref;
+    $root //= '.';
+    require App::PerlGraph::Git;
+    my $git = App::PerlGraph::Git->new(root => $root);
+    unless ($git->available) { print STDERR "Not a git repository: $root (semver needs git).\n"; return 1 }
+    my $parser = eval { App::PerlGraph::Parser->new } or do { print STDERR "parser unavailable: $@"; return 1 };
+    require App::PerlGraph::Diff;
+    my $d = App::PerlGraph::Diff->new(root => $root, ref => $ref, parser => $parser)->diff;
+    print App::PerlGraph::Format::semver($d, $ref);
     return 0;
 }
 
@@ -528,7 +632,7 @@ sub _cmd_export (@args) {
     }
     return _usage() if grep { /^--/ } @pos;          # reject unknown flags (don't treat a typo as the root)
     my $fmt = $opt{format} // 'mermaid';
-    return _usage() unless $fmt =~ /^(?:dot|mermaid|json)$/;
+    return _usage() unless $fmt =~ /^(?:dot|mermaid|json|html)$/;
     my $q = _query($pos[0] // '.') or return 1;
     print App::PerlGraph::Format::export($q->graph(around => $opt{around}, depth => $opt{depth}), $fmt);
     return 0;
@@ -575,8 +679,8 @@ App::PerlGraph::CLI - the pcg command-line dispatcher
 
 Parses @ARGV and dispatches to the pcg subcommands: index, sync, watch, the
 read queries (overview, search, node, explain, explore, callers, callees, impact,
-path, affected, unused, untested, deps, cycles, hotspots, risk, cochange, sinks,
-diff, review, api, covers, unresolved), the graph-driven rename codemod, export,
+path, affected, unused, untested, undocumented, deps, cycles, layers, prereqs, hotspots, risk, cochange, owners, sinks,
+diff, semver, review, api, covers, unresolved), the graph-driven rename / move codemods, export,
 status, serve and install/uninstall.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the

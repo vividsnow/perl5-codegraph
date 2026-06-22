@@ -88,6 +88,17 @@ like App::PerlGraph::Format::export({ nodes => [], edges => [] }, 'mermaid'), qr
 # dot escapes a special char in a node label (the route node carries a `"`)
 like $dot, qr/P GET \/a\\"b/, 'dot: escapes a " inside a node name';
 
+# html: a self-contained interactive export -- valid HTML with the data injected inline
+# (placeholder fully replaced) and no external/CDN script dependency
+my $html = App::PerlGraph::Format::export($g, 'html');
+like   $html, qr/<!DOCTYPE html>/,  'html export: a valid document';
+like   $html, qr/const DATA = \{/,  'html export: the graph data is injected inline';
+unlike $html, qr/__DATA__/,         'html export: the placeholder is fully replaced';
+like   $html, qr/createElementNS/,  'html export: a self-contained inline renderer';
+unlike $html, qr/<script\s+src=/,   'html export: no external/CDN dependency';
+like   App::PerlGraph::Format::export({ nodes => [], edges => [] }, 'html'), qr/<!DOCTYPE html>/,
+       'html export of an empty graph is still a valid document';
+
 # CLI export flag validation (error paths)
 { open my $fh,'>',\my $err; local *STDERR=$fh;
   is App::PerlGraph::CLI->run('export', '--depth'),      2, 'export --depth with no value is a usage error';

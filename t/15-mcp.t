@@ -3,6 +3,7 @@ use Test2::V0;
 use App::PerlGraph::Store;
 use App::PerlGraph::Query;
 use App::PerlGraph::MCP;
+use App::PerlGraph::Installer ();
 use Path::Tiny ();
 
 # --- initialize ---
@@ -19,7 +20,7 @@ is $mcp0->dispatch({ jsonrpc => '2.0', method => 'notifications/initialized' }),
 # --- tools/list ---
 my $tl = $mcp0->dispatch({ jsonrpc => '2.0', id => 2, method => 'tools/list' });
 my @tools = @{ $tl->{result}{tools} };
-is scalar(@tools), 28, 'twenty-eight tools (25 read + index / sync / status)';
+is scalar(@tools), 35, 'thirty-five tools (31 read + index / sync / status)';
 ok( (grep { $_->{name} eq 'pcg_callers'  } @tools), 'pcg_callers listed' );
 ok( (grep { $_->{name} eq 'pcg_hotspots' } @tools), 'pcg_hotspots listed' );
 ok( (grep { $_->{name} eq 'pcg_untested' } @tools), 'pcg_untested listed' );
@@ -34,6 +35,17 @@ ok( (grep { $_->{name} eq 'pcg_affected' } @tools), 'pcg_affected listed' );
 ok( (grep { $_->{name} eq 'pcg_deps'     } @tools), 'pcg_deps listed' );
 ok( (grep { $_->{name} eq 'pcg_api'      } @tools), 'pcg_api listed' );
 is $tools[0]{inputSchema}{type}, 'object', 'inputSchema is an object';
+is $tools[0]{name}, 'pcg_overview', 'pcg_overview is advertised first (the recommended first call)';
+
+# --- doc-sync guard: every advertised tool must be discoverable to an agent, both in the
+# MCP INSTRUCTIONS catalog (injected every session) and in the deployed skill. Catches the
+# recurring drift where a new tool ships but never gets surfaced in the agent-facing docs.
+my $instr = App::PerlGraph::MCP::INSTRUCTIONS;
+my $skill = App::PerlGraph::Installer::SKILL;
+for my $name (map { $_->{name} } @tools) {
+    like $instr, qr/\b\Q$name\E\b/, "INSTRUCTIONS catalog names $name";
+    like $skill, qr/\b\Q$name\E\b/, "skill names $name";
+}
 
 # --- tools/call against a real index ---
 my $s = App::PerlGraph::Store->new(path => ':memory:'); $s->init;
@@ -85,6 +97,7 @@ sub _call ($name, $args) {
 like _call('pcg_node',    { symbol => 'P::run'  }), qr/P::run/,  'pcg_node dispatches';
 like _call('pcg_explain', { symbol => 'P::help' }), qr/Explain: P::help.*blast radius/s, 'pcg_explain returns a one-call dossier (blast radius incl.)';
 like _call('pcg_explain', { symbol => 'No::Such' }), qr/_not found_/, 'pcg_explain on an unknown symbol -> not found (no crash)';
+like _call('pcg_context', { symbol => 'P::run' }), qr/Context: P::run/, 'pcg_context dispatches (working-set bundle)';
 like _call('pcg_explore', { query  => 'run'     }), qr/P::run/,  'pcg_explore dispatches';
 like _call('pcg_callees', { symbol => 'P::run'  }), qr/P::help/, 'pcg_callees dispatches';
 like _call('pcg_impact',  { symbol => 'P::help' }), qr/P::run/,  'pcg_impact dispatches';

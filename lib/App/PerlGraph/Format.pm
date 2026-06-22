@@ -1,8 +1,8 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.037};
+our $VERSION = q{0.047};
 use App::PerlGraph::Source;
-use App::PerlGraph::Model qw(package_of);
+use App::PerlGraph::Model qw(package_of is_public);
 use Cpanel::JSON::XS ();
 
 # Render query results as markdown/text for humans and agents.
@@ -25,6 +25,22 @@ sub _names ($label, $nodes) {
     return '' unless @$nodes;
     return "- $label: " . join(', ', map { '`' . ($_->{qualified_name} // $_->{name}) . '`' } @$nodes) . "\n";
 }
+# A fenced perl code block whose fence outlasts any backtick run in the source.
+sub _fenced ($src) {
+    my $longest = 0;
+    while ($src =~ /(`+)/g) { $longest = length($1) if length($1) > $longest }
+    my $fence = '`' x ($longest >= 3 ? $longest + 1 : 3);
+    $src .= "\n" unless $src =~ /\n\z/;
+    return "${fence}perl\n$src${fence}\n";
+}
+# A header line + the node's source (for the source-bearing bundles).
+sub _src_block ($n, $base, $heading = '###') {
+    my $cx = ($n->{metadata} // {})->{complexity};
+    my $out = sprintf "%s `%s` (%s) -- %s%s\n", $heading, $n->{qualified_name} // $n->{name}, $n->{kind}, _loc($n),
+        ($cx ? " -- complexity $cx" : '');
+    if (defined(my $src = App::PerlGraph::Source::for_node($n, $base))) { $out .= _fenced($src) }
+    return $out;
+}
 sub _view ($v, $base) {
     my $n = $v->{node};
     my $cx = ($n->{metadata} // {})->{complexity};
@@ -35,13 +51,7 @@ sub _view ($v, $base) {
         $first =~ s/^\s+|\s+$//g;
         $out .= "_${first}_\n" if length $first;
     }
-    if (defined(my $src = App::PerlGraph::Source::for_node($n, $base))) {
-        my $longest = 0;
-        while ($src =~ /(`+)/g) { $longest = length($1) if length($1) > $longest }
-        my $fence = '`' x ($longest >= 3 ? $longest + 1 : 3);   # outlast any backticks in the source
-        $src .= "\n" unless $src =~ /\n\z/;
-        $out .= "${fence}perl\n$src${fence}\n";
-    }
+    if (defined(my $src = App::PerlGraph::Source::for_node($n, $base))) { $out .= _fenced($src) }
     $out .= _names('callers', $v->{callers});
     $out .= _names('callees', $v->{callees});
     return $out;
@@ -65,6 +75,33 @@ sub explain ($symbol, $dossiers, $base = '') {
             ? "- covered by: " . join(', ', map { "`$_`" } @{ $d->{tests} }) . "\n"
             : "- covered by: _no test statically reaches it_\n";
         $out .= "\n";
+    }
+    return $out;
+}
+
+# A ready-to-paste working set for an agent: the focus symbol(s) WITH source + their
+# immediate caller/callee index + covering tests, then the SOURCE of each project callee
+# (what you need to read to change the focus), truncated to a character budget.
+sub context ($ctx, $base = '', $budget = 16000) {
+    return "## Context: $ctx->{symbol}\n\n_not found_\n" unless @{ $ctx->{focus} };
+    my $hint = $ctx->{via} ? " (via $ctx->{via} \"$ctx->{query}\")" : '';
+    my $out  = "## Context: $ctx->{symbol}$hint\n\n";
+    $out .= _view($_, $base) for @{ $ctx->{focus} };               # focus: source + caller/callee names
+    $out .= sprintf "- covered by: %s\n\n",
+        (@{ $ctx->{tests} } ? join(', ', map { "`$_`" } @{ $ctx->{tests} }) : '_no test statically reaches it_');
+    if (@{ $ctx->{callees} }) {
+        $out .= "### Callee definitions (what the focus depends on)\n\n";
+        my $shown = 0;
+        for my $n (@{ $ctx->{callees} }) {
+            my $blk = _src_block($n, $base, '####');
+            if ($shown && length($out) + length($blk) > $budget) {  # always show at least one; then stop at the budget
+                my @rest = @{ $ctx->{callees} }[$shown .. $#{ $ctx->{callees} }];
+                $out .= sprintf "_(+%d more callee definition(s) omitted for budget: %s)_\n",
+                    scalar(@rest), join(', ', map { "`" . ($_->{qualified_name} // $_->{name}) . "`" } @rest);
+                last;
+            }
+            $out .= $blk; $shown++;
+        }
     }
     return $out;
 }
@@ -94,6 +131,56 @@ sub unused ($nodes) {
     my %pkg; $pkg{ package_of($_->{qualified_name} // $_->{name} // '') } = 1 for @$nodes;
     $out .= sprintf "\n%d package(s), %d sub(s) unreferenced\n", scalar(keys %pkg), scalar @$nodes;
     $out .= "(note: dynamic/string dispatch and cross-distribution callers not counted -- run `pcg index --runtime` to narrow)\n";
+    return $out;
+}
+
+sub prereqs ($r) {
+    return "## Prerequisites\n\n_no declared prereqs found (looked for META.json / MYMETA.json / cpanfile / Makefile.PL)_\n"
+        unless $r->{source};
+    my $out = "## Prerequisites (declared in $r->{source})\n\n";
+    if (@{ $r->{missing} }) {
+        $out .= "### Missing -- use'd but NOT declared (add to prereqs)\n\n";
+        $out .= "- `$_`\n" for @{ $r->{missing} };
+        $out .= "\n";
+    }
+    if (@{ $r->{unused} }) {
+        $out .= "### Possibly unused -- declared but not seen in any use/require\n\n";
+        $out .= "- `$_`\n" for @{ $r->{unused} };
+        $out .= "(may be loaded dynamically, or used only in build tooling outside the indexed files)\n\n";
+    }
+    $out .= "_in sync -- every used module is declared and every declared prereq is used_\n"
+        unless @{ $r->{missing} } || @{ $r->{unused} };
+    $out .= sprintf "\n(%d declared, %d module(s) used; %d core module(s) used need no declaring)\n",
+        $r->{declared}, $r->{used}, scalar @{ $r->{core} };
+    return $out;
+}
+
+sub owners ($rows) {
+    my $out = "## Code ownership & bus factor\n\n";
+    return $out . "_no git history for the indexed files_\n" unless @$rows;
+    $out .= "(ranked by how depended-upon the file is; **risk** = one author owns >=80% of a depended-upon file)\n\n";
+    for my $r (@$rows) {
+        my $risk = ($r->{share} >= 0.8 && $r->{fanin} > 0) ? ' **[bus-factor risk]**' : '';
+        $out .= sprintf "- `%s` -- owner **%s** (%.0f%% of %d commit%s, %d author%s) -- %d inbound dep(s)%s\n",
+            $r->{file}, $r->{owner}, $r->{share} * 100, $r->{commits}, ($r->{commits} == 1 ? '' : 's'),
+            $r->{authors}, ($r->{authors} == 1 ? '' : 's'), $r->{fanin}, $risk;
+    }
+    return $out;
+}
+
+sub layers ($r) {
+    my $out = "## Architecture layers (module dependency stratification)\n\n";
+    my $L = $r->{layers};
+    return $out . "_no modules_\n" unless %$L;
+    for my $lvl (sort { $a <=> $b } keys %$L) {
+        $out .= sprintf "**Layer %d**%s -- %s\n", $lvl, ($lvl == 0 ? ' (foundational)' : ''),
+            join(', ', map { "`$_`" } sort @{ $L->{$lvl} });
+    }
+    if (@{ $r->{violations} }) {
+        $out .= "\n### Layering violations (cyclic dependencies break the layering)\n\n";
+        $out .= "- $_\n" for @{ $r->{violations} };
+    }
+    $out .= "\n(layer 0 depends on nothing internal; higher layers build on lower -- a clean architecture is a DAG)\n";
     return $out;
 }
 
@@ -161,6 +248,33 @@ sub diff ($d, $ref) {
     return $out;
 }
 
+# Recommend a semver bump from the structural diff: removed/re-signatured PUBLIC API
+# forces MAJOR; otherwise new public API is MINOR; otherwise internal-only is PATCH.
+sub semver ($d, $ref) {
+    my @breaking  = grep { $_->{_breaking} } @{ $d->{removed} }, @{ $d->{changed} };
+    my @added_pub = grep { is_public($_) } @{ $d->{added} };
+    my ($level, $why) = @breaking  ? ('MAJOR', 'removed or re-signatured PUBLIC API')
+                      : @added_pub ? ('MINOR', 'new public API, no breaking changes')
+                      :              ('PATCH', 'no public API change (internal only)');
+    my $out = "## Semver recommendation (vs $ref)\n\n**Recommended bump: $level** -- $why.\n\n";
+    if (@breaking) {
+        $out .= "### Breaking -> MAJOR\n\n";
+        $out .= sprintf "- %s `%s` (%s)\n",
+            ($_->{new} ? 're-signatured' : 'removed'),
+            ($_->{new} ? $_->{new}{qualified_name} : $_->{qualified_name}),
+            ($_->{new} ? $_->{new}{kind} : $_->{kind}) for @breaking;
+        $out .= "\n";
+    }
+    if (@added_pub) {
+        $out .= "### New public API -> MINOR\n\n";
+        $out .= sprintf "+ `%s` (%s)\n", $_->{qualified_name}, $_->{kind} for @added_pub;
+        $out .= "\n";
+    }
+    my $internal = (@{ $d->{added} } - @added_pub) + grep { !$_->{_breaking} } @{ $d->{changed} };
+    $out .= sprintf "(%d internal / non-public change(s) -- do not raise the bump level)\n", $internal if $internal;
+    return $out;
+}
+
 sub cochange ($rows) {
     my $out = "## Co-change coupling (files that change together)\n\n";
     return $out . "_none_\n" unless @$rows;
@@ -197,6 +311,15 @@ sub untested ($nodes) {
     return $out;
 }
 
+sub undocumented ($nodes) {
+    my $out = "## Undocumented public API (no POD)\n\n";
+    return $out . "_none -- every public symbol is documented_\n" unless @$nodes;
+    $out .= join '', map { sprintf "- `%s` (%s) -- %s\n",
+        $_->{qualified_name} // $_->{name}, $_->{kind}, _loc($_) } @$nodes;
+    $out .= sprintf "\n%d undocumented public symbol(s)\n", scalar @$nodes;
+    return $out;
+}
+
 sub path ($from, $to, $nodes) {
     my $out = "## Path: $from -> $to\n\n";
     return $out . "_no path found_\n"
@@ -217,7 +340,80 @@ sub path ($from, $to, $nodes) {
 sub export ($graph, $format = 'mermaid') {
     return _export_dot($graph)  if ($format // '') eq 'dot';
     return _export_json($graph) if ($format // '') eq 'json';
+    return _export_html($graph) if ($format // '') eq 'html';
     return _export_mermaid($graph);
+}
+
+# A SELF-CONTAINED interactive graph: the nodes/edges are embedded as JSON and laid out
+# by a small inline force-directed simulation (no external/CDN dependency). Hover a node
+# to highlight its neighbours, drag to reposition, search to locate. For onboarding/docs.
+sub _export_html ($g) {
+    my @nodes = map { +{ id => $_->{id}, label => _nlabel($_), kind => $_->{kind} // 'function' } } @{ $g->{nodes} };
+    my @edges = map  { +{ from => $_->{from}, to => $_->{to}, kind => $_->{kind} // 'calls' } }
+                grep { defined $_->{from} && defined $_->{to} } @{ $g->{edges} };
+    my $json = Cpanel::JSON::XS->new->canonical->encode({ nodes => \@nodes, edges => \@edges });
+    my $html = <<'HTML';
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>pcg graph</title>
+<style>
+ html,body{margin:0;height:100%;font:13px/1.4 system-ui,sans-serif;background:#0f1115;color:#cdd3de}
+ #bar{position:fixed;top:8px;left:8px;z-index:2;background:#1b1f27;padding:6px 8px;border-radius:6px;box-shadow:0 1px 4px #0008}
+ #bar input{background:#0f1115;border:1px solid #333;color:#cdd3de;padding:3px 6px;border-radius:4px;width:200px}
+ #bar b{color:#8ab4f8} svg{width:100vw;height:100vh;display:block;cursor:grab}
+ line{stroke:#39404d;stroke-width:1}
+ circle{stroke:#0f1115;stroke-width:1.5;cursor:pointer}
+ text{fill:#9aa3b2;font-size:10px;pointer-events:none;opacity:0}
+ .lab-on text{opacity:1}
+ .dim{opacity:.12} .hot{stroke:#fff;stroke-width:2.5px}
+</style></head><body>
+<div id="bar"><b>pcg</b> &middot; <span id="n"></span> nodes &middot;
+ <input id="q" placeholder="search a symbol..." autocomplete="off"> &middot; hover=neighbours, drag=move</div>
+<svg id="svg"><g id="links"></g><g id="nodes"></g></svg>
+<script>
+const DATA = __DATA__;
+const KCOL = {function:'#8ab4f8',method:'#81c995',package:'#fdd663',class:'#fcad70',route:'#f28b82',constant:'#c58af9'};
+const svg=document.getElementById('svg'), W=innerWidth, H=innerHeight;
+document.getElementById('n').textContent = DATA.nodes.length;
+const idx={}; DATA.nodes.forEach((n,i)=>{idx[n.id]=i; n.x=W/2+(Math.cos(i)*1+ (i%37)*7)%W*0+ (i*53%W); n.y=(i*97%H); n.vx=0;n.vy=0; n.deg=0;});
+const E=DATA.edges.filter(e=>idx[e.from]!=null&&idx[e.to]!=null);
+E.forEach(e=>{DATA.nodes[idx[e.from]].deg++;DATA.nodes[idx[e.to]].deg++;});
+const adj={}; DATA.nodes.forEach(n=>adj[n.id]=new Set());
+E.forEach(e=>{adj[e.from].add(e.to);adj[e.to].add(e.from);});
+const N=DATA.nodes;
+for(let it=0;it<280;it++){
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const a=N[i],b=N[j];let dx=a.x-b.x,dy=a.y-b.y;let d2=dx*dx+dy*dy+.01;
+    if(d2>90000)continue;let d=Math.sqrt(d2),f=1600/d2;a.vx+=f*dx/d;a.vy+=f*dy/d;b.vx-=f*dx/d;b.vy-=f*dy/d;}
+  E.forEach(e=>{const a=N[idx[e.from]],b=N[idx[e.to]];let dx=b.x-a.x,dy=b.y-a.y;let d=Math.sqrt(dx*dx+dy*dy)+.01;
+    let f=(d-70)*.012;a.vx+=f*dx/d;a.vy+=f*dy/d;b.vx-=f*dx/d;b.vy-=f*dy/d;});
+  N.forEach(n=>{n.vx+=(W/2-n.x)*.002;n.vy+=(H/2-n.y)*.002;n.x+=n.vx*.82;n.y+=n.vy*.82;n.vx*=.82;n.vy*=.82;});
+}
+const gl=document.getElementById('links'), gn=document.getElementById('nodes');
+const lines=E.map(e=>{const l=document.createElementNS('http://www.w3.org/2000/svg','line');gl.appendChild(l);return {l,e};});
+const els={};
+N.forEach(n=>{const g=document.createElementNS('http://www.w3.org/2000/svg','g');
+  const c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+  c.setAttribute('r',Math.min(4+n.deg,16));c.setAttribute('fill',KCOL[n.kind]||'#8ab4f8');
+  const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.textContent=n.label;
+  g.appendChild(c);g.appendChild(t);gn.appendChild(g);els[n.id]={g,c,t};
+  c.addEventListener('mouseenter',()=>focus(n.id));c.addEventListener('mouseleave',clear);
+  let drag=false;c.addEventListener('mousedown',ev=>{drag=true;ev.preventDefault();});
+  addEventListener('mousemove',ev=>{if(drag){n.x=ev.clientX;n.y=ev.clientY;render();}});
+  addEventListener('mouseup',()=>drag=false);
+});
+function render(){N.forEach(n=>{const e=els[n.id];e.c.setAttribute('cx',n.x);e.c.setAttribute('cy',n.y);
+  e.t.setAttribute('x',n.x+6);e.t.setAttribute('y',n.y+3);});
+  lines.forEach(({l,e})=>{const a=N[idx[e.from]],b=N[idx[e.to]];l.setAttribute('x1',a.x);l.setAttribute('y1',a.y);l.setAttribute('x2',b.x);l.setAttribute('y2',b.y);});}
+function focus(id){const keep=adj[id];N.forEach(n=>{const on=n.id===id||keep.has(n.id);els[n.id].g.classList.toggle('dim',!on);els[n.id].g.classList.toggle('lab-on',on);els[n.id].c.classList.toggle('hot',n.id===id);});
+  lines.forEach(({l,e})=>l.style.opacity=(e.from===id||e.to===id)?.9:.05);}
+function clear(){N.forEach(n=>{els[n.id].g.classList.remove('dim','lab-on');els[n.id].c.classList.remove('hot');});lines.forEach(({l})=>l.style.opacity=1);}
+document.getElementById('q').addEventListener('input',ev=>{const v=ev.target.value.toLowerCase();
+  if(!v){clear();return;}N.forEach(n=>{const hit=n.label.toLowerCase().includes(v);els[n.id].g.classList.toggle('dim',!hit);els[n.id].g.classList.toggle('lab-on',hit);});});
+render();
+</script></body></html>
+HTML
+    my $i = index $html, '__DATA__';
+    substr($html, $i, length '__DATA__') = $json if $i >= 0;   # literal inject (no s/// interpretation of JSON)
+    return $html;
 }
 
 sub _nlabel ($n) { $n->{qualified_name} // $n->{name} // '?' }
@@ -308,6 +504,34 @@ sub cycles ($cycles) {
     return $out;
 }
 
+sub move ($r) {
+    return "## Move\n\n**error**: $r->{error}\n" if $r->{error};
+    my $out   = "## Move `$r->{old}` -> `$r->{new}`\n\n";
+    my $files = scalar @{ $r->{files} };
+    if ($r->{applied}) {
+        $out .= "Relocated the definition ($r->{relocation}) and applied **$r->{applied}** edit(s) "
+              . "across $files file(s). Run `pcg sync` to refresh the graph.\n\n";
+    }
+    else {
+        $out .= "Plan (dry run -- add `--apply` / apply:true to write):\n";
+        $out .= "- relocate the definition: $r->{relocation}\n";
+        $out .= "- requalify " . scalar(@{ $r->{edits} }) . " call site(s) to `$r->{new}`:\n";
+        my %byf; push @{ $byf{ $_->{file} } }, $_ for @{ $r->{edits} };
+        for my $f (sort keys %byf) {
+            $out .= sprintf "    `%s` L%d  `%s` -> `%s`\n", $f, $_->{line}, $_->{old}, $_->{new}
+                for sort { $a->{line} <=> $b->{line} } @{ $byf{$f} };
+        }
+        $out .= "\n";
+    }
+    if (@{ $r->{frontier} }) {
+        $out .= "**Manual review** -- " . scalar(@{ $r->{frontier} })
+              . " dynamic `\$obj->method` call(s) of the same name + any stale `use` imports of it:\n";
+        $out .= sprintf "- `%s` L%d  (receiver `%s`)\n", $_->{file}, $_->{line}, $_->{receiver} // '?'
+            for @{ $r->{frontier} };
+    }
+    return $out;
+}
+
 sub rename ($r) {
     return "## Rename\n\n**error**: $r->{error}\n" if $r->{error};
     my $out = "## Rename `$r->{old}` -> `$r->{new}`\n\n";
@@ -338,18 +562,23 @@ sub rename ($r) {
 sub sinks ($r) {
     my $out = "## Security sinks -- command / SQL execution\n\n";
     return $out . "_none found_ (no system/exec or DBI do/execute/select* calls)\n" unless @{ $r->{sites} };
+    my $dyn_sites = grep { grep { $_->{dynamic} } @{ $_->{sinks} } } @{ $r->{sites} };
     if (@{ $r->{reachable} }) {
-        $out .= "### Reachable from an endpoint (attack surface -- verify no tainted input / use placeholders)\n\n";
+        $out .= "### Reachable from an endpoint (attack surface)\n\n";
         for my $e (@{ $r->{reachable} }) {
             $out .= sprintf "- **%s** -> %s\n", $e->{route}{name},
-                join('; ', map { "$_->{type} `$_->{name}` in `$_->{sub}`" } @{ $e->{sinks} });
+                join('; ', map { sprintf '%s `%s` in `%s`%s', $_->{type}, $_->{name}, $_->{sub},
+                    $_->{dynamic} ? ' **[dynamic -- injection risk]**' : ' [parameterized]' } @{ $e->{sinks} });
         }
         $out .= "\n";
     }
-    $out .= "### All sink sites (" . scalar(@{ $r->{sites} }) . ")\n\n";
-    $out .= sprintf "- `%s` -- %s\n", $_->{sub},
-        join(', ', map { "$_->{type}:$_->{name}" } @{ $_->{sinks} }) for @{ $r->{sites} };
-    $out .= "\n(heuristic by call name -- a placeholdered DBI call is safe; these are sites to VERIFY, not confirmed bugs)\n";
+    $out .= "### All sink sites (" . scalar(@{ $r->{sites} }) . ", $dyn_sites with a dynamically-built argument)\n\n";
+    for my $site (@{ $r->{sites} }) {
+        $out .= sprintf "- `%s` -- %s\n", $site->{sub},
+            join(', ', map { "$_->{type}:$_->{name}" . ($_->{dynamic} ? ' **[dynamic]**' : '') } @{ $site->{sinks} });
+    }
+    $out .= "\n(**[dynamic]** = the command/SQL string is built from a variable (interpolated or concatenated) -- the\n"
+          . "injection-shaped sites to VERIFY. Unmarked sinks pass a constant or use placeholders, and are safe.)\n";
     return $out;
 }
 
@@ -485,10 +714,10 @@ App::PerlGraph::Format - render query results as markdown / text
 
 =head1 DESCRIPTION
 
-Formats every query result for humans and agents: node/explore source views,
-caller/callee/impact/search lists, path, affected, unused, deps, cycles, api,
-covers, the unresolved surface and the resolve result, and graph export
-(dot/mermaid/json).
+Renders every L<App::PerlGraph::Query> result as markdown / text for humans and agents:
+the source-bearing symbol views (node, explore, explain, context), the relationship and
+analysis reports (navigation, architecture, history, security and release queries), the
+unresolved surface and resolve result, and graph export (dot / mermaid / json / html).
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
 C<pcg> command for the public interface.

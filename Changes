@@ -1,5 +1,120 @@
 Revision history for App-PerlGraph
 
+0.047     2026-06-22
+          - Docs / discoverability polish so an agent reaches for the right tool naturally:
+            restructured the MCP INSTRUCTIONS catalog from one dense run-on into intent-grouped
+            routing lines (ORIENT / UNDERSTAND / ARCHITECTURE / HISTORY / QUALITY & RELEASE /
+            REFACTOR / LIFECYCLE / UNRESOLVED FRONTIER), leading with the provenance trust model;
+            pcg_overview is now advertised FIRST (the recommended first call); added pcg_node to
+            the deployed skill; brought the App::PerlGraph SYNOPSIS up to date (context, layers,
+            prereqs, undocumented, owners, semver, move, export html).
+          - New doc-sync GUARD (t/15): every advertised tool must be named in BOTH the INSTRUCTIONS
+            catalog and the skill -- locks the recurring drift where a shipped tool never reaches
+            the agent-facing docs. No new tool, no behavior change (still 35 tools).
+          - Tests +71 (1206 total): t/15 (the per-tool catalog/skill coverage guard + overview-first).
+
+0.046     2026-06-22
+          - New: `pcg owners` / pcg_owners (35 MCP tools) -- code ownership x importance for
+            bus-factor: each indexed file's primary author (most commits, from git) and that
+            author's share, ranked by how depended-upon the file is (cross-file inbound call /
+            reference edges). A high-importance file owned almost entirely by one author is
+            flagged a bus-factor risk -- where knowledge is concentrated in code many things
+            depend on. New Git::authors; Query::owners; Format::owners; CLI `pcg owners`.
+          - Tests +10 (1135 total): t/87 (cross-file fan-in incl. same-file edges excluded,
+            primary-owner + share, ranking, and the bus-factor-risk flag on / off).
+
+0.045     2026-06-22
+          - New: `pcg export --format html` -- a SELF-CONTAINED interactive graph (no external / CDN
+            dependency): nodes/edges are embedded as JSON and laid out by a small inline force-
+            directed simulation rendered to SVG. Hover a node to highlight its neighbours, drag to
+            reposition, search to locate; nodes colored by kind and sized by degree. For onboarding
+            / docs / review of a (sub)graph -- pair with --around SYM --depth N. New
+            Format::_export_html (the data is injected by literal substr, never an interpolating
+            s///, so arbitrary symbol names are safe).
+          - Tests +6 (1125 total): t/37 (valid document, data injected, placeholder replaced, the
+            inline renderer, no external script src, and the empty-graph case).
+
+0.044     2026-06-22
+          - New: `pcg move <Old::sub> <NewPkg>` / pcg_move (34 MCP tools) -- the SECOND write tool:
+            move a function to another (already-existing) package using the graph. It relocates the
+            sub's source from its origin file into the target package's file and requalifies every
+            resolved call site (Foo::bar and bareword bar -> NewPkg::bar). Dynamic $obj->method
+            dispatch + stale `use` imports are reported for manual review, never silently edited.
+            Dry-run by default. New Refactor::move + _relocate / _pkg_line (reuses rename's
+            resolver-confirmed call-site machinery); Format::move; CLI `pcg move`.
+          - Tests +14 (1119 total): t/86 (relocate + requalify across files, both edited files still
+            parse, the dry-run, and the unknown-symbol / unknown-target / same-package / collision errors).
+
+0.043     2026-06-22
+          - Taint-aware sinks: `pcg sinks` / pcg_sinks now flags each command/SQL sink as [dynamic]
+            when its STRING argument is built from a variable -- interpolated (do("...$id") /
+            system("rm $f")), concatenated, or a bare variable -- the injection-SHAPED sites --
+            vs parameterized/constant (do("...?", $id) / system("ls","-l")) which are safe. The
+            route-reachable [dynamic] sinks are the real attack surface. A big precision gain over
+            the pure name-heuristic (the difference between a vuln and safe code), computed at
+            extraction from the call argument AST. Still honest -- no full source->sink dataflow,
+            so a [dynamic] reached sink is a site to VERIFY, not a confirmed bug. New Extractor::
+            _sink_dynamic / _has_interp_var; sink metadata gains `dynamic`; Query / Format::sinks
+            carry and render it. EXTRACTION_VERSION 5->6 (a sync after upgrade re-extracts).
+          - Tests +3 (1105 total): t/78 (interpolated string -> dynamic; placeholdered DBI +
+            list-form system() -> safe).
+
+0.042     2026-06-22
+          - New: `pcg layers` / pcg_layers (33 MCP tools) -- architecture stratification: groups the
+            project's modules into LAYERS by their longest dependency-path depth (layer 0 imports /
+            inherits nothing internal; each higher layer builds only on lower ones), and flags
+            cyclic dependencies as layering violations. Reveals the architectural shape at a glance
+            -- on this codebase: Model / Schema / Parser (layer 0) -> Store / Resolver (1) -> Query /
+            Indexer (2) -> ... -> MCP -> Installer -> CLI (top). A clean architecture is a DAG. New
+            Query::layers (memoized longest-path DFS with back-edge detection); Format::layers; CLI
+            `pcg layers`.
+          - Tests +8 (1102 total): t/85 (a 3-layer chain stratifies correctly + a 2-module cycle is
+            reported as a layering violation).
+
+0.041     2026-06-22
+          - New: `pcg undocumented [module]` / pcg_undocumented (32 MCP tools) -- public API
+            symbols (function/method/constant) carrying no POD docstring: the same public surface
+            as `untested` / `api`, filtered to those a reader gets no documentation for. A
+            documentation-coverage check for a release; completes the CPAN-hygiene trio
+            (semver / prereqs / undocumented). New Query::undocumented; Format::undocumented; CLI
+            `pcg undocumented`.
+          - Tests +8 (1094 total): t/84 (documented excluded, whitespace-only docstring counts as
+            undocumented, private excluded, the rendered list + clean state).
+
+0.040     2026-06-22
+          - New: `pcg prereqs` / pcg_prereqs (31 MCP tools) -- CPAN dependency hygiene: reconcile
+            the DECLARED prerequisites (META.json / MYMETA.json / cpanfile / Makefile.PL, tried in
+            that order) against the modules actually use'd / require'd in the indexed code. Flags
+            MISSING deps (used but not declared -- add them) and possibly-UNUSED deps (declared but
+            never used); core modules (via Module::CoreList) and the project's own packages are
+            excluded. A kwalitee-adjacent release check. New Query::prereqs + _declared_prereqs /
+            _core_checker; Format::prereqs; CLI `pcg prereqs`.
+          - Tests +8 (1086 total): t/83 (Makefile.PL parse, missing/unused classification, and
+            structured JSON metadata winning over Makefile.PL).
+
+0.039     2026-06-22
+          - New: `pcg semver <ref>` / pcg_semver (30 MCP tools) -- recommend a Semantic Versioning
+            bump from the structural diff vs a git ref: a removed or re-signatured PUBLIC symbol
+            forces MAJOR, otherwise new public API is MINOR, otherwise internal-only changes are
+            PATCH -- with the evidence listed. A CPAN-release helper that turns the diff you
+            already compute into the bump decision. Reuses Diff; new Format::semver; CLI `pcg
+            semver`.
+          - Tests +9 (1078 total): t/82 (MAJOR/MINOR/PATCH classification + a real-git removed-
+            public-sub -> MAJOR end-to-end).
+
+0.038     2026-06-22
+          - New: `pcg context <symbol>` / pcg_context (29 MCP tools) -- a paste-ready WORKING
+            SET for editing a symbol: the focus symbol(s) WITH verbatim source, their immediate
+            callers/callees and covering tests, AND the full source of every PROJECT callee (the
+            definitions you must read to change the focus), truncated to a character budget
+            (default 16000). A non-symbol arg is treated as a natural-language query resolved via
+            semantic (or keyword) search to the focus. The codegraph-for-agents primitive: gather
+            everything needed to modify some code in ONE call instead of a flurry of node/impact/
+            covers/Read round-trips. New Query::context + Format::context (a shared _fenced/
+            _src_block helper factored from _view); CLI `pcg context [--budget N]`.
+          - Tests +14 (1069 total): t/81 (focus + project-callee source + tests, budget
+            truncation, NL-query routing, not-found) + a pcg_context MCP dispatch test.
+
 0.037     2026-06-22
           - New: optional, LOCAL semantic search -- `pcg search --semantic <intent>` /
             pcg_search semantic:true ranks symbols by MEANING (embedding cosine similarity),

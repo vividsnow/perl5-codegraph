@@ -30,7 +30,7 @@ sub tcall ($name, $args = {}) {
 # the lifecycle tools are advertised
 my $list = $mcp->dispatch({ jsonrpc => '2.0', id => 1, method => 'tools/list' });
 my %tool = map { $_->{name} => 1 } @{ $list->{result}{tools} };
-is scalar(keys %tool), 28, 'tools/list advertises 28 tools (25 read + index/sync/status)';
+is scalar(keys %tool), 35, 'tools/list advertises 35 tools (31 read + index/sync/status)';
 ok $tool{pcg_index} && $tool{pcg_sync} && $tool{pcg_status}, 'the three lifecycle tools are present';
 
 # a read tool BEFORE indexing -> clear guidance, not a confusing empty result

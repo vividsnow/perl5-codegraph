@@ -1,6 +1,6 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.037};
+our $VERSION = q{0.047};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify sink_type);
 use App::PerlGraph::Grammar qw(:all);
@@ -710,8 +710,30 @@ sub _handle_call ($self, $n, $cur_sub) {
         reference_name => $name, reference_kind => 'call',
         line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
     };
-    $self->_edge($self->_from_id($cur_sub), undef, 'sink', metadata => { sink => $_, name => $name })
+    $self->_edge($self->_from_id($cur_sub), undef, 'sink',
+        metadata => { sink => $_, name => $name, dynamic => $self->_sink_dynamic($n->{fields}{ +F_ARGUMENTS }) })
         for grep { defined } sink_type($name, 0);   # command-execution sink
+}
+
+# Is a sink call's argument DYNAMICALLY constructed -- the injection-shaped pattern?
+# True when the command/SQL string itself is built from a variable: an interpolated
+# string embedding a $var, a concatenation, or a bare variable/expression as the string.
+# A plain string literal (even with separate bind/list args) is parameterized/constant.
+sub _sink_dynamic ($self, $args) {
+    return 0 unless $args;
+    my $first = ($args->{type} // '') eq 'list_expression'
+        ? (grep { ($_->{type} // '') !~ /\A[[:punct:]]+\z/ } @{ $args->{children} // [] })[0]
+        : $args;
+    return 0 unless $first;
+    my $t = $first->{type} // '';
+    return 1 if $t =~ /\Ascalar\z|\Aarray\z|deref|binary_expression|ternary|method_call|function_call/;  # $sql / "..".$x / cond
+    return 1 if $t =~ /string|heredoc/ && _has_interp_var($first);   # "...$x..."
+    return 0;
+}
+sub _has_interp_var ($node) {
+    return 1 if ($node->{type} // '') =~ /\Ascalar\z|\Aarray\z|scalar_deref|array_element/;
+    _has_interp_var($_) && return 1 for @{ $node->{children} // [] };
+    return 0;
 }
 
 # \&name -> a code reference. Record it as a `references` ref so callback-wired
@@ -767,7 +789,8 @@ sub _handle_method_call ($self, $n, $cur_sub) {
         line => $n->{sl}, col => $n->{sc}, file_path => $self->file_path,
         candidates => (%cand ? \%cand : undef),
     };
-    $self->_edge($self->_from_id($cur_sub), undef, 'sink', metadata => { sink => $_, name => $meth })
+    $self->_edge($self->_from_id($cur_sub), undef, 'sink',
+        metadata => { sink => $_, name => $meth, dynamic => $self->_sink_dynamic($n->{fields}{ +F_ARGUMENTS }) })
         for grep { defined } sink_type($meth, 1);   # SQL-execution sink
 }
 

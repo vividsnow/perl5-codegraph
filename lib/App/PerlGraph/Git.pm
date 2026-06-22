@@ -1,12 +1,13 @@
 package App::PerlGraph::Git;
 use v5.36;
-our $VERSION = q{0.037};
+our $VERSION = q{0.047};
 use Moo;
 
 # Thin read-only wrapper over `git log` for the history-aware analyses (churn for
-# risk scoring, per-commit file sets for co-change mining). Shells out to the git
-# CLI (list-form open, no shell); every method degrades to empty when the root
-# isn't a git work tree or git isn't installed.
+# risk scoring, per-commit file sets for co-change mining, per-file author counts
+# for ownership/bus-factor). Shells out to the git CLI (list-form open, no shell);
+# every method degrades to empty when the root isn't a git work tree or git isn't
+# installed.
 
 has root => (is => 'ro', required => 1);
 
@@ -43,6 +44,19 @@ sub commits ($self, $limit = 3000) {
         push @tx, \@files if @files;
     }
     return \@tx;
+}
+
+# { file_path => { author => commits_touching_it } } -- per-file authorship from
+# `git log`, for ownership / bus-factor analysis. Each commit emits a `\0<author>`
+# header line followed by its touched files.
+sub authors ($self) {
+    my $out = $self->_run('log', '--relative', '--no-merges', '--format=%x00%an', '--name-only') // return {};
+    my (%by, $who);
+    for my $line (split /\n/, $out) {
+        if ($line =~ /\A\x00(.*)/) { $who = $1; next }       # commit header: NUL + author name
+        $by{$line}{$who}++ if length $line && defined $who;  # a file touched by that commit
+    }
+    return \%by;
 }
 
 # Perl files changed between $ref and the working tree (relative to the indexed
@@ -87,9 +101,10 @@ App::PerlGraph::Git - read-only git-history helpers (churn, co-change transactio
 =head1 DESCRIPTION
 
 A thin wrapper over C<git log> backing the history-aware analyses: C<churn> (how
-many commits touched each file, for risk scoring) and C<commits> (each commit's
-touched-file set, for co-change mining). Degrades to empty when the root is not a
-git work tree.
+many commits touched each file, for risk scoring), C<commits> (each commit's
+touched-file set, for co-change mining), and C<authors> (per-file author commit
+counts, for ownership / bus-factor). Degrades to empty when the root is not a git
+work tree.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
 C<pcg> command for the public interface.

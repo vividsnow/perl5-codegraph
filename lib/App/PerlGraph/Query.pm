@@ -1,6 +1,6 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.037};
+our $VERSION = q{0.047};
 use Moo;
 use App::PerlGraph::Model qw(package_of is_public);
 
@@ -277,11 +277,13 @@ sub hotspots ($self, %opt) {
 # is safe -- so a hit is a site to VERIFY, not a confirmed bug.
 sub sinks ($self, %opt) {
     my $s = $self->store;
-    my %by_sub;   # sub id -> { "type:name" => {type,name} }
+    my %by_sub;   # sub id -> { "type:name" => {type,name,dynamic} }
     for my $e ($s->edges_of_kind('sink')) {
         next unless defined $e->{source};
         my $m = $e->{metadata} // {};
-        $by_sub{ $e->{source} }{ "$m->{sink}:$m->{name}" } //= { type => $m->{sink} // '?', name => $m->{name} // '?' };
+        my $slot = $by_sub{ $e->{source} }{ "$m->{sink}:$m->{name}" }
+            //= { type => $m->{sink} // '?', name => $m->{name} // '?', dynamic => 0 };
+        $slot->{dynamic} ||= $m->{dynamic} ? 1 : 0;   # any dynamically-built call of this name -> flag the site
     }
     my @sites = map { my $n = $s->node($_); $n ? { sub => $n->{qualified_name} // $n->{name} // '?',
                                                    sinks => [ values %{ $by_sub{$_} } ] } : () }
@@ -470,6 +472,95 @@ sub untested ($self, $module = undef) {
         push @out, grep { !$reached{ $_->{id} } && !$seen{ $_->{id} }++ } $self->api($m);
     }
     return @out;
+}
+
+# Architectural stratification of the project's modules: each module's LAYER is its
+# longest dependency-path depth (layer 0 depends on nothing internal; higher layers
+# build on lower). A clean architecture is a DAG; mutual/cyclic deps break the layering
+# and are reported as violations.
+sub layers ($self) {
+    my $s = $self->store;
+    my @mods = grep { !($_->{metadata} // {})->{cpan} } $s->all_nodes(qw(package class));
+    my %is_proj = map { (($_->{qualified_name} // $_->{name}) => 1) } @mods;
+    my %dep;   # module -> [ project modules it imports/inherits ]
+    for my $m (@mods) {
+        my $name = $m->{qualified_name} // $m->{name};
+        $dep{$name} //= [];
+        my %d;
+        for my $e ($s->outgoing_edges($m->{id}, 'imports', 'extends')) {
+            my $tn;
+            if ($e->{target}) { my $t = $s->node($e->{target}); $tn = $t->{qualified_name} // $t->{name} if $t }
+            $tn //= ($e->{metadata} // {})->{name} // ($e->{metadata} // {})->{module};
+            $d{$tn} = 1 if defined $tn && $is_proj{$tn} && $tn ne $name;
+        }
+        push @{ $dep{$name} }, sort keys %d;
+    }
+    # longest-path depth, memoized, recording back-edges (into the active path) as cycles.
+    my (%depth, %state, @violations);
+    my $visit;
+    $visit = sub ($m) {
+        return $depth{$m} if ($state{$m} // 0) == 2;
+        return undef      if ($state{$m} // 0) == 1;     # a node still on the stack -> a cycle
+        $state{$m} = 1;
+        my $max = -1;
+        for my $d (@{ $dep{$m} // [] }) {
+            my $dd = $visit->($d);
+            if (defined $dd) { $max = $dd if $dd > $max }
+            else             { push @violations, "$m -> $d" }   # cyclic dependency
+        }
+        $state{$m} = 2;
+        return $depth{$m} = $max + 1;
+    };
+    $visit->($_) for sort keys %dep;
+    my %by_layer;
+    push @{ $by_layer{ $depth{$_} } }, $_ for sort keys %depth;
+    my %seen;
+    return { layers => \%by_layer, violations => [ grep { !$seen{$_}++ } @violations ] };
+}
+
+# Public API symbols (function/method/constant) carrying no POD docstring -- the same
+# public surface as `untested`/`api`, filtered to those a reader gets no documentation for.
+sub undocumented ($self, $module = undef) {
+    my $s = $self->store;
+    my @modules = $module ? ($module)
+        : map { $_->{qualified_name} // $_->{name} } grep { !($_->{metadata} // {})->{cpan} } $s->all_nodes(qw(package class));
+    my (%seen, @out);
+    for my $m (@modules) {
+        push @out, grep { !$seen{ $_->{id} }++ && !(defined $_->{docstring} && $_->{docstring} =~ /\S/) } $self->api($m);
+    }
+    return @out;
+}
+
+# Code ownership x importance for bus-factor: per indexed file, its primary author
+# (most commits) and that author's share, ranked by how depended-upon the file is
+# (cross-file inbound call/reference edges). A high-importance file dominated by one
+# author is a bus-factor risk. $authors comes from App::PerlGraph::Git::authors.
+sub owners ($self, $authors, %opt) {
+    my $s = $self->store;
+    my %nfile = map { (($_->{id} // '') => $_->{file_path}) } $s->all_nodes(qw(function method package class constant route));
+    my %fanin;   # file -> number of inbound cross-file dependency edges
+    for my $kind (qw(calls references)) {
+        for my $e ($s->edges_of_kind($kind)) {
+            next unless $e->{target};
+            my ($sf, $tf) = ($nfile{ $e->{source} }, $nfile{ $e->{target} });
+            $fanin{$tf}++ if defined $sf && defined $tf && $sf ne $tf;
+        }
+    }
+    my %indexed = map { (($_ // '') => 1) } values %nfile;   # files that carry indexed symbols
+    my @rows;
+    for my $f (sort keys %$authors) {
+        next unless $indexed{$f};
+        my $au = $authors->{$f};
+        my $total = 0; $total += $_ for values %$au;
+        next unless $total;
+        my ($top) = sort { $au->{$b} <=> $au->{$a} || $a cmp $b } keys %$au;
+        push @rows, { file => $f, owner => $top, share => $au->{$top} / $total,
+                      authors => scalar keys %$au, commits => $total, fanin => $fanin{$f} // 0 };
+    }
+    @rows = sort { $b->{fanin} <=> $a->{fanin} || $b->{share} <=> $a->{share} || $a->{file} cmp $b->{file} } @rows;
+    my $limit = $opt{limit} || 20;
+    @rows = @rows[0 .. $limit - 1] if @rows > $limit;
+    return \@rows;
 }
 
 # { module => qname, deps => { dep_qname => edge_kind, ... } }, sorted by module.
@@ -675,6 +766,115 @@ sub explain ($self, $symbol) {
     }
     return @out;
 }
+
+# A ready-to-paste working set for an agent: the focus symbol(s) + their immediate
+# caller/callee index + covering tests + the SOURCE of every PROJECT callee (what you
+# read to change the focus). $spec is a symbol, or -- if it matches no symbol -- a
+# natural-language query resolved via semantic search (else keyword) to the top hits.
+sub context ($self, $spec, %opt) {
+    my $focus_n = $opt{focus} || 2;
+    my @defs = $self->_defs($spec);
+    my ($via, $query);
+    unless (@defs) {                                   # treat $spec as a natural-language query
+        $query = $spec;
+        my $sem = $self->semantic($spec, 5);
+        my @hits = ($sem->{results} && @{ $sem->{results} })
+            ? (do { $via = 'semantic'; @{ $sem->{results} } })
+            : (do { $via = 'search';   $self->search($spec, 5) });
+        my @callable = grep { ($_->{kind} // '') =~ /function|method/ } @hits;
+        @defs = @callable ? @callable : @hits;
+        @defs = @defs[0 .. $focus_n - 1] if @defs > $focus_n;
+    }
+    return { symbol => $spec, focus => [], callees => [], tests => [], via => $via, query => $query } unless @defs;
+
+    my (@focus, %callee_seen, @callees, %test_seen, @tests);
+    for my $node (@defs) {
+        my $v = $self->_view($node);
+        push @focus, $v;
+        for my $c (@{ $v->{callees} }) {               # project callees -> inline their source
+            next unless ($c->{kind} // '') =~ /function|method/;
+            next if ($c->{metadata} // {})->{cpan} || !$c->{file_path};   # skip external deps
+            push @callees, $c unless $callee_seen{ $c->{id} }++;
+        }
+        my $qn = $node->{qualified_name} // $node->{name};
+        push @tests, grep { !$test_seen{$_}++ } $self->covers($qn) if defined $qn;
+    }
+    return { symbol => $spec, focus => \@focus, callees => \@callees, tests => \@tests, via => $via, query => $query };
+}
+
+# Reconcile DECLARED CPAN prereqs (from $root's META.json / MYMETA.json / cpanfile /
+# Makefile.PL) against the modules actually use'd/require'd in the indexed code: flags
+# MISSING (used but not declared) and possibly-UNUSED (declared but never used). Core
+# modules and the project's own packages are excluded from "missing".
+sub prereqs ($self, $root) {
+    my $s = $self->store;
+    my %used;
+    for my $e ($s->edges_of_kind('imports')) {
+        my $m = ($e->{metadata} // {})->{module};
+        $used{$m} = 1 if defined $m && length $m;
+    }
+    my %internal = map { (($_->{qualified_name} // '') => 1) } $s->all_nodes('package'), $s->all_nodes('class');
+    my ($declared, $source) = _declared_prereqs($root);
+    my $is_core = _core_checker();
+    my %skip = map { $_ => 1 } qw(perl ExtUtils::MakeMaker Module::Build);   # build tooling, not a runtime dep
+    my (@missing, @unused, @core);
+    for my $m (sort keys %used) {
+        next if $internal{$m} || $skip{$m};
+        if ($is_core->($m)) { push @core, $m unless $declared->{$m}; next }
+        push @missing, $m unless exists $declared->{$m};
+    }
+    for my $m (sort keys %$declared) {
+        next if $skip{$m};
+        push @unused, $m unless $used{$m} || $internal{$m};
+    }
+    return { source => $source, missing => \@missing, unused => \@unused, core => \@core,
+             declared => scalar(keys %$declared), used => scalar(keys %used) };
+}
+
+# (module => version) declared prereqs + the file they came from, trying the structured
+# JSON metadata first, then cpanfile, then a targeted scan of Makefile.PL's prereq hashes.
+sub _declared_prereqs ($root) {
+    require Path::Tiny; require Cpanel::JSON::XS;
+    my %req;
+    for my $f (qw(META.json MYMETA.json)) {
+        my $p = Path::Tiny::path($root)->child($f);
+        next unless $p->is_file;
+        my $j = eval { Cpanel::JSON::XS->new->decode($p->slurp_raw) } or next;
+        for my $phase (values %{ $j->{prereqs} || {} }) {
+            my $h = $phase->{requires} or next;           # only hard 'requires', not recommends/suggests
+            $req{$_} = $h->{$_} for keys %$h;
+        }
+        return (\%req, $f);
+    }
+    my $cpan = Path::Tiny::path($root)->child('cpanfile');
+    if ($cpan->is_file) {
+        my $txt = $cpan->slurp_utf8;
+        $req{$1} = $2 // 0 while $txt =~ /(?:^|\n)\s*requires\s+['"]([\w:]+)['"](?:\s*(?:=>|,)\s*['"]?([\w.]+)['"]?)?/g;
+        return (\%req, 'cpanfile') if %req;
+    }
+    my $mf = Path::Tiny::path($root)->child('Makefile.PL');
+    if ($mf->is_file) {
+        my $txt = $mf->slurp_utf8;
+        while ($txt =~ /(?:PREREQ_PM|(?:TEST|CONFIGURE|BUILD)_REQUIRES)\s*=>\s*\{([^}]*)\}/gs) {
+            my $body = $1;
+            $req{$1} = $2 // 0 while $body =~ /['"]([\w:]+)['"]\s*=>\s*'?([\w.]+)'?/g;
+        }
+        return (\%req, 'Makefile.PL') if %req;
+    }
+    return (\%req, undef);
+}
+
+# A predicate `is_core($module)` via Module::CoreList when available, else a small
+# fallback set of obvious core modules (so "missing" never flags a core dependency).
+sub _core_checker {
+    if (eval { require Module::CoreList; 1 }) {
+        return sub ($m) { Module::CoreList::is_core($m) ? 1 : 0 };
+    }
+    my %core = map { $_ => 1 } qw(strict warnings POSIX Exporter Carp Scalar::Util List::Util
+        Digest::SHA Data::Dumper Encode Storable File::Temp File::Spec Cwd Time::HiRes
+        Getopt::Long constant overload parent base lib feature utf8 Fcntl Errno);
+    return sub ($m) { $core{$m} ? 1 : 0 };
+}
 # explore omits whole-file nodes so it never dumps an entire file.
 sub explore ($self, $query, $max = 8) {
     map { $self->_view($_) } grep { ($_->{kind} // '') ne 'file' } $self->search($query, $max);
@@ -690,8 +890,11 @@ App::PerlGraph::Query - read-only graph queries
 
 =head1 DESCRIPTION
 
-callers / callees / impact / path / affected / unused / search / explore / node_view /
-graph / deps / cycles / api / covers over a L<App::PerlGraph::Store>, plus the
+Read-only structural queries over a L<App::PerlGraph::Store>, grouped by intent:
+navigation (callers, callees, impact, path), orientation (overview, explore, search /
+semantic, node, explain, context), API and tests (api, covers, untested, undocumented),
+architecture (deps, cycles, layers, hotspots), history (risk, cochange, owners), security
+(sinks), release (affected, diff, semver, review), the graph export model, and the
 agent-mediated unresolved / resolve loop.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
