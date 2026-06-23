@@ -1,6 +1,6 @@
 package App::PerlGraph;
 use v5.36;
-our $VERSION = '0.047';
+our $VERSION = '0.053';
 1;
 
 __END__
@@ -15,6 +15,7 @@ App::PerlGraph - a Perl-native code knowledge graph for AI agents
     pcg sync                          # incremental update (changed files + dependents)
     pcg watch                         # keep it fresh: re-index on file changes
     pcg overview                      # codebase map: scale, frameworks, entry points, central symbols
+    pcg metrics                       # code-health snapshot: coverage, complexity, dead code, clones, cycles
     pcg explore Some::Module          # symbols with source + POD + relationships
     pcg node|search Some::thing       # a symbol's definition / symbol search
     pcg explain Some::thing           # one-call dossier: source + callers/callees + blast radius + tests
@@ -23,21 +24,26 @@ App::PerlGraph - a Perl-native code knowledge graph for AI agents
     pcg path Foo::a Bar::z            # shortest call path between two symbols
     pcg unused                        # dead-code candidates (nothing references)
     pcg untested|undocumented         # public API symbols no test reaches / with no POD
+    pcg dead-exports                  # exported functions/methods no other in-repo pkg calls (retractable API)
+    pcg checkcalls                    # broken method calls: $obj->method the receiver's known class lacks
     pcg affected lib/Foo.pm           # files/tests impacted by a change
     pcg deps|cycles|layers            # module deps / cycles / architecture layers (by dependency depth)
     pcg api|covers X                  # a module's public surface / which tests exercise a symbol
     pcg prereqs                       # declared CPAN prereqs vs actually-used (missing / unused)
     pcg unresolved [--by-receiver]    # opaque $obj->method calls (--by-receiver suggests each receiver's class)
     pcg hotspots                      # fan-in / fan-out / complexity / coupling leaders
+    pcg duplication                   # structural code clones (type-1/2): extract-a-shared-helper targets
     pcg risk [--since main]           # git churn x fan-in (--since: churn on the current branch)
     pcg cochange                      # files that change together (logical coupling)
     pcg owners                        # code ownership x importance (bus-factor risks)
+    pcg suggest-reviewers main        # who should review a change: authors of the changed files, ranked
     pcg sinks                         # command/SQL execution sites + which web endpoints reach them
     pcg diff main                     # structural diff vs a ref (added/removed/changed + breaking)
     pcg semver main                   # recommend a major/minor/patch version bump from the diff
     pcg review main                   # PR review: diff + blast radius + tests + breaking + findings
     pcg rename Foo::bar baz [--apply] # graph-driven rename within a package (dry-run by default)
-    pcg move Foo::bar Other::Pkg      # move a sub to another package: relocate source + requalify calls
+    pcg move Foo::bar Other::Pkg [--apply]  # move a sub to another package: relocate source + requalify calls
+    pcg inline Foo::helper [--apply]  # inline a simple function at its call sites (do{} block) + remove def
     pcg search --semantic "intent"    # rank symbols by meaning (needs `index --embed` + a local provider)
     pcg export --format html          # render the graph (dot|mermaid|json|html -- html is interactive)
     pcg index --deps                  # also resolve calls into used CPAN modules (@INC)

@@ -57,6 +57,7 @@ pcg watch                         # keep it fresh: re-index on every file change
                                   #   change, for an agent to monitor the stream and react
 pcg overview                      # codebase map: scale, frameworks, entry points, central symbols,
                                   #   namespaces, most-subclassed (the lay of the land -- a good first stop)
+pcg metrics                       # code-health snapshot: scale, coverage, complexity, clones, cycles + concerns
 pcg explore Some::Module          # matching symbols with source + POD docs + relationships (one call)
 pcg node    Some::Module::thing   # a symbol's source + callers/callees
 pcg explain Some::Module::thing   # full dossier: source + callers/callees + blast radius + covering tests
@@ -69,14 +70,18 @@ pcg path    Foo::a Bar::z         # shortest call path: how Foo::a reaches Bar::
 pcg affected lib/Foo.pm           # files/tests impacted by a change (CI: pcg affected --since main --tests)
 pcg unused                        # dead-code candidates: subs nothing references (--all keeps exported/lifecycle subs)
 pcg untested                      # public API symbols no test statically reaches
+pcg dead-exports                  # exported functions/methods no other in-repo pkg calls (retractable API)
 pcg deps    Some::Module          # module dependency graph: what it imports / inherits (omit for the whole project)
 pcg cycles                        # circular module dependencies
 pcg layers                        # architecture stratification: modules by dependency depth + cyclic violations
+pcg checkcalls                    # broken method calls: a method the receiver's known class does NOT define
+pcg duplication                   # structural code clones (type-1/2): extract-a-shared-helper targets
 pcg hotspots                      # fan-in (+ blast radius) / fan-out / complexity / most-coupled-modules triage
 pcg risk                          # git churn x fan-in: frequently-changed + widely-depended-upon code
 pcg risk --since main             #   ... weighted by churn on the current branch (commits since main)
 pcg cochange                      # files that change together (logical coupling, incl. hidden)
 pcg owners                        # code ownership x importance: each file's author + bus-factor risks
+pcg suggest-reviewers main        # who should review a change: authors of the changed files, ranked
 pcg sinks                         # command/SQL sinks (flags dynamically-built args as injection risk) + which endpoints reach them
 pcg diff main                     # structural diff vs a git ref: added/removed/changed symbols (+ breaking)
 pcg semver v1.4.0                 # recommend a major/minor/patch bump from the diff (CPAN release helper)
@@ -89,6 +94,7 @@ pcg unresolved [--name M] [--limit N] [--by-receiver]   # opaque $obj->method ca
 pcg rename Foo::bar baz [--apply]   # graph-driven rename within a package; reports the dynamic
                                   #   $obj->method sites it can't verify. Dry-run unless --apply
 pcg move Foo::bar Other::Pkg [--apply]   # move a sub to another package: relocate source + requalify calls
+pcg inline Pkg::helper [--apply]         # inline a simple function at its call sites (do{} block) + remove def
 pcg export --format mermaid --around Some::Module::run   # render the (sub)graph for docs/review (dot|mermaid|json|html -- html is a self-contained interactive viz)
 pcg search  thing
 pcg search --semantic "where do we validate user input"   # rank by meaning (needs `index --embed`)
@@ -126,10 +132,10 @@ reverses them:
 "mcpServers": { "pcg": { "type": "stdio", "command": "pcg", "args": ["serve", "--mcp"] } }
 ```
 
-Tools exposed (35): the read tools `pcg_overview`, `pcg_sinks`, `pcg_explore`, `pcg_explain`, `pcg_context`, `pcg_node`, `pcg_search`,
+Tools exposed (41): the read tools `pcg_overview`, `pcg_metrics`, `pcg_explore`, `pcg_explain`, `pcg_context`, `pcg_node`, `pcg_search`,
 `pcg_callers`, `pcg_callees`, `pcg_impact`, `pcg_path`, `pcg_unused`,
-`pcg_affected`, `pcg_deps`, $1, `pcg_layers`, `pcg_prereqs`, `pcg_hotspots`, $1, `pcg_owners`, `pcg_semver`, `pcg_diff`, `pcg_review`, `pcg_api`, $1, `pcg_undocumented`,
-`pcg_unresolved`, `pcg_resolve`, the two write tools `pcg_rename` (rename) and `pcg_move` (cross-package move),
+`pcg_affected`, `pcg_deps`, `pcg_cycles`, `pcg_layers`, `pcg_checkcalls`, `pcg_duplication`, `pcg_prereqs`, `pcg_hotspots`, `pcg_risk`, `pcg_owners`, `pcg_suggest_reviewers`, `pcg_cochange`, `pcg_semver`, `pcg_diff`, `pcg_review`, `pcg_api`, `pcg_covers`, `pcg_untested`, `pcg_undocumented`, `pcg_dead_exports`, `pcg_sinks`,
+`pcg_unresolved`, `pcg_resolve`, the three write tools `pcg_rename` (rename), `pcg_move` (cross-package move) and `pcg_inline` (inline a function),
 plus lifecycle tools `pcg_index` (with
 `runtime`, `deps` and `embed` options), `pcg_sync` and `pcg_status`. The
 agent can therefore build and refresh the graph

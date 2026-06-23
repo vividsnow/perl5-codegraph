@@ -1,10 +1,11 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.047};
+our $VERSION = q{0.053};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify sink_type);
 use App::PerlGraph::Grammar qw(:all);
 use App::PerlGraph::Pod;
+use Digest::SHA qw(sha1_hex);
 no warnings 'recursion';   # deep but bounded CST walks (after Moo re-enables warnings)
 
 # Walks a normalized parse tree (from App::PerlGraph::Parser) and produces
@@ -215,6 +216,7 @@ sub _handle_sub ($self, $n) {
     my %meta;
     $meta{complexity} = $cx if $cx > 1;                         # omit the trivial cx=1
     if (my $r = $self->_return_class($n)) { $meta{returns} = $r }   # a `Class->new` builder
+    if (my $dup = $self->_body_fingerprint($n)) { $meta{dup} = $dup }  # structural clone fingerprint
     my $snode = $self->_emit({
         kind           => ($n->{type} eq NODE_METHOD_DECL ? 'method' : 'function'),
         name           => $name,
@@ -227,6 +229,24 @@ sub _handle_sub ($self, $n) {
     $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $snode->{id}, 'contains');
     $self->_handle_catalyst($n, $snode);
     return $snode;
+}
+
+# A structural fingerprint of a sub BODY for clone detection: the pre-order sequence
+# of CST node TYPES (leaf text -- identifiers and literals -- ignored), so two subs
+# with the same shape but different names/values (type-1 and type-2 clones) hash the
+# same. Returns "<node-count>:<sha1>" for a non-trivial body, else undef. The count is
+# stored in the key so a query can threshold on size without re-hashing.
+sub _body_fingerprint ($self, $sub) {
+    my ($block) = grep { ($_->{type} // '') eq NODE_BLOCK } @{ $sub->{children} // [] };
+    return undef unless $block;
+    my @types;
+    my @stack = ($block);
+    while (my $n = pop @stack) {
+        push @types, $n->{type} // '';
+        push @stack, reverse @{ $n->{children} // [] };          # pre-order, deterministic
+    }
+    return undef unless @types >= 12;                            # skip trivial bodies (getters / one-liners)
+    return scalar(@types) . ':' . sha1_hex(join "\x1f", @types);
 }
 
 # Cyclomatic complexity of a sub: 1 + the decision points in its body (branches,
@@ -450,6 +470,10 @@ sub _call_name ($self, $node) {
 }
 
 sub _infer_var_type ($self, $left, $right) {
+    # only a plain `$x` / `my $x` lvalue -- NOT an element/field/deref assignment like
+    # `$self->{parser} = Class->new` or `$a[0] = ...` (those type the SLOT, never the base
+    # variable; typing `$self` from them mis-resolves every later `$self->method`).
+    return if ($left->{text} // '') =~ /->|[\[{]/;
     my @scalars = $self->_descendants($left, 'scalar');
     return unless @scalars == 1;                                 # a single `my $x` (skip `my ($a,$b)` / arrays)
     my $vn = $self->_find_descendant($scalars[0], NODE_VARNAME) or return;
@@ -574,6 +598,7 @@ sub _handle_has ($self, $n) {
         elsif ($single && defined $opt{reader})   { @acc = ($opt{reader}) }
         elsif (defined $opt{is} && $opt{is} ne 'bare') { @acc = ($attr) }   # default accessor = attribute name (needs an `is`)
         push @acc, $opt{writer} if $single && defined $opt{writer};
+        push @acc, "_set_$attr" if ($opt{is} // '') eq 'rwp';              # Moo `is => 'rwp'` -> private writer _set_<attr>
         $self->_emit_accessor($pkg, $_, $n, $opt{isa}) for grep { defined && /\A\w+\z/ } @acc;
     }
     $pkg->{_is_class} = 1;

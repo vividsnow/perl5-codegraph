@@ -1,6 +1,6 @@
 package App::PerlGraph::Installer;
 use v5.36;
-our $VERSION = q{0.047};
+our $VERSION = q{0.053};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);
@@ -50,6 +50,8 @@ routes/helpers, XSUBs), not text matches.
 - Land in an unfamiliar repo -> **pcg_overview** (scale, frameworks, entry-point scripts,
   the most central symbols, top namespaces, most-subclassed classes -- the lay of the land
   in one call).
+- A code-health snapshot for triage / a release gate -- NOT for orienting (use pcg_overview for that):
+  resolution %, test & doc coverage, complexity, dead code, clones, cycles + a concerns summary -> **pcg_metrics**.
 - Orient on a specific area -> **pcg_explore** `<symbol-or-term>` (symbols + source + immediate
   callers/callees in one call -- the best first stop; beats grep).
 - Everything about ONE symbol in one call (definition + source + callers/callees + transitive
@@ -66,18 +68,25 @@ routes/helpers, XSUBs), not text matches.
 - Architecture layers (modules stratified by dependency depth; cyclic deps flagged) -> **pcg_layers**.
 - CPAN dependency hygiene (declared prereqs vs actually-used modules: missing / unused) -> **pcg_prereqs**.
 - Where's the risk/complexity (fan-in + blast radius / fan-out / cyclomatic complexity / module coupling) -> **pcg_hotspots** (review & refactor triage).
+- Copy-pasted / structurally duplicated subs (DRY / extract-a-shared-helper targets) -> **pcg_duplication**.
 - What's risky to change given git history (churn x fan-in) -> **pcg_risk**.
 - What changes together but has no static link (hidden coupling) -> **pcg_cochange**.
 - Code ownership x importance (each file's primary author + bus-factor risks) -> **pcg_owners**.
+- Who should review a change (authors of the changed files, ranked by how much of that code they wrote) -> **pcg_suggest_reviewers** `<ref>`.
 - Review a branch/PR in one call (diff + blast radius + tests + breaking + findings) -> **pcg_review** `<ref>`. Just the structural diff -> **pcg_diff**.
 - Recommend a semver bump (major/minor/patch) for a release from the structural diff -> **pcg_semver** `<ref>` (breaking public API->major, new public API->minor, internal->patch).
 - Security attack surface (command/SQL execution sites + which web endpoints reach them) -> **pcg_sinks** (flags sinks whose argument is dynamically built -- interpolated/concatenated -- as the injection-shaped sites; constant/placeholdered ones are safe).
 - Which tests exercise X -> **pcg_covers**.  Tests impacted by a diff -> **pcg_affected**.
+- Broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class doesn't
+  define (a typo or a call into renamed/removed API) -> **pcg_checkcalls** (heuristic; `pcg_index runtime:true` sharpens it).
 - Dead-code candidates -> **pcg_unused**.  Untested public API -> **pcg_untested**.
 - Undocumented public API (no POD) -> **pcg_undocumented**.
-- Rename a function/method across the codebase via the graph (the one WRITE tool; edits only the
-  call sites it can tie to the symbol, reports the dynamic ones) -> **pcg_rename** (dry-run unless apply:true; call pcg_sync after).
+- Exported functions/methods no OTHER in-repo package calls (retractable public API) -> **pcg_dead_exports**.
+- Rename a function/method to a new name WITHIN ITS OWN PACKAGE across the codebase (the first of three WRITE
+  tools; for a cross-package move use pcg_move; edits only the call sites it can tie to the symbol, reports the
+  dynamic ones) -> **pcg_rename** (dry-run unless apply:true; call pcg_sync after).
 - Move a function to another existing package (relocate its source + requalify call sites to NewPkg::sub) -> **pcg_move** (dry-run unless apply:true; call pcg_sync after).
+- Inline a simple function at its call sites (a do{} block) + remove the definition, the inverse of extract -> **pcg_inline** (dry-run unless apply:true; refuses unsafe bodies; call pcg_sync after).
 
 ## Closing the unresolved frontier (high value)
 Opaque `$obj->method` dispatch that static analysis can't tie to a class (local

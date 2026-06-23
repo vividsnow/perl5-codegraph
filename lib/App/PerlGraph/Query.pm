@@ -1,8 +1,8 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.047};
+our $VERSION = q{0.053};
 use Moo;
-use App::PerlGraph::Model qw(package_of is_public);
+use App::PerlGraph::Model qw(package_of is_public is_universal);
 
 # Read-only graph queries over a Store. Symbols may be bare names ('run') or
 # qualified ('Foo::run').
@@ -529,6 +529,145 @@ sub undocumented ($self, $module = undef) {
         push @out, grep { !$seen{ $_->{id} }++ && !(defined $_->{docstring} && $_->{docstring} =~ /\S/) } $self->api($m);
     }
     return @out;
+}
+
+# Broken method calls: `$recv->method` sites where the receiver's class is KNOWN
+# (in-repo, with a fully in-repo MRO and no AUTOLOAD escape hatch) yet defines no such
+# method anywhere in that MRO -- typos and calls into renamed/removed API, which static
+# Perl misses until runtime. The closed-MRO + no-AUTOLOAD + not-universal/lifecycle gate
+# keeps false positives near zero (`has`/`field` accessors ARE captured); the residue is
+# dynamic method injection (runtime *glob installs, `handles` delegation), exactly what
+# `pcg index --runtime` resolves -- so findings are honest heuristic candidates to verify.
+# Skip-list: object-system base methods we don't model as nodes for a plain `-base` class.
+my %CHECKCALLS_SKIP = map { $_ => 1 }
+    qw(new import unimport BUILD BUILDARGS BUILDALL DEMOLISH DESTROY AUTOLOAD CLONE
+       meta does DOES dump tap attr with_roles);
+sub checkcalls ($self) {
+    my $s = $self->store;
+    require App::PerlGraph::Resolver;
+    my $r = App::PerlGraph::Resolver->new(store => $s);
+    my %in_repo = map { (($_->{qualified_name} // '') => 1) } $s->all_nodes(qw(package class));  # closed-MRO test, once
+    my (%seen, @out);
+    for my $ref ($s->all_unresolved) {
+        next unless ($ref->{reference_kind} // '') eq 'method_call';
+        my $m = $ref->{reference_name};
+        next if $m =~ /::/ || is_universal($m) || $CHECKCALLS_SKIP{$m};   # SUPER::/qualified, can/isa, lifecycle
+        my $cls = $r->receiver_class($ref)              or next;          # only when we KNOW the receiver's class
+        my @mro = $r->mro($cls)                         or next;
+        next if grep { !$in_repo{$_} } @mro;                             # any MRO class (incl. $cls) external -> unsure
+        next if $r->method_in_mro($cls, $m);                             # the method DOES exist -> fine
+        next if $r->method_in_mro($cls, 'AUTOLOAD');                     # AUTOLOAD in the MRO -> dynamic dispatch
+        my $caller = $ref->{from_node_id} ? $s->node($ref->{from_node_id}) : undef;
+        my $cn = $caller ? ($caller->{qualified_name} // $caller->{name} // '?') : '?';
+        next if $seen{"$cls\x1f$m\x1f$cn\x1f@{[ $ref->{line} // 0 ]}"}++;
+        push @out, { class => $cls, method => $m, caller => $cn, file => $ref->{file_path}, line => $ref->{line} };
+    }
+    return [ sort { $a->{class} cmp $b->{class} || $a->{method} cmp $b->{method}
+                 || ($a->{file} // '') cmp ($b->{file} // '') || ($a->{line} // 0) <=> ($b->{line} // 0) } @out ];
+}
+
+# Structural code clones: subs whose BODY has an identical CST shape (the per-sub
+# `dup` fingerprint -- node-type sequence with identifiers/literals abstracted away,
+# so type-1 and type-2 copy-paste-with-renames match). Groups of >= 2 are reported,
+# ranked by size x copies (the best extract-a-helper targets). Near-duplicates with
+# small edits (type-3) are NOT grouped -- this is exact-structure, low false positive.
+sub duplication ($self, %opt) {
+    my $s   = $self->store;
+    my $min = $opt{min_nodes} || 30;                 # ignore small bodies (a few statements)
+    my %by_fp;
+    for my $n ($s->all_nodes(qw(function method))) {
+        my $dup = ($n->{metadata} // {})->{dup} or next;
+        my ($count) = $dup =~ /\A(\d+):/;
+        push @{ $by_fp{$dup} }, $n if $count && $count >= $min;
+    }
+    my @groups;
+    for my $fp (keys %by_fp) {
+        my @members = @{ $by_fp{$fp} };
+        next unless @members >= 2;                    # a clone needs at least two copies
+        my ($nodes) = $fp =~ /\A(\d+):/;
+        push @groups, { nodes => $nodes + 0, count => scalar @members,
+            members => [ sort { ($a->{qualified_name} // '') cmp ($b->{qualified_name} // '') } @members ] };
+    }
+    @groups = sort { $b->{nodes} * $b->{count} <=> $a->{nodes} * $a->{count}     # biggest x most-copied first
+                  || $b->{nodes} <=> $a->{nodes}
+                  || ($a->{members}[0]{qualified_name} // '') cmp ($b->{members}[0]{qualified_name} // '') } @groups;
+    my $limit = $opt{limit} || 20;
+    @groups = @groups[0 .. $limit - 1] if @groups > $limit;
+    return \@groups;
+}
+
+# Suggested reviewers for a change: rank the authors of the CHANGED files by how many commits
+# they've made to them (git authorship x the diff). The people who wrote the touched code
+# review it best. $authors = App::PerlGraph::Git::authors; $changed = the changed code files
+# (App::PerlGraph::Git::changed). Pure git -- no graph lookup -- but a Query method for symmetry.
+sub suggest_reviewers ($self, $authors, $changed) {
+    my (%score, %touched);
+    for my $f (@$changed) {
+        my $au = $authors->{$f} or next;
+        for my $a (keys %$au) {
+            $score{$a} += $au->{$a};
+            push @{ $touched{$a} }, $f;
+        }
+    }
+    return [ map { { author => $_, commits => $score{$_}, files => [ sort @{ $touched{$_} } ] } }
+             sort { $score{$b} <=> $score{$a} || $a cmp $b } keys %score ];
+}
+
+# Exported FUNCTIONS/METHODS (@EXPORT / @EXPORT_OK) that NO other in-repo package calls or
+# references -- public API you could stop exporting. "Used" counts any caller OUTSIDE the
+# defining package (tests included); an export only its own package uses is dead weight on
+# the API. Constants are excluded: their bareword use isn't recorded as a call edge, so we
+# can't tell if they're live. Honest caveat (the renderer states it): a CPAN module's
+# exports may exist for external consumers the graph can't see -- candidates, not removals.
+sub dead_exports ($self) {
+    my $s = $self->store;
+    my @out;
+    for my $n (grep { $_->{is_exported} } $s->all_nodes(qw(function method))) {
+        my $pkg  = package_of($n->{qualified_name} // $n->{name} // '');
+        my $live = 0;
+        for my $e ($s->incoming_edges($n->{id}, 'calls', 'references')) {
+            my $src = $s->node($e->{source}) or next;
+            next if package_of($src->{qualified_name} // $src->{name} // '') eq $pkg;   # same-package use doesn't count
+            $live = 1; last;
+        }
+        push @out, $n unless $live;
+    }
+    return [ sort { ($a->{qualified_name} // '') cmp ($b->{qualified_name} // '') } @out ];
+}
+
+# A one-call code-health snapshot for triage / release: composes the analyses into
+# headline scale numbers plus the coverage and quality ratios. Graph-only (no git), so it
+# runs anywhere. The renderer turns these into a concerns summary.
+sub metrics ($self) {
+    my $s   = $self->store;
+    my $dbh = $s->dbh;
+    my @funcs = $s->all_nodes(qw(function method));
+    my @pkgs  = $s->all_nodes(qw(package class));
+    my @api   = grep { is_public($_) } $s->all_nodes(qw(function method constant));
+    my @complex = grep { (($_->{metadata} // {})->{complexity} // 0) >= 10 } @funcs;
+    my $maxcx = 0;
+    for my $f (@funcs) { my $c = ($f->{metadata} // {})->{complexity} // 0; $maxcx = $c if $c > $maxcx }
+    my ($nodes)      = $dbh->selectrow_array('select count(*) from nodes');
+    my ($edges)      = $dbh->selectrow_array('select count(*) from edges');
+    my ($files)      = $dbh->selectrow_array('select count(*) from files');
+    my ($unresolved) = $dbh->selectrow_array('select count(*) from unresolved_refs');
+    my ($rels)       = $dbh->selectrow_array("select count(*) from edges where kind in ('calls','references')");
+    my @unused   = $self->unused;
+    my @untested = $self->untested;
+    my @undoc    = $self->undocumented;
+    my @cycles   = $self->cycles;
+    my $clones   = $self->duplication(limit => scalar(@funcs) || 1);   # the true group COUNT, not the top-20 default
+    my $napi = scalar(@api) || 1;                # denominator for the coverage ratios (>=1, avoids /0)
+    my $tot  = ($rels // 0) + ($unresolved // 0) || 1;
+    return {
+        files => $files // 0, packages => scalar @pkgs, subs => scalar @funcs, public_api => scalar @api,
+        nodes => $nodes // 0, edges => $edges // 0,
+        unresolved => $unresolved // 0, resolved_pct => 100 * ($rels // 0) / $tot,
+        complex => scalar @complex, max_complexity => $maxcx,
+        cycles => scalar @cycles, unused => scalar @unused, clone_groups => scalar @$clones,
+        untested => scalar @untested, tested_pct => 100 * ($napi - scalar @untested) / $napi,
+        undocumented => scalar @undoc, documented_pct => 100 * ($napi - scalar @undoc) / $napi,
+    };
 }
 
 # Code ownership x importance for bus-factor: per indexed file, its primary author

@@ -1,6 +1,6 @@
 package App::PerlGraph::Resolver;
 use v5.36;
-our $VERSION = q{0.047};
+our $VERSION = q{0.053};
 use Moo;
 use App::PerlGraph::Model qw(package_of qualify is_builtin is_external is_universal);
 
@@ -153,7 +153,7 @@ sub _resolve_method ($self, $ref) {
     if (my ($m) = $meth =~ /\ASUPER::(.+)\z/) {
         my $s = $self->store;
         my $cls = $self->_from_package($ref);
-        my @anc = @{ $self->{_mro_cache}{$cls} //= [ $self->_mro($cls) ] };
+        my @anc = $self->mro($cls);
         shift @anc;
         for my $c (@anc) {
             if (my ($n) = grep { ($_->{kind} // '') =~ /method|function/ } $s->nodes_by_qname(qualify($c, $m))) {
@@ -203,7 +203,7 @@ sub _resolve_method ($self, $ref) {
 # cache each type's MRO; a deep chain isn't re-walked (with DB lookups) per call.
 sub _method_in ($self, $type, $meth) {
     my $s = $self->store;
-    for my $cls (@{ $self->{_mro_cache}{$type} //= [ $self->_mro($type) ] }) {
+    for my $cls ($self->mro($type)) {
         if (my ($n) = grep { $_->{kind} =~ /method|function/ } $s->nodes_by_qname(qualify($cls, $meth))) {
             return $n;
         }
@@ -215,6 +215,25 @@ sub _method_in ($self, $type, $meth) {
 # Lets the LLM resolver type a receiver once and resolve all its calls (only the
 # ones the class actually has -- never a fabricated edge).
 sub method_in_mro ($self, $class, $meth) { $self->_method_in($class, $meth) }
+
+# Public: $class followed by its MRO ancestors (for callers that need the chain,
+# e.g. checkcalls' closed-MRO test). Memoized like the internal walk.
+sub mro ($self, $class) { @{ $self->{_mro_cache}{$class} //= [ $self->_mro($class) ] } }
+
+# Public: the class a method-call ref dispatches ON, when statically determinable
+# -- the receiver-typing half of _resolve_method without the method lookup. Returns
+# the class name for `$self`/`$class` (enclosing package), an inferred `my $x =
+# Class->new` receiver, or a bareword `Class->meth` receiver; undef for an opaque
+# `$obj`/expression/chain receiver. Lets checkcalls ask "is the method missing from
+# a class we DO know?" rather than "did resolution fail (for any reason)?".
+sub receiver_class ($self, $ref) {
+    my $cand = $ref->{candidates} || {};
+    return $cand->{receiver_type} if $cand->{receiver_type};          # my $x = Class->new
+    my $recv = $cand->{receiver} // '';
+    return $self->_from_package($ref) if $recv =~ /\A\$(?:self|class)\z/;
+    return $recv if $recv =~ /\A[\w:]+\z/;                            # Class->meth (bareword invocant)
+    return undef;                                                     # $obj / expr / chain -- unknown
+}
 
 # A class followed by its ancestors in Perl's default (depth-first, left-to-right)
 # method resolution order, walked transitively through @ISA `extends` edges. The

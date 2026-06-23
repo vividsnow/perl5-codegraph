@@ -106,6 +106,12 @@ t/71-review.t
 t/72-resolution.t
 t/73-deps.t
 t/74-resolve-type.t
+t/93-suggest-reviewers.t
+t/92-dead-exports.t
+t/91-metrics.t
+t/90-inline.t
+t/89-duplication.t
+t/88-checkcalls.t
 t/87-owners.t
 t/86-move.t
 t/85-layers.t

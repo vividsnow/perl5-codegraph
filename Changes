@@ -1,5 +1,84 @@
 Revision history for App-PerlGraph
 
+0.053     2026-06-23
+          - New: `pcg suggest-reviewers <ref>` / pcg_suggest_reviewers (41 MCP tools) -- who should
+            review a change: the authors of the files changed vs <ref>, ranked by how many commits
+            they have made to that touched code (git authorship x the diff). The people who wrote
+            the changed code review it best; the change's own author tends to rank first, so pick
+            the next most familiar. New Query::suggest_reviewers; Format::suggest_reviewers; CLI `pcg
+            suggest-reviewers` (reuses Git::authors + Git::changed). Needs a git work tree.
+          - Tests +15 (1311 total): t/93 (ranking by commit total across the changed files, an
+            author of an unchanged file excluded, the per-reviewer file list, the rendered report).
+          - Completes the sixth feature wave (0.048-0.053): checkcalls, duplication, inline, metrics,
+            dead-exports, suggest-reviewers. 41 MCP tools.
+
+0.052     2026-06-23
+          - New: `pcg dead-exports` / pcg_dead_exports (40 MCP tools) -- exported FUNCTIONS/METHODS
+            (@EXPORT / @EXPORT_OK) that NO other in-repo package calls: public API you could stop
+            exporting to shrink the surface. A caller in any OTHER package (tests included) makes an
+            export live; same-package use does not. Constants are excluded (their bareword use is not
+            call-tracked). Honest caveat: a CPAN module's exports may serve external / downstream
+            consumers the graph can't see -- candidates to verify, not certain removals. New
+            Query::dead_exports; Format::dead_exports; CLI `pcg dead-exports`.
+          - Tests +10 (1296 total): t/92 (a dead export + a same-package-only export flagged, a
+            cross-package-called export not flagged).
+
+0.051     2026-06-23
+          - New: `pcg metrics` / pcg_metrics (39 MCP tools) -- a one-call code-health snapshot for
+            triage or a release gate: scale (files/packages/subs/public-API/nodes/edges), static
+            resolution %, test + POD coverage of the public API, high-complexity sub count, dead
+            code, structural clone groups, and dependency cycles, plus a flagged "concerns" summary.
+            Composes the existing analyses (unused / untested / undocumented / duplication / cycles)
+            into headline numbers; spans all indexed files (tests included). New Query::metrics;
+            Format::metrics; CLI `pcg metrics`.
+          - Tests +21 (1286 total): t/91 (the metric keys, percentages bounded to [0,100], and the
+            rendered dashboard + concerns summary).
+
+0.050     2026-06-23
+          - New: `pcg inline` / pcg_inline (38 MCP tools) -- the THIRD write tool, the inverse of
+            extracting a helper: inline a simple FUNCTION at its resolved call sites and remove the
+            definition. Each call becomes a `do { my (params) = (args); body }` block -- binds the
+            arguments once, preserves precedence, supports multi-statement bodies. Strictly scoped
+            for safety: a plain function (not a method), params via a leading `my (...) = @_` or a
+            simple all-scalar signature, and a body with no return / wantarray / shift / pop /
+            $_[N] / caller / goto / local (control flow a do-block cannot preserve). Dynamic $obj->method +
+            unresolved sites are reported and the definition kept; refuses (with a reason) anything
+            unsafe. Dry-run by default. New Refactor::inline + _find_sub / _calls_by_pos /
+            _inline_template / _apply_inline (byte-span replacement); Format::inline; CLI `pcg inline`.
+          - Tests +29 (1265 total): t/90 (unpack-idiom + signature inline with args bound once, def
+            removal, dry-run, the return refusal, a method-call site -> frontier + def kept, a
+            recursive self-call -> frontier, an exported function -> def kept, a $1-shaped argument
+            inlined literally, and multi-package same-name targeting -- the file re-parses each time).
+
+0.049     2026-06-23
+          - New: `pcg duplication` / pcg_duplication (37 MCP tools) -- structural clone detection:
+            groups subs whose BODY has an identical CST shape (a per-sub `dup` fingerprint -- the
+            node-type sequence with identifiers and literals abstracted away), so type-1 (exact) and
+            type-2 (copy-paste with renamed vars / changed constants) duplicates are caught. Ranked
+            by size x copies, so the biggest, most-copied groups -- the best extract-a-shared-helper /
+            DRY targets -- lead. Type-3 near-dupes are NOT grouped, so a group is a real structural
+            match. New Extractor::_body_fingerprint (stored as metadata.dup; EXTRACTION_VERSION 7->8);
+            Query::duplication; Format::duplication; CLI `pcg duplication` (--limit / --min-nodes).
+          - Tests +13 (1236 total): t/89 (a type-2 pair groups, a structurally-different sub does not,
+            the min-nodes floor). Dogfooding flagged real clones in pcg (the mirrored _cmd_* CLI
+            handlers + copy-pasted test helpers).
+
+0.048     2026-06-23
+          - New: `pcg checkcalls` / pcg_checkcalls (36 MCP tools) -- a static BUG FINDER turning the
+            resolved graph into a linter: `$obj->method` sites where the receiver class is KNOWN (a
+            $self/$class invocant, an inferred `my $x = Class->new`, or a bareword Class->method) and
+            that class + its FULL in-repo MRO defines no such method -- typos and calls into renamed/
+            removed API that Perl misses until runtime. Conservative gate (closed in-repo MRO, no
+            AUTOLOAD, not a universal/lifecycle method; `has`/`field`/`is=>rwp` accessors understood)
+            keeps false positives near zero; honest about the residue (runtime-injected methods,
+            `handles` delegation) that `pcg index --runtime` resolves. New Query::checkcalls +
+            Resolver::receiver_class/mro; Format::checkcalls; CLI `pcg checkcalls`.
+          - Fix (surfaced by dogfooding checkcalls -- 0 false positives on pcg only after these; both
+            also improve resolution generally): (1) `$self->{slot} = Class->new` no longer mis-types
+            `$self` itself (it typed the base var, mis-resolving every later `$self->method`); (2) Moo
+            `is => rwp` now emits the generated private writer `_set_<attr>` as a node. EXTRACTION_VERSION 6->7.
+          - Tests +17 (1223 total): t/88 (the genuine bug + every false-positive guard incl. the rwp writer).
+
 0.047     2026-06-22
           - Docs / discoverability polish so an agent reaches for the right tool naturally:
             restructured the MCP INSTRUCTIONS catalog from one dense run-on into intent-grouped

@@ -1,6 +1,6 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.047};
+our $VERSION = q{0.053};
 use App::PerlGraph::Source;
 use App::PerlGraph::Model qw(package_of is_public);
 use Cpanel::JSON::XS ();
@@ -155,6 +155,21 @@ sub prereqs ($r) {
     return $out;
 }
 
+sub suggest_reviewers ($reviewers, $ref, $nchanged) {
+    my $out = "## Suggested reviewers for the change vs `$ref`\n\n";
+    return $out . "_no changed code files (or no git history for them)._\n" unless @$reviewers;
+    $out .= "$nchanged changed code file(s); reviewers ranked by how much of that code they authored:\n\n";
+    for my $r (@$reviewers) {
+        my @f = @{ $r->{files} };
+        my $shown = join(', ', map { "`$_`" } @f[0 .. ($#f < 4 ? $#f : 4)]);
+        $shown .= sprintf ' (+%d more)', @f - 5 if @f > 5;
+        $out .= sprintf "- **%s** -- %d commit(s) across %d of the changed file(s): %s\n",
+            $r->{author}, $r->{commits}, scalar @f, $shown;
+    }
+    $out .= "\n(by git authorship of the touched files -- the change's own author ranks high, so pick the next most familiar.)\n";
+    return $out;
+}
+
 sub owners ($rows) {
     my $out = "## Code ownership & bus factor\n\n";
     return $out . "_no git history for the indexed files_\n" unless @$rows;
@@ -165,6 +180,71 @@ sub owners ($rows) {
             $r->{file}, $r->{owner}, $r->{share} * 100, $r->{commits}, ($r->{commits} == 1 ? '' : 's'),
             $r->{authors}, ($r->{authors} == 1 ? '' : 's'), $r->{fanin}, $risk;
     }
+    return $out;
+}
+
+sub duplication ($groups) {
+    my $out = "## Duplicate code (structural clones)\n\n";
+    return $out . "_none found_ -- no two non-trivial subs share an identical structure.\n" unless @$groups;
+    $out .= scalar(@$groups)
+        . " clone group(s) -- subs with an identical body structure (same shape; identifiers and literals aside). Each is an extract-a-shared-helper candidate:\n\n";
+    my $i = 0;
+    for my $g (@$groups) {
+        $out .= sprintf "%d. **%d copies**, ~%d AST nodes each:\n", ++$i, $g->{count}, $g->{nodes};
+        $out .= sprintf "   - `%s` -- %s\n", $_->{qualified_name} // $_->{name}, _loc($_) for @{ $g->{members} };
+    }
+    $out .= "\n(type-1 / type-2 clones: identical CST shape with names and literals abstracted away."
+          . " Near-duplicates with small edits are not grouped.)\n";
+    return $out;
+}
+
+sub dead_exports ($nodes) {
+    my $out = "## Dead exports (exported but unused in-repo)\n\n";
+    return $out . "_none_ -- every exported symbol is called by another package in the repo.\n" unless @$nodes;
+    $out .= scalar(@$nodes)
+        . " exported symbol(s) that no OTHER in-repo package calls -- candidates to drop from \@EXPORT"
+        . " (or kept only for external/downstream consumers, which the graph can't see):\n\n";
+    $out .= sprintf "- `%s` (%s) -- %s\n", $_->{qualified_name} // $_->{name}, $_->{kind}, _loc($_) for @$nodes;
+    $out .= "\n(verify a symbol isn't part of your public CPAN API before removing it from the export list.)\n";
+    return $out;
+}
+
+sub metrics ($m) {
+    my $out = "## Code health metrics\n\n";
+    $out .= sprintf "**Scale** -- %d files, %d packages/classes, %d subs (%d public API); %d nodes, %d edges.\n\n",
+        @{$m}{qw(files packages subs public_api nodes edges)};
+    $out .= sprintf "**Resolution** -- %.0f%% of call/reference edges statically resolved (%d unresolved \$obj->method / bareword).\n\n",
+        $m->{resolved_pct}, $m->{unresolved};
+    $out .= "**Quality**\n";
+    $out .= sprintf "- test coverage: %.0f%% of public API reached by a test (%d untested)\n",  $m->{tested_pct}, $m->{untested};
+    $out .= sprintf "- doc coverage:  %.0f%% of public API carries POD (%d undocumented)\n",      $m->{documented_pct}, $m->{undocumented};
+    $out .= sprintf "- complexity:    %d sub(s) at cyclomatic complexity >= 10 (max %d)\n",        $m->{complex}, $m->{max_complexity};
+    $out .= sprintf "- dead code:     %d unreferenced sub(s)\n",                                    $m->{unused};
+    $out .= sprintf "- duplication:   %d structural clone group(s)\n",                             $m->{clone_groups};
+    $out .= sprintf "- cycles:        %d circular module-dependency group(s)\n",                   $m->{cycles};
+    my @c;
+    push @c, "$m->{cycles} dependency cycle(s)"                              if $m->{cycles};
+    push @c, sprintf('%.0f%% of public API untested',     100 - $m->{tested_pct})     if $m->{tested_pct} < 80;
+    push @c, sprintf('%.0f%% of public API undocumented', 100 - $m->{documented_pct}) if $m->{documented_pct} < 50;
+    push @c, "$m->{complex} high-complexity sub(s)"                          if $m->{complex};
+    push @c, "$m->{clone_groups} clone group(s)"                            if $m->{clone_groups};
+    push @c, "$m->{unused} dead-code candidate(s)"                          if $m->{unused};
+    $out .= "\n" . (@c ? '**Concerns:** ' . join('; ', @c) . ".\n" : "_No major concerns flagged._\n");
+    return $out;
+}
+
+sub checkcalls ($findings) {
+    my $out = "## Broken method calls\n\n";
+    return $out . "_none found_ -- every \$obj->method on a known in-repo class hierarchy resolves to a real method.\n"
+        unless @$findings;
+    $out .= scalar(@$findings)
+        . " call(s) to a method the receiver's class (and its full MRO) does not define -- likely a typo or a call into renamed/removed API:\n\n";
+    for my $f (@$findings) {
+        $out .= sprintf "- `->%s` in `%s` -- %s:%s -- class `%s` and its MRO define no `%s`\n",
+            $f->{method}, $f->{caller}, $f->{file} // '?', $f->{line} // '?', $f->{class}, $f->{method};
+    }
+    $out .= "\n(heuristic: the static graph captures `has`/`field` accessors but not runtime-injected methods or"
+          . " `handles` delegation -- `pcg index --runtime` resolves those and sharpens this; verify before removing a call.)\n";
     return $out;
 }
 
@@ -501,6 +581,36 @@ sub cycles ($cycles) {
     my $out = "## Circular module dependencies\n\n";
     return $out . "_none found_\n" unless @$cycles;
     $out .= '- ' . join(' -> ', map { "`$_`" } @$_, $_->[0]) . "\n" for @$cycles;
+    return $out;
+}
+
+sub inline ($r) {
+    return "## Inline\n\n**error**: $r->{error}\n" if $r->{error};
+    my $out   = "## Inline `$r->{target}`\n\n";
+    my $files = scalar @{ $r->{files} };
+    if (!@{ $r->{edits} } && !@{ $r->{frontier} }) {
+        return $out . "_no resolved call sites to inline._\n";
+    }
+    if ($r->{applied}) {
+        $out .= sprintf "Inlined **%d** call site(s)%s across %d file(s). Run `pcg sync` to refresh the graph.\n\n",
+            scalar @{ $r->{edits} }, ($r->{removed} ? " and removed the definition" : ''), $files;
+    }
+    else {
+        $out .= "Plan (dry run -- add `--apply` / apply:true to write):\n";
+        my $fate = $r->{removed}       ? ' and remove the definition'
+                 : @{ $r->{frontier} } ? ' (the definition is KEPT -- not every caller can be inlined)'
+                 :                       ' (the definition is KEPT -- the function is exported)';
+        $out .= '- replace ' . scalar(@{ $r->{edits} }) . " call site(s) with an inlined `do { ... }` block$fate:\n";
+        my %byf; push @{ $byf{ $_->{file} } }, $_ for @{ $r->{edits} };
+        for my $f (sort keys %byf) {
+            $out .= sprintf "    `%s` L%d\n", $f, $_->{line} for sort { $a->{line} <=> $b->{line} } @{ $byf{$f} };
+        }
+        $out .= "\n";
+    }
+    if (@{ $r->{frontier} }) {
+        $out .= '**Manual review** -- ' . scalar(@{ $r->{frontier} }) . " call site(s) left untouched (the definition is kept):\n";
+        $out .= sprintf "- `%s` L%d -- %s\n", $_->{file}, $_->{line}, $_->{why} for @{ $r->{frontier} };
+    }
     return $out;
 }
 

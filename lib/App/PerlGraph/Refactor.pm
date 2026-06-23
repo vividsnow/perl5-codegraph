@@ -1,8 +1,9 @@
 package App::PerlGraph::Refactor;
 use v5.36;
-our $VERSION = q{0.047};
+our $VERSION = q{0.053};
 use Moo;
 use App::PerlGraph::Model qw(package_of);
+use App::PerlGraph::Grammar qw(:all);
 use App::PerlGraph::Parser;
 use App::PerlGraph::Extractor;
 use App::PerlGraph::Resolver;
@@ -223,22 +224,207 @@ sub _pkg_line ($lines, $pkg) {
     return scalar @$lines;
 }
 
+# Graph-driven INLINE of a simple function: replace each RESOLVED call with a `do { ... }`
+# block that binds the call's arguments to the sub's params and runs its body, then remove
+# the definition. The do-block preserves single-evaluation of args and correct precedence, and
+# works for multi-statement bodies. Strictly scoped for safety -- a plain function (not a
+# method), params via a leading `my (...) = @_` or a simple all-scalar signature, and a body
+# with NO return / wantarray / shift / pop / $_[N] / @_-reuse / caller / goto / local (control
+# flow or @_ tricks a do-block can't preserve). Dynamic `$obj->method` and unresolved call
+# sites are reported and the definition is kept; dry-run unless apply.
+sub inline ($self, $target, %opt) {
+    my $s = $self->store;
+    my @defs = grep { ($_->{kind} // '') eq 'function' }
+               ($target =~ /::/ ? $s->nodes_by_qname($target) : $s->nodes_by_name($target));
+    return { error => "no plain function named '$target' (only functions inline; a method needs its invocant)" } unless @defs;
+    return { error => "'$target' is ambiguous (@{[ scalar @defs ]} defs) -- qualify it" } if @defs > 1;
+    my $def   = $defs[0];
+    my $qn    = $def->{qualified_name};
+    my $short = $qn =~ s/.*:://r;
+
+    my $disk = path($self->root)->child($def->{file_path});
+    return { error => "cannot read $def->{file_path}" } unless $disk->is_file;
+    my $dsrc  = $disk->slurp_raw;
+    my $dtree = eval { $self->parser->parse_string($dsrc) } or return { error => "could not parse $def->{file_path}" };
+    my $subnode = _find_sub($dtree, $short, $def->{start_line}) or return { error => "could not locate sub $short in $def->{file_path}" };
+    my ($build, $why) = _inline_template($subnode);
+    return { error => "cannot safely inline $qn -- $why" } unless $build;
+
+    my $resolver = App::PerlGraph::Resolver->new(store => $s);
+    my %files = ($def->{file_path} => 1);
+    for my $e ($s->incoming_edges($def->{id}, 'calls', 'references')) {
+        my $n = $s->node($e->{source});
+        $files{ $n->{file_path} } = 1 if $n && defined $n->{file_path};
+    }
+    $files{ $_->{file_path} } = 1
+        for $s->_rows('select distinct file_path from unresolved_refs where reference_name = ?', $short);
+
+    my (@edits, @frontier);
+    for my $file (sort keys %files) {
+        my $fdisk = path($self->root)->child($file);
+        next unless $fdisk->is_file;
+        my $fsrc  = $fdisk->slurp_raw;
+        my $ftree = eval { $self->parser->parse_string($fsrc) } or next;
+        my $calls = _calls_by_pos($ftree);                                   # "line:col" -> call node
+        my $out   = eval { App::PerlGraph::Extractor->new(file_path => $file, source => $fsrc)->extract($ftree) } or next;
+        for my $r (@{ $out->{refs} }) {
+            next unless ($r->{reference_name} // '') eq $short || ($r->{reference_name} // '') eq $qn;
+            if (($r->{reference_kind} // '') eq 'method_call') {
+                push @frontier, { file => $file, line => $r->{line}, why => 'method call (needs an invocant)' };
+                next;
+            }
+            my $tn = $resolver->_resolve_call($r);
+            next unless $tn && $tn->{id} eq $def->{id};                      # provably this function
+            my $call = $calls->{ "$r->{line}:$r->{col}" };
+            if (!$call) { push @frontier, { file => $file, line => $r->{line}, why => 'could not pinpoint the call expression' }; next }
+            my $args = ($call->{fields}{ +F_ARGUMENTS } // {})->{text} // '';
+            push @edits, { file => $file, line => $r->{line},
+                           span => [ @{$call}{qw(sl sc el ec)} ], replacement => $build->($args) };
+        }
+    }
+
+    # A self-call (recursion) sits INSIDE the definition's own body. Inlining it would lose the
+    # recursion AND -- since its replacement rewrites bytes inside the def -- invalidate the
+    # def-removal span, corrupting the file. Send such sites to the frontier and keep the def.
+    my ($dsl, $del) = @{$subnode}{qw(sl el)};
+    my @safe;
+    for my $e (@edits) {
+        if ($e->{file} eq $def->{file_path} && ($e->{span}[0] // 0) >= $dsl && ($e->{span}[0] // 0) <= $del) {
+            push @frontier, { file => $e->{file}, line => $e->{line}, why => 'self-call inside the function (recursive)' };
+        }
+        else { push @safe, $e }
+    }
+    @edits = @safe;
+
+    # Remove the def only when EVERY caller was inlined AND it is not exported (an exported
+    # function may have out-of-repo consumers the graph can't see -- inline the calls, keep the def).
+    my $removable = !@frontier && @edits && !$def->{is_exported};
+    my $applied = 0;
+    if ($opt{apply}) {
+        $applied = $self->_apply_inline(\@edits,
+            ($removable ? { file => $def->{file_path}, span => [ @{$subnode}{qw(sl sc el ec)} ] } : undef));
+    }
+    return { target => $qn, edits => \@edits, frontier => \@frontier, files => [ sort keys %files ],
+             removed => ($removable ? 1 : 0), applied => $applied };
+}
+
+# The NODE_SUB named $short, anchored to $line (the def's start line from the graph) so a
+# multi-package file with two same-named subs picks the RIGHT one -- a bare-name match alone
+# would grab whichever the walk reaches first and inline/remove the wrong package's sub. A
+# sole name-match is returned regardless of $line; ambiguity with no line hit yields undef.
+sub _find_sub ($tree, $short, $line) {
+    my @hits;
+    my @stack = ($tree);
+    while (my $n = pop @stack) {
+        push @hits, $n if ($n->{type} // '') eq NODE_SUB && (($n->{fields}{ +F_NAME } // {})->{text} // '') eq $short;
+        push @stack, @{ $n->{children} // [] };
+    }
+    my ($exact) = grep { ($_->{sl} // 0) == $line } @hits;
+    return $exact // (@hits == 1 ? $hits[0] : undef);
+}
+
+# function_call_expression nodes keyed "line:col" (their start), to map a resolved ref back
+# to the full call expression (with its byte span + argument text) for replacement.
+sub _calls_by_pos ($tree) {
+    my %by;
+    my @stack = ($tree);
+    while (my $n = pop @stack) {
+        $by{ "$n->{sl}:$n->{sc}" } = $n if ($n->{type} // '') eq NODE_CALL;
+        push @stack, @{ $n->{children} // [] };
+    }
+    return \%by;
+}
+
+# Given a sub node, return (\&build, undef) where build->($args_text) yields the `do {...}`
+# inline for a call with those args, or (undef, reason) if the sub is not safely inlineable.
+sub _inline_template ($sub) {
+    my ($block) = grep { ($_->{type} // '') eq NODE_BLOCK } @{ $sub->{children} // [] };
+    return (undef, 'no body block') unless $block;
+    (my $body = $block->{text} // '') =~ s/\A\s*\{//;
+    $body =~ s/\}\s*\z//;
+    $body =~ s/\A\s+//; $body =~ s/\s+\z//;
+    return (undef, 'empty body') unless length $body;
+    for my $kw (qw(return wantarray shift pop caller goto local)) {
+        return (undef, "the body uses `$kw` (control flow / \@_ a do-block can't preserve)") if $body =~ /\b\Q$kw\E\b/;
+    }
+    return (undef, 'the body indexes @_ directly ($_[N])') if $body =~ /\$_\[/;
+
+    my $sig;
+    for my $c (@{ $sub->{children} }) { $sig = $c->{text}, last if ($c->{type} // '') eq 'signature' }
+    if (defined $sig) {
+        return (undef, 'the signature has defaults or a slurpy param') if $sig =~ /[=\@\%]/;
+        my $params = $sig =~ s/\A\(\s*|\s*\)\z//gr;
+        return (sub ($args) { length $params ? "do { my ($params) = ($args); $body }" : "do { $body }" }, undef);
+    }
+    my @at = $body =~ /(\@_)/g;
+    if (@at == 1 && $body =~ /\bmy\b[^;]*=\s*\@_/) {                          # the `my (...) = @_` unpack idiom
+        # literal substr replace, NOT s/// -- $args is raw call-site text that may contain
+        # $1/$&/etc., which a regex replacement would interpolate as capture vars.
+        return (sub ($args) { my $b = $body; substr($b, index($b, '@_'), 2) = "($args)"; "do { $b }" }, undef);
+    }
+    return (undef, '@_ is used ' . scalar(@at) . ' times (would re-evaluate the arguments)') if @at;
+    return (sub ($args) { "do { $body }" }, undef);                          # a parameterless body
+}
+
+# Apply inline edits: each is a (line,col)-span of source replaced by its `do {...}` text.
+# Spans are converted to byte offsets and applied right-to-left so earlier edits don't shift
+# later ones. An optional $remove span (the definition) is deleted, swallowing its indentation
+# and trailing newline. Each span is re-validated against the current bytes.
+sub _apply_inline ($self, $edits, $remove) {
+    my %by_file;
+    push @{ $by_file{ $_->{file} } }, $_ for @$edits;
+    push @{ $by_file{ $remove->{file} } }, { %$remove, replacement => '', _remove => 1 } if $remove;
+    my $count = 0;
+    for my $file (sort keys %by_file) {
+        my $disk = path($self->root)->child($file);
+        next unless $disk->is_file;
+        my $src  = $disk->slurp_raw;
+        my @line_off = (0);                                                  # byte offset of each line start
+        my $off = 0;
+        $off += length($_), push @line_off, $off for split /(?<=\n)/, $src;
+        my @apply;
+        for my $e (@{ $by_file{$file} }) {
+            my ($sl, $sc, $el, $ec) = @{ $e->{span} };
+            my $start = ($line_off[$sl - 1] // -1) + $sc;
+            my $end   = ($line_off[$el - 1] // -1) + $ec;
+            next if $start < 0 || $end < $start || $end > length $src;
+            push @apply, { start => $start, end => $end, repl => $e->{replacement}, rm => $e->{_remove} };
+        }
+        for my $a (sort { $b->{start} <=> $a->{start} } @apply) {            # right-to-left
+            if ($a->{rm}) {
+                my ($x, $y) = ($a->{start}, $a->{end});
+                $x-- while $x > 0 && substr($src, $x - 1, 1) =~ /[ \t]/;     # eat the def's indentation
+                $y++ if substr($src, $y, 1) eq "\n";                        # and its trailing newline
+                substr($src, $x, $y - $x) = '';
+            }
+            else {
+                substr($src, $a->{start}, $a->{end} - $a->{start}) = $a->{repl};
+            }
+            $count++;
+        }
+        $disk->spew_raw($src);
+    }
+    return $count;
+}
+
 1;
 
 __END__
 
 =head1 NAME
 
-App::PerlGraph::Refactor - graph-driven rename / move codemods
+App::PerlGraph::Refactor - graph-driven rename / move / inline codemods
 
 =head1 DESCRIPTION
 
-Renames a function/method within its own package, or MOVES a function to another
-existing package (relocating its source and requalifying call sites to NewPkg::sub),
-using the resolved call graph to locate every reference precisely and the resolver to
+Renames a function/method within its own package; MOVES a function to another existing
+package (relocating its source and requalifying call sites to NewPkg::sub); or INLINES a
+simple function at its call sites as a C<do { ... }> block and removes the definition --
+all using the resolved call graph to locate every reference precisely and the resolver to
 decide which call sites actually target it. Dynamic C<$obj-E<gt>method> dispatch that
-cannot be tied to the symbol is reported, not edited. Internal to L<App::PerlGraph>; driven
-by C<pcg rename> / C<pcg move> and the C<pcg_rename> / C<pcg_move> MCP tools.
+cannot be tied to the symbol is reported, not edited (inline also keeps the definition for
+a recursive or exported function). Internal to L<App::PerlGraph>; driven by C<pcg rename> /
+C<pcg move> / C<pcg inline> and the C<pcg_rename> / C<pcg_move> / C<pcg_inline> MCP tools.
 
 =head1 AUTHOR
 
