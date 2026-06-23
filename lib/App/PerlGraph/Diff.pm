@@ -1,6 +1,6 @@
 package App::PerlGraph::Diff;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Moo;
 use Path::Tiny qw(path);
 use App::PerlGraph::Git;

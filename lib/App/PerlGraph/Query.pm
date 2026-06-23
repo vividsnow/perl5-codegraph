@@ -1,8 +1,9 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Moo;
 use App::PerlGraph::Model qw(package_of is_public is_universal);
+use App::PerlGraph::Grammar qw(NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_LIST_EXPR F_ARGUMENTS F_FUNCTION F_METHOD);
 
 # Read-only graph queries over a Store. Symbols may be bare names ('run') or
 # qualified ('Foo::run').
@@ -564,6 +565,251 @@ sub checkcalls ($self) {
     }
     return [ sort { $a->{class} cmp $b->{class} || $a->{method} cmp $b->{method}
                  || ($a->{file} // '') cmp ($b->{file} // '') || ($a->{line} // 0) <=> ($b->{line} // 0) } @out ];
+}
+
+# Wrong-arity calls: resolved calls to an in-repo function/method whose SIGNATURE fixes
+# its arity, where the call site passes a statically-countable number of args that doesn't
+# fit -- a static BUG FINDER (sibling to checkcalls) for a violation Perl only catches at
+# runtime. Re-parses each calling file to count the positional args at the call site; a
+# splat arg (@list / %h / a list-returning call) is indeterminate and skipped, and a
+# method call's implicit invocant is counted toward @_. Only subs with an explicit
+# signature and a determinate call site are checked, so findings are precise but not
+# exhaustive (a `my (...) = @_` / `shift` sub has no signature to check against).
+sub checkargs ($self, $root) {
+    my $s = $self->store;
+    my %qn_count;                                        # a qname defined by >1 node is resolution-ambiguous
+    $qn_count{ $_->{qualified_name} // '' }++ for $s->all_nodes(qw(function method));
+    my %arity;                                           # callee id -> { min, max, sig, node, short, qn, method }
+    for my $fn ($s->all_nodes(qw(function method))) {
+        my $sig = $fn->{signature};
+        next unless defined $sig && length $sig;
+        my ($min, $max) = _sig_arity($sig);
+        next unless defined $min;                        # variadic (a slurpy @/%) / unparseable -> can't check
+        my $qn = $fn->{qualified_name} // $fn->{name} // '';
+        next if ($qn_count{$qn} // 0) > 1;               # e.g. main::setup in two scripts -> which one is unclear
+        $arity{ $fn->{id} } = { min => $min, max => $max, sig => $sig, node => $fn,
+                                short => (split /::/, $qn)[-1], qn => $qn, pkg => package_of($qn) };
+    }
+    return [] unless %arity;
+    # The graph dedups multiple call sites caller->callee into ONE edge, so use the edge
+    # only as a resolution hint -- "this caller calls this fixed-arity sub" -- then re-parse
+    # and check EVERY matching call site in the caller's line range. A function site matches
+    # by full name when qualified (precise) else short name; a `$self->m` method site matches
+    # only a callee in the SAME package (the common intra-class case), so a `$x->foo` call is
+    # never mis-checked against an unrelated same-named `Other::foo`.
+    my %calls;                                           # caller id -> { f|fq|m } -> name -> [ callee, ... ]
+    for my $cid (keys %arity) {
+        my $a = $arity{$cid};
+        for my $e ($s->incoming_edges($cid, 'calls')) {
+            push @{ $calls{ $e->{source} }{f}{ $a->{short} } }, $a;
+            push @{ $calls{ $e->{source} }{fq}{ $a->{qn} } }, $a;
+            push @{ $calls{ $e->{source} }{m}{ $a->{short} } }, $a;
+        }
+    }
+    my %file_callers;                                    # file -> [ caller node ]
+    for my $caller_id (keys %calls) {
+        my $cn = $s->node($caller_id) or next;
+        push @{ $file_callers{ $cn->{file_path} } }, $cn if $cn->{file_path};
+    }
+    require App::PerlGraph::Parser;
+    require Path::Tiny;
+    my $parser = App::PerlGraph::Parser->new;
+    my (%seen, @out);
+    for my $file (sort keys %file_callers) {
+        my $disk = Path::Tiny::path($root)->child($file);
+        next unless $disk->is_file;
+        my $tree  = eval { $parser->parse_string($disk->slurp_raw) } or next;
+        my @sites = _call_sites($tree);                  # { name, method, line, argc }
+        for my $caller (@{ $file_callers{$file} }) {
+            my ($lo, $hi) = ($caller->{start_line} // 0, $caller->{end_line} // ~0);
+            my $cpkg  = package_of($caller->{qualified_name} // $caller->{name} // '');
+            my $named = $calls{ $caller->{id} };
+            for my $site (@sites) {
+                next unless defined $site->{argc} && $site->{line} >= $lo && $site->{line} <= $hi;
+                my $cands = $site->{method}       ? [ grep { $_->{pkg} eq $cpkg } @{ $named->{m}{ $site->{name} } // [] } ]
+                          : $site->{full} =~ /::/ ? $named->{fq}{ $site->{full} }
+                          :                         $named->{f}{ $site->{name} };
+                $cands && @$cands or next;
+                next if @$cands > 1;                     # caller calls two same-named fixed-arity subs -> ambiguous
+                my $c   = $cands->[0];
+                my $got = $site->{argc} + ($site->{method} ? 1 : 0);  # a `->method` call passes an implicit invocant
+                next if $got >= $c->{min} && (!defined $c->{max} || $got <= $c->{max});
+                my $callee = $c->{node}{qualified_name} // $c->{node}{name};
+                next if $seen{"$file\x1f$site->{line}\x1f$callee"}++;
+                push @out, {
+                    callee   => $callee,
+                    sig      => $c->{sig},
+                    expected => (defined $c->{max} ? ($c->{min} == $c->{max} ? "$c->{min}" : "$c->{min}-$c->{max}") : "$c->{min}+"),
+                    got      => $got,
+                    caller   => ($caller->{qualified_name} // $caller->{name} // '?'),
+                    file     => $file, line => $site->{line},
+                };
+            }
+        }
+    }
+    return [ sort { ($a->{file} // '') cmp ($b->{file} // '') || ($a->{line} // 0) <=> ($b->{line} // 0)
+                 || $a->{callee} cmp $b->{callee} } @out ];
+}
+
+# Parse a signature's arity -> (min required, max), max undef if a slurpy @/% makes it
+# variadic; a `$x = default` param is optional (counts toward max, not min). undef if the
+# signature isn't a simple param list.
+sub _sig_arity ($sig) {
+    $sig =~ s/\A\s*\(\s*//;
+    $sig =~ s/\s*\)\s*\z//;
+    return (0, 0) unless length $sig;
+    my ($min, $max) = (0, 0);
+    for my $p (_split_top_commas($sig)) {
+        $p =~ s/\A\s+//;
+        $p =~ s/\s+\z//;
+        next unless length $p;
+        return ($min, undef) if $p =~ /\A[\@%]/;          # slurpy -> variadic; the params before it set the min
+        $max++;
+        $min++ unless $p =~ /=/;                           # a default value makes the param optional
+    }
+    return ($min, $max);
+}
+
+# Split on top-level commas only (depth tracks () [] {} so `$x = foo(1, 2)` stays one param).
+sub _split_top_commas ($s) {
+    my @out;
+    my $buf   = '';
+    my $depth = 0;
+    for my $ch (split //, $s) {
+        if    ($ch =~ /[(\[{]/)           { $depth++;        $buf .= $ch }
+        elsif ($ch =~ /[)\]}]/)           { $depth--;        $buf .= $ch }
+        elsif ($ch eq ',' && $depth == 0) { push @out, $buf; $buf = '' }
+        else                              {                  $buf .= $ch }
+    }
+    push @out, $buf if length $buf;
+    return @out;
+}
+
+# Every call site in a tree: its called short name, whether it's a `->method` call, its
+# start line, and its arg count (undef when not statically countable).
+sub _call_sites ($tree) {
+    my @sites;
+    my @stack = ($tree);
+    while (my $n = pop @stack) {
+        my $t = $n->{type} // '';
+        if ($t eq NODE_CALL || $t eq NODE_CALL_AMBIG || $t eq NODE_CALL_OP) {
+            if (my $fn = $n->{fields}{ +F_FUNCTION }) {
+                my $full = $fn->{text} // '';
+                push @sites, { name => (split /::/, $full)[-1], full => $full, method => 0,
+                               line => $n->{sl}, argc => _count_args($n->{fields}{ +F_ARGUMENTS }) };
+            }
+        }
+        elsif ($t eq NODE_METHOD_CALL) {
+            if (my $m = $n->{fields}{ +F_METHOD }) {
+                push @sites, { name => ($m->{text} // ''), method => 1,        # method sites match by short name, never `full`
+                               line => $n->{sl}, argc => _count_args($n->{fields}{ +F_ARGUMENTS }) };
+            }
+        }
+        push @stack, @{ $n->{children} // [] };
+    }
+    return @sites;
+}
+
+# Count top-level positional args; undef if any arg is list-context (its element count is
+# not statically known): a @array / %hash splat, an @{...}/%{...} deref, or a call result.
+sub _count_args ($args) {
+    return 0 unless $args;
+    my @top = (($args->{type} // '') eq NODE_LIST_EXPR)
+        ? grep { ($_->{type} // '') !~ /\A[[:punct:]]+\z/ } @{ $args->{children} // [] }
+        : ($args);
+    for my $a (@top) {
+        my $t = $a->{type} // '';
+        return undef if $t =~ /\A(?:array|hash)\z/ || $t =~ /(?:array|hash)_deref/ || $t =~ /_call_expression\z/;
+    }
+    return scalar @top;
+}
+
+# POD documenting a method/function that no longer exists -- doc DRIFT (distinct from
+# undocumented, which is missing POD). Scans each file's POD for call-shaped entries
+# (`=head2 name($args)` / `=item C<< $obj->name >>`) and flags any whose name is defined by
+# NO sub in the documenting file's package(s) or their @ISA ancestors -- a method that was
+# removed or renamed while its docs were left behind. Package+MRO-aware (an inherited method
+# documented in a subclass is fine); auto-provided names (new/import/...) are skipped.
+my %DOCCHECK_SKIP = map { $_ => 1 }
+    qw(new import unimport BUILD BUILDARGS DEMOLISH DESTROY AUTOLOAD CLONE meta does DOES);
+sub doccheck ($self, $root) {
+    my $s = $self->store;
+    require App::PerlGraph::Resolver;
+    my $r = App::PerlGraph::Resolver->new(store => $s);
+    my %pkg_names;                                       # package qname -> { sub/method/constant short name => 1 }
+    for my $n ($s->all_nodes(qw(function method constant))) {   # constants are public API too -- documenting one isn't stale
+        my $qn = $n->{qualified_name} // $n->{name} // '';
+        $pkg_names{ package_of($qn) }{ (split /::/, $qn)[-1] } = 1;
+    }
+    my %file_pkgs;                                       # file -> [ package qname ]
+    push @{ $file_pkgs{ $_->{file_path} } }, $_->{qualified_name}
+        for grep { $_->{file_path} } $s->all_nodes(qw(package class));
+    require Path::Tiny;
+    my @out;
+    for my $file (sort keys %file_pkgs) {
+        my $disk = Path::Tiny::path($root)->child($file);
+        next unless $disk->is_file;
+        my %known;                                       # every name reachable from a package in this file
+        for my $pkg (@{ $file_pkgs{$file} }) {
+            $known{$_} = 1 for map { keys %{ $pkg_names{$_} // {} } } $r->mro($pkg);
+        }
+        for my $doc (_pod_api_names($disk->slurp_utf8)) {
+            next if $known{ $doc->{name} } || $DOCCHECK_SKIP{ $doc->{name} };
+            push @out, { name => $doc->{name}, file => $file, line => $doc->{line} };
+        }
+    }
+    return [ sort { $a->{file} cmp $b->{file} || $a->{line} <=> $b->{line} } @out ];
+}
+
+# Call-shaped POD entries: =head2/=head3/=item headings that document a callable, as
+# `name(...)` or `$obj->name`. Returns { name, line }. Requiring the call form (parens or
+# an arrow) keeps prose section headings ("DESCRIPTION", "Configuration") from matching.
+sub _pod_api_names ($text) {
+    my @found;
+    my $line = 0;
+    for my $ln (split /\n/, $text) {
+        $line++;
+        next unless $ln =~ /\A=(?:head[234]|item)\s+(\S.*)\z/;
+        my $p = $1;
+        $p =~ s/[A-Z]<+//g;                              # strip C<< / B< / L< / I< openers
+        $p =~ s/(?<!-)>+//g;                             # and their closers, but NOT the > in a -> arrow
+        my $name = $p =~ /(?:\$\w+|\w+)\s*->\s*(\w+)/ ? $1     # $obj->method
+                 : $p =~ /\A\s*(\w+)\s*\(/            ? $1     # name(...)
+                 :                                      undef;
+        push @found, { name => $name, line => $line } if defined $name;
+    }
+    return @found;
+}
+
+# A POD + test SKELETON (with TODOs) for one sub, derived from its signature -- the
+# actionable starting point for pcg_untested / pcg_undocumented. Resolves the symbol to a
+# unique function/method and returns what the renderer needs (the node, its parameters, and
+# whether it's a method so the call shape uses $obj-> and drops the invocant).
+sub scaffold ($self, $symbol) {
+    my $s = $self->store;
+    my @defs = grep { ($_->{kind} // '') =~ /\A(?:function|method)\z/ }
+               ($symbol =~ /::/ ? $s->nodes_by_qname($symbol) : $s->nodes_by_name($symbol));
+    return { error => "no function/method named '$symbol'" } unless @defs;
+    return { error => "'$symbol' is ambiguous (@{[ scalar @defs ]} defs) -- qualify it" } if @defs > 1;
+    my $n = $defs[0];
+    my @params = _sig_params($n->{signature} // '');
+    my $is_method = ($n->{kind} // '') eq 'method' || (@params && $params[0] =~ /\A\$(?:self|class)\z/);
+    return { node => $n, params => \@params, is_method => $is_method, has_pod => ($n->{docstring} ? 1 : 0) };
+}
+
+# Parameter names from a signature, defaults dropped: "($a, $b = 5)" -> ('$a', '$b').
+sub _sig_params ($sig) {
+    $sig =~ s/\A\s*\(\s*//;
+    $sig =~ s/\s*\)\s*\z//;
+    return () unless length $sig;
+    my @p;
+    for my $part (_split_top_commas($sig)) {
+        $part =~ s/\s*=.*\z//s;                              # drop a default value
+        $part =~ s/\A\s+//;
+        $part =~ s/\s+\z//;
+        push @p, $part if $part =~ /\A[\$\@%]\w+\z/;
+    }
+    return @p;
 }
 
 # Structural code clones: subs whose BODY has an identical CST shape (the per-sub

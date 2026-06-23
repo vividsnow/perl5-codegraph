@@ -1,6 +1,6 @@
 package App::PerlGraph::Refactor;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Moo;
 use App::PerlGraph::Model qw(package_of);
 use App::PerlGraph::Grammar qw(:all);
@@ -323,6 +323,152 @@ sub _find_sub ($tree, $short, $line) {
     return $exact // (@hits == 1 ? $hits[0] : undef);
 }
 
+# The fourth WRITE tool: de-duplicate an EXACT structural clone group. Given a target
+# function in a `pcg duplication` group, keep it as the canonical copy and rewrite every
+# OTHER plain function in the group whose signature+body is byte-identical into a one-line
+# delegation `sub name { goto &Canonical }` -- the duplicated logic is removed while each
+# name stays callable. Conservative: only EXACT (type-1) duplicate FUNCTIONS are rewritten;
+# type-2 clones (renamed vars / changed literals) and methods are reported, not touched.
+# Dry-run unless apply => 1.
+sub dedupe ($self, $target, %opt) {
+    my $s = $self->store;
+    my @defs = grep { ($_->{kind} // '') eq 'function' }
+               ($target =~ /::/ ? $s->nodes_by_qname($target) : $s->nodes_by_name($target));
+    return { error => "no plain function named '$target' (dedupe keeps a function as the canonical copy)" } unless @defs;
+    return { error => "'$target' is ambiguous (@{[ scalar @defs ]} defs) -- qualify it" } if @defs > 1;
+    my $canon = $defs[0];
+    my $fp    = ($canon->{metadata} // {})->{dup}
+        or return { error => "'$target' is not part of a structural clone group (see `pcg duplication`)" };
+    my $crest = $self->_sub_rest($canon);
+    return { error => "could not read '$target'" } unless defined $crest;
+    # A sub PROTOTYPE (($$) etc.) or an :attribute (:lvalue) can't be carried into the
+    # `goto &Canon` delegation stub -- rewriting would silently drop it (a `($x)` SIGNATURE
+    # is fine). The exact clones all share $crest, so this is an all-or-nothing refusal.
+    return { error => "'$target' carries a prototype or :attribute the goto-delegation can't preserve -- not safe to dedupe",
+             canonical => $canon->{qualified_name}, replaced => [], skipped => [] }
+        if $crest =~ /\A\([\$\@\%\&\*\\\[\];+]+\)/ || $crest =~ /\A(?:\([^)]*\)\s*)?:\w/;
+    my $canon_pkg = package_of($canon->{qualified_name});
+
+    my (@replaced, @skipped);
+    for my $g (grep { $_->{id} ne $canon->{id} && (($_->{metadata} // {})->{dup} // '') eq $fp }
+               $s->all_nodes(qw(function method))) {
+        my $name = $g->{qualified_name} // $g->{name};
+        if (($g->{kind} // '') ne 'function') { push @skipped, { name => $name, why => 'a method (its invocant differs)' }; next }
+        my ($rest, $node) = $self->_sub_rest($g, want_node => 1);
+        if    (!defined $rest)  { push @skipped, { name => $name, why => 'could not read it' };            next }
+        elsif ($rest ne $crest) { push @skipped, { name => $name, why => 'a type-2 clone (text differs)' }; next }
+        # `goto &Canon` dies at runtime unless the canonical's package is loadable where the
+        # clone lives: same file, same package, or the clone's package use's it.
+        my $cpkg = package_of($name);
+        unless ($g->{file_path} eq $canon->{file_path} || $cpkg eq $canon_pkg
+                || grep { (($_->{metadata} // {})->{module} // '') eq $canon_pkg }
+                        map { $s->outgoing_edges($_->{id}, 'imports') } $s->nodes_by_qname($cpkg)) {
+            push @skipped, { name => $name, why => "its file does not `use $canon_pkg` -- add it first" };
+            next;
+        }
+        push @replaced, { name => $name, file => $g->{file_path}, span => [ @{$node}{qw(sl sc el ec)} ],
+                          replacement => 'sub ' . ($name =~ s/.*:://r) . " { goto &$canon->{qualified_name} }" };
+    }
+    return { error => "'$target' has no EXACT (type-1) duplicate function to merge -- its clone group is"
+                    . " type-2 or methods only (reported below, not rewritten)",
+             canonical => $canon->{qualified_name}, replaced => [], skipped => \@skipped } unless @replaced;
+
+    my $applied = $opt{apply}
+        ? $self->_apply_inline([ map { +{ file => $_->{file}, span => $_->{span}, replacement => $_->{replacement} } } @replaced ], undef)
+        : 0;
+    return { canonical => $canon->{qualified_name}, replaced => \@replaced, skipped => \@skipped, applied => $applied };
+}
+
+# The (signature + body) text of a sub with the leading `sub NAME` stripped -- the part
+# that must be byte-identical for two clones to be EXACT (type-1). Re-parses the file. With
+# want_node it also returns the CST sub node (for its byte span); returns undef / () on miss.
+sub _sub_rest ($self, $node, %opt) {
+    my $disk = path($self->root)->child($node->{file_path} // '');
+    return $opt{want_node} ? () : undef unless $disk->is_file;
+    my $tree = eval { $self->parser->parse_string($disk->slurp_raw) } or return $opt{want_node} ? () : undef;
+    my $short = ($node->{qualified_name} // $node->{name} // '') =~ s/.*:://r;
+    my $sn = _find_sub($tree, $short, $node->{start_line}) or return $opt{want_node} ? () : undef;
+    (my $rest = $sn->{text} // '') =~ s/\A\s*sub\s+\w+//;        # drop `sub NAME`, keep (sig) { body }
+    $rest =~ s/\A\s+//;
+    $rest =~ s/\s+\z//;
+    return $opt{want_node} ? ($rest, $sn) : $rest;
+}
+
+# The fifth WRITE tool: safely DELETE a dead sub. Refuses if the target is still called by
+# any in-repo node, or is exported (it may have out-of-repo consumers) -- you remove the
+# callers / export first. When it IS dead, removes it AND cascade-removes the now-dead
+# PRIVATE helpers it solely used (recursively, to a fixed point), so a whole dead subtree
+# goes in one shot. Dry-run unless apply => 1.
+sub rm ($self, $target, %opt) {
+    my $s = $self->store;
+    my @defs = grep { ($_->{kind} // '') =~ /\A(?:function|method)\z/ }
+               ($target =~ /::/ ? $s->nodes_by_qname($target) : $s->nodes_by_name($target));
+    return { error => "no function/method named '$target'" } unless @defs;
+    return { error => "'$target' is ambiguous (@{[ scalar @defs ]} defs) -- qualify it" } if @defs > 1;
+    my $t = $defs[0];
+    return { error => "'$target' is exported -- it may have out-of-repo consumers; remove the export first" }
+        if $t->{is_exported};
+    my @callers = grep { $_->{source} ne $t->{id} } $s->incoming_edges($t->{id}, 'calls', 'references');
+    if (@callers) {
+        my %who; for (@callers) { my $n = $s->node($_->{source}); $who{ $n->{qualified_name} // $n->{name} // '?' } = 1 if $n }
+        return { error => "'$target' is still called -- remove the call site(s) first", blocked_by => [ sort keys %who ] };
+    }
+    my %rm = ($t->{id} => $t);                                   # cascade now-dead PRIVATE helpers to a fixed point
+    my $changed = 1;
+    while ($changed) {
+        $changed = 0;
+        for my $n (values %rm) {
+            for my $e ($s->outgoing_edges($n->{id}, 'calls', 'references')) {
+                my $c = $s->node($e->{target}) or next;
+                next if $rm{$c->{id}} || $c->{is_exported};
+                next unless ($c->{kind} // '') =~ /\A(?:function|method)\z/ && ($c->{visibility} // '') eq 'private';
+                next if grep { !$rm{$_->{source}} } $s->incoming_edges($c->{id}, 'calls', 'references');
+                $rm{$c->{id}} = $c;
+                $changed = 1;
+            }
+        }
+    }
+    my @nodes   = sort { ($a->{qualified_name} // '') cmp ($b->{qualified_name} // '') } values %rm;
+    my $applied = $opt{apply} ? $self->_apply_removals(\@nodes) : 0;
+    return { target => $t->{qualified_name}, applied => $applied,
+             removed => [ map { +{ name => ($_->{qualified_name} // $_->{name}), file => $_->{file_path},
+                                   cascade => ($_->{id} ne $t->{id} ? 1 : 0) } } @nodes ] };
+}
+
+# Remove each node's `sub NAME {...}` span from disk (right-to-left per file, eating the
+# def's indentation + trailing newline). Re-parses to get exact byte spans, like _apply_inline.
+sub _apply_removals ($self, $nodes) {
+    my %by_file;
+    push @{ $by_file{ $_->{file_path} } }, $_ for grep { $_->{file_path} } @$nodes;
+    my $count = 0;
+    for my $file (sort keys %by_file) {
+        my $disk = path($self->root)->child($file);
+        next unless $disk->is_file;
+        my $src  = $disk->slurp_raw;
+        my $tree = eval { $self->parser->parse_string($src) } or next;
+        my @line_off = (0);
+        my $off = 0;
+        $off += length($_), push @line_off, $off for split /(?<=\n)/, $src;
+        my @abs;
+        for my $node (@{ $by_file{$file} }) {
+            my $short = ($node->{qualified_name} // $node->{name} // '') =~ s/.*:://r;
+            my $sn = _find_sub($tree, $short, $node->{start_line}) or next;
+            my ($sl, $sc, $el, $ec) = @{$sn}{qw(sl sc el ec)};
+            push @abs, [ ($line_off[$sl - 1] // -1) + $sc, ($line_off[$el - 1] // -1) + $ec ];
+        }
+        for my $a (sort { $b->[0] <=> $a->[0] } @abs) {          # right-to-left so offsets stay valid
+            my ($x, $y) = @$a;
+            next if $x < 0 || $y < $x || $y > length $src;
+            $x-- while $x > 0 && substr($src, $x - 1, 1) =~ /[ \t]/;
+            $y++ if substr($src, $y, 1) eq "\n";
+            substr($src, $x, $y - $x) = '';
+            $count++;
+        }
+        $disk->spew_raw($src);
+    }
+    return $count;
+}
+
 # function_call_expression nodes keyed "line:col" (their start), to map a resolved ref back
 # to the full call expression (with its byte span + argument text) for replacement.
 sub _calls_by_pos ($tree) {
@@ -413,18 +559,23 @@ __END__
 
 =head1 NAME
 
-App::PerlGraph::Refactor - graph-driven rename / move / inline codemods
+App::PerlGraph::Refactor - graph-driven rename / move / inline / dedupe / rm codemods
 
 =head1 DESCRIPTION
 
-Renames a function/method within its own package; MOVES a function to another existing
-package (relocating its source and requalifying call sites to NewPkg::sub); or INLINES a
-simple function at its call sites as a C<do { ... }> block and removes the definition --
-all using the resolved call graph to locate every reference precisely and the resolver to
-decide which call sites actually target it. Dynamic C<$obj-E<gt>method> dispatch that
-cannot be tied to the symbol is reported, not edited (inline also keeps the definition for
-a recursive or exported function). Internal to L<App::PerlGraph>; driven by C<pcg rename> /
-C<pcg move> / C<pcg inline> and the C<pcg_rename> / C<pcg_move> / C<pcg_inline> MCP tools.
+The five graph-driven write tools. RENAMES a function/method within its own package; MOVES
+a function to another existing package (relocating its source and requalifying call sites to
+NewPkg::sub); INLINES a simple function at its call sites as a C<do { ... }> block and
+removes the definition; DEDUPEs an exact (type-1) structural clone group by keeping one
+canonical function and rewriting each byte-identical duplicate to C<sub name { goto
+&Canonical }>; or safely RMs a dead sub, cascade-removing the now-dead private helpers it
+solely used. All use the resolved call graph to locate every reference precisely and the
+resolver to decide which call sites actually target the symbol. Dynamic C<$obj-E<gt>method>
+dispatch that cannot be tied to the symbol is reported, not edited; rm refuses a sub that is
+still called or exported; and dedupe refuses outright if the canonical carries a prototype or
+C<:attribute> the C<goto> stub cannot preserve, otherwise it skips type-2 clones, methods, and
+clones whose file cannot load the canonical. Internal to L<App::PerlGraph>; driven by C<pcg rename> / C<pcg
+move> / C<pcg inline> / C<pcg dedupe> / C<pcg rm> and the matching C<pcg_*> MCP tools.
 
 =head1 AUTHOR
 

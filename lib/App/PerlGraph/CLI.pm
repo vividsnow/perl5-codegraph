@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Path::Tiny qw(path);
 use Cpanel::JSON::XS ();
 use App::PerlGraph::Store;
@@ -70,6 +70,12 @@ usage: pcg <command> [args] [path]
   layers                architecture stratification: modules grouped by dependency depth + cyclic violations
   checkcalls            $obj->method calls to a method the receiver's class (known, in-repo) does NOT define
                         (typos / calls into removed API; heuristic -- `index --runtime` sharpens it)
+  checkargs             calls passing the wrong NUMBER of args to a sub whose signature fixes its arity
+                        (too few / too many; signature-based, a method call's invocant counted; heuristic)
+  doccheck              stale POD: `=head2 name(...)` / `=item $obj->name` entries documenting a method
+                        that no longer exists in the package or its @ISA (removed/renamed; doc drift)
+  scaffold <symbol>     generate a POD + test SKELETON (with TODOs) for a sub, from its signature
+                        (the actionable starting point for untested / undocumented subs)
   duplication [--limit N] [--min-nodes N]   structural code clones: subs with an identical body shape
                         (type-1/2; names + literals aside) -- extract-a-shared-helper candidates
   hotspots [--limit N]  fan-in (+ blast radius), fan-out, cyclomatic-complexity, and most-coupled-module leaders
@@ -82,6 +88,7 @@ usage: pcg <command> [args] [path]
   sinks                 command/SQL execution sites + which web endpoints reach them (attack surface)
   diff <ref>            structural diff vs a git ref: added/removed/re-signatured symbols (+ breaking)
   semver <ref>          recommend a major/minor/patch bump from the diff (breaking->major, new public->minor)
+  changelog <ref>       draft a Changes-style entry from the structural diff (added/removed/changed + bump)
   review <ref>          PR review: diff + blast radius + tests to run + breaking changes
                         + findings (untested public changes / wide blast radius), in one report
   api <module>          a module's public/exported surface
@@ -95,6 +102,10 @@ usage: pcg <command> [args] [path]
                         source + requalify call sites to NewPkg::sub. Dry-run by default
   inline <Pkg::sub> [--apply] [path]   inline a simple function at its call sites as a do{} block +
                         remove the definition (dry-run; refuses unsafe bodies, reports method-call sites)
+  dedupe <Pkg::sub> [--apply] [path]   de-duplicate a clone group: keep <Pkg::sub> canonical, rewrite each
+                        EXACT-duplicate function to `{ goto &<Pkg::sub> }` (dry-run; type-2/methods reported)
+  rm <Pkg::sub> [--apply] [path]   safely DELETE a dead sub + cascade-remove the now-dead private helpers it
+                        solely used (refuses if it's still called or exported; dry-run by default)
   export [--format dot|mermaid|json|html] [--around SYM] [--depth N]   render the graph
   metrics               one-call code-health snapshot: scale, resolution %, coverage, complexity,
                         dead code, clones, cycles + a concerns summary (across all indexed files)
@@ -132,6 +143,9 @@ sub run ($class, @argv) {
         cycles    => \&_cmd_cycles,
         layers    => \&_cmd_layers,
         checkcalls => \&_cmd_checkcalls,
+        checkargs  => \&_cmd_checkargs,
+        doccheck   => \&_cmd_doccheck,
+        scaffold   => \&_cmd_scaffold,
         duplication => \&_cmd_duplication,
         metrics   => \&_cmd_metrics,
         'dead-exports' => \&_cmd_dead_exports,
@@ -142,6 +156,8 @@ sub run ($class, @argv) {
         rename    => \&_cmd_rename,
         move      => \&_cmd_move,
         inline    => \&_cmd_inline,
+        dedupe    => \&_cmd_dedupe,
+        rm        => \&_cmd_rm,
         hotspots  => \&_cmd_hotspots,
         risk      => \&_cmd_risk,
         owners    => \&_cmd_owners,
@@ -149,6 +165,7 @@ sub run ($class, @argv) {
         cochange  => \&_cmd_cochange,
         diff      => \&_cmd_diff,
         semver    => \&_cmd_semver,
+        changelog => \&_cmd_changelog,
         review    => \&_cmd_review,
         api       => \&_cmd_api,
         covers    => \&_cmd_covers,
@@ -424,6 +441,26 @@ sub _cmd_checkcalls ($root = '.') {
     return 0;
 }
 
+sub _cmd_checkargs ($root = '.') {
+    my $q = _query($root) or return 1;
+    print App::PerlGraph::Format::checkargs($q->checkargs($root));
+    return 0;
+}
+
+sub _cmd_doccheck ($root = '.') {
+    my $q = _query($root) or return 1;
+    print App::PerlGraph::Format::doccheck($q->doccheck($root));
+    return 0;
+}
+
+sub _cmd_scaffold (@args) {
+    my ($symbol, $root) = @args;
+    return _usage() unless defined $symbol && length $symbol;
+    my $q = _query($root // '.') or return 1;
+    print App::PerlGraph::Format::scaffold($q->scaffold($symbol));
+    return 0;
+}
+
 sub _cmd_metrics ($root = '.') {
     my $q = _query($root) or return 1;
     print App::PerlGraph::Format::metrics($q->metrics);
@@ -500,6 +537,40 @@ sub _cmd_inline (@args) {
     my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
         ->inline($target, ($apply ? (apply => 1) : ()));
     print App::PerlGraph::Format::inline($plan);
+    return $plan->{error} ? 1 : 0;
+}
+
+sub _cmd_dedupe (@args) {
+    my ($apply, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--apply') { $apply = 1 } else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my ($target, $root) = @pos;
+    return _usage() unless defined $target && length $target;
+    my $q = _query($root // '.') or return 1;
+    require App::PerlGraph::Refactor;
+    my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
+        ->dedupe($target, ($apply ? (apply => 1) : ()));
+    print App::PerlGraph::Format::dedupe($plan);
+    return $plan->{error} ? 1 : 0;
+}
+
+sub _cmd_rm (@args) {
+    my ($apply, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--apply') { $apply = 1 } else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my ($target, $root) = @pos;
+    return _usage() unless defined $target && length $target;
+    my $q = _query($root // '.') or return 1;
+    require App::PerlGraph::Refactor;
+    my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
+        ->rm($target, ($apply ? (apply => 1) : ()));
+    print App::PerlGraph::Format::rm($plan);
     return $plan->{error} ? 1 : 0;
 }
 
@@ -644,6 +715,21 @@ sub _cmd_semver (@args) {
     return 0;
 }
 
+sub _cmd_changelog (@args) {
+    return _usage() if grep { /^--/ } @args;
+    my ($ref, $root) = @args;
+    return _usage() unless defined $ref && length $ref;
+    $root //= '.';
+    require App::PerlGraph::Git;
+    my $git = App::PerlGraph::Git->new(root => $root);
+    unless ($git->available) { print STDERR "Not a git repository: $root (changelog needs git).\n"; return 1 }
+    my $parser = eval { App::PerlGraph::Parser->new } or do { print STDERR "parser unavailable: $@"; return 1 };
+    require App::PerlGraph::Diff;
+    my $d = App::PerlGraph::Diff->new(root => $root, ref => $ref, parser => $parser)->diff;
+    print App::PerlGraph::Format::changelog($d, $ref);
+    return 0;
+}
+
 sub _cmd_cochange (@args) {
     my (%opt, @pos);
     while (@args) {
@@ -762,8 +848,8 @@ App::PerlGraph::CLI - the pcg command-line dispatcher
 Parses @ARGV and dispatches to the pcg subcommands: index, sync, watch, the
 read queries (overview, metrics, search, node, explain, explore, callers, callees, impact,
 path, affected, unused, untested, undocumented, dead-exports, deps, cycles, layers, checkcalls,
-duplication, prereqs, hotspots, risk, cochange, owners, suggest-reviewers, sinks,
-diff, semver, review, api, covers, unresolved), the graph-driven rename / move / inline codemods,
+checkargs, doccheck, scaffold, duplication, prereqs, hotspots, risk, cochange, owners, suggest-reviewers, sinks,
+diff, semver, changelog, review, api, covers, unresolved), the graph-driven rename / move / inline / dedupe / rm codemods,
 export, status, serve and install/uninstall.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the

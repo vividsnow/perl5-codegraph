@@ -1,5 +1,81 @@
 Revision history for App-PerlGraph
 
+0.059     2026-06-23
+          - New: `pcg scaffold <symbol>` / pcg_scaffold (47 MCP tools) -- generate a POD + test SKELETON
+            (with TODO placeholders) for a sub, derived from its signature: a `=head2` POD stub (using
+            $obj->name and dropping the invocant for a method) and a Test2::V0 test stub that loads the
+            package and calls the sub with one placeholder argument per parameter, plus an assertion to fill
+            in. The actionable starting point for pcg_untested / pcg_undocumented. Read-only -- it emits text
+            to adapt, writes nothing. New Query::scaffold + _sig_params; Format::scaffold; CLI `pcg scaffold`.
+            Closes the 7th wave (detection -> action): checkargs, doccheck, changelog, dedupe, rm, scaffold.
+          - Tests +13 (1405 total): t/99 (a function scaffold with one placeholder per param, a method
+            scaffold that drops the invocant and uses $obj->, a no-arg sub, an unknown-symbol error).
+
+0.058     2026-06-23
+          - New: `pcg rm <target>` / pcg_rm (46 MCP tools) -- the FIFTH write tool, the actionable
+            follow-up to pcg_unused: safely DELETE a dead sub. Refuses if the target is still called by any
+            in-repo node (lists the callers) or is exported (it may have out-of-repo consumers). When it IS
+            dead, removes it AND cascade-removes the now-dead PRIVATE helpers it solely used (recursively,
+            to a fixed point), so a whole dead subtree goes at once. Dry-run unless apply. New Refactor::rm
+            + _apply_removals (reuses _find_sub + a byte-span remover); Format::rm; CLI `pcg rm`.
+          - Tests +19 (1392 total): t/98 (a still-called sub refused with the caller listed; a dead sub + its
+            sole-use private helper removed while a shared helper survives; the file still parses; dry-run
+            writes nothing; an exported sub refused).
+
+0.057     2026-06-23
+          - New: `pcg dedupe <target>` / pcg_dedupe (45 MCP tools) -- the FOURTH write tool, the inverse of
+            copy-paste: de-duplicate a structural clone group (from `pcg duplication`). Keep the target
+            function as the canonical copy and rewrite every OTHER plain function in the group whose
+            signature+body is BYTE-IDENTICAL into a one-line delegation `sub name { goto &Canonical }` --
+            the duplicated logic lives in one place while every name stays callable. Conservative by design:
+            only EXACT (type-1) duplicate FUNCTIONS are rewritten; type-2 clones (renamed vars / changed
+            literals) and methods are reported, never edited. Dry-run unless apply. New Refactor::dedupe +
+            _sub_rest (reuses _find_sub + _apply_inline); Format::dedupe; CLI `pcg dedupe`.
+          - Tests +20 (1373 total): t/97 (an exact duplicate rewritten to delegate, a type-2 clone left
+            untouched, the canonical preserved, the rewritten file still parses, dry-run writes nothing, a
+            non-clone target errors, a cross-package clone whose file does not load the canonical skipped,
+            and a clone group carrying an :attribute refused outright).
+
+0.056     2026-06-23
+          - New: `pcg changelog <ref>` / pcg_changelog (44 MCP tools) -- draft a release-notes / Changes
+            entry from the STRUCTURAL diff vs a git ref: the added / removed / signature-changed
+            functions/methods/constants/packages grouped under Added / Removed / Changed, each tagged
+            public-vs-internal and breaking-vs-not, with the suggested version bump at the top. A
+            ready-to-edit scaffold for a CPAN-style Changes entry (turn the bullets into prose before
+            release) -- complements semver, which only recommends the bump. Reuses App::PerlGraph::Diff;
+            new Format::changelog; CLI `pcg changelog`. Needs a git work tree.
+          - Tests +13 (1353 total): t/96 (the major/minor/patch bump levels, the Added/Removed/Changed
+            grouping, internal-vs-public and breaking tagging, the signature old->new line, the empty case).
+
+0.055     2026-06-23
+          - New: `pcg doccheck` / pcg_doccheck (43 MCP tools) -- a doc-DRIFT linter (distinct from
+            undocumented, which is MISSING POD): call-shaped POD entries (`=head2 name($args)` /
+            `=item C<< $obj->name >>`) documenting a method/function that no longer exists in the
+            documenting file's package(s) or their @ISA -- a method removed or renamed while its docs were
+            left behind. Package + MRO aware (an inherited method documented in a subclass is fine),
+            auto-provided names (new/import/...) skipped, and the call form (parens or `->`) is required so
+            prose section headings ('DESCRIPTION', 'Configuration') never match. New Query::doccheck +
+            _pod_api_names; Format::doccheck; CLI `pcg doccheck`. 0 false positives dogfooding pcg.
+          - Tests +15 (1340 total): t/95 (a removed method via =head2 and via =item, an inherited method,
+            a real method, a documented `use constant`, a prose heading, and an auto-provided new() -- only
+            the two stale entries flagged).
+
+0.054     2026-06-23
+          - New: `pcg checkargs` / pcg_checkargs (42 MCP tools) -- a static BUG FINDER, sibling to
+            checkcalls: calls that pass the wrong NUMBER of arguments to an in-repo sub whose SIGNATURE
+            fixes its arity (`sub f ($a, $b)` = exactly 2; a `$b = 5` default = 1-2; a slurpy @rest / %opt
+            = variadic, not checked) -- too few or too many args, which Perl only catches at runtime.
+            Re-parses each calling file to count the positional args at the call site: a `->method` call's
+            implicit invocant is counted toward @_, and a splat arg (@list / a list-returning call) makes a
+            site indeterminate and is skipped. Precise, not exhaustive: a same-package `$self->method` call
+            is matched so a `$x->foo` is never checked against an unrelated `Other::foo`, a callee whose
+            qualified name is defined twice (e.g. main:: in two scripts) is skipped as resolution-ambiguous,
+            and a `my ($x) = @_` sub has no signature to check. New Query::checkargs + _sig_arity /
+            _call_sites / _count_args; Format::checkargs; CLI `pcg checkargs`. 0 false positives dogfooding
+            pcg itself. Opens a 7th wave -- turning the graph's detectors into actions + new finders.
+          - Tests +14 (1325 total): t/94 (too-few / too-many function calls, a same-package method call's
+            invocant, plus the negatives -- a defaulted param, a slurpy signature, and a splat arg, none flagged).
+
 0.053     2026-06-23
           - New: `pcg suggest-reviewers <ref>` / pcg_suggest_reviewers (41 MCP tools) -- who should
             review a change: the authors of the files changed vs <ref>, ranked by how many commits

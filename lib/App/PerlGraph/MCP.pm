@@ -1,6 +1,6 @@
 package App::PerlGraph::MCP;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Moo;
 use Cpanel::JSON::XS ();
 use App::PerlGraph ();
@@ -33,8 +33,8 @@ ORIENT in an unfamiliar repo: pcg_overview (the map -- scale, frameworks, entry 
 UNDERSTAND a symbol: pcg_explain (one-call dossier -- source + callers/callees + transitive blast radius + covering tests); pcg_context (a paste-ready EDITING set -- the symbol + the full source of every project callee it depends on + tests, budget-capped; a non-symbol arg becomes a search). Finer-grained: pcg_node (def + source); pcg_callers / pcg_callees; pcg_impact (transitive callers = blast radius); pcg_path A B (shortest call chain).
 ARCHITECTURE: pcg_deps (import/inheritance graph); pcg_cycles (circular deps); pcg_layers (modules stratified by dependency depth; cycles = violations); pcg_hotspots (fan-in / fan-out / complexity / coupling leaders); pcg_duplication (structural code clones -- DRY / extract-a-helper targets).
 HISTORY (needs a git work tree): pcg_risk (churn x fan-in = what's risky to change); pcg_cochange (files that change together = hidden coupling); pcg_owners (per-file author x importance = bus-factor risk); pcg_suggest_reviewers <ref> (who should review a change -- authors of the changed files ranked by how much of that code they wrote).
-QUALITY & RELEASE: pcg_checkcalls (broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class does not define, i.e. a typo or a call into removed API; heuristic, `index runtime:true` sharpens it); pcg_unused (dead code); pcg_untested (public API no test reaches); pcg_undocumented (public API without POD); pcg_dead_exports (exported functions no other in-repo package calls -- retractable API); pcg_sinks (command/SQL injection surface -- `[dynamic]` sites are built from a variable, the ones to verify); pcg_prereqs (declared CPAN deps vs actually-used); pcg_api (a module's public surface); pcg_covers (tests exercising a symbol); pcg_affected (files/tests impacted by a change). Branch/PR review (needs git): pcg_review (diff + blast radius + tests + findings, one call); pcg_diff (just the structural diff); pcg_semver (recommend a major/minor/patch bump).
-REFACTOR -- the three WRITE tools: pcg_rename (rename a sub/method within its package); pcg_move (move a sub to another existing package -- relocate its source + requalify calls to NewPkg::sub); pcg_inline (inline a simple function at its call sites as a do{} block + remove the definition, the inverse of extracting a helper). All edit ONLY resolver-confirmed call sites and report the dynamic `$obj->method` ones they can't verify, never editing them silently. Dry-run unless apply:true; call pcg_sync after.
+QUALITY & RELEASE: pcg_checkcalls (broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class does not define, i.e. a typo or a call into removed API; heuristic, `index runtime:true` sharpens it); pcg_checkargs (wrong-arity calls -- the sibling bug finder: a call passing too few/many args to a sub whose signature fixes its arity); pcg_unused (dead code); pcg_untested (public API no test reaches); pcg_undocumented (public API without POD); pcg_doccheck (stale POD -- documents a method that no longer exists); pcg_scaffold (a POD + test skeleton for a sub from its signature -- the fix for untested/undocumented); pcg_dead_exports (exported functions no other in-repo package calls -- retractable API); pcg_sinks (command/SQL injection surface -- `[dynamic]` sites are built from a variable, the ones to verify); pcg_prereqs (declared CPAN deps vs actually-used); pcg_api (a module's public surface); pcg_covers (tests exercising a symbol); pcg_affected (files/tests impacted by a change). Branch/PR review (needs git): pcg_review (diff + blast radius + tests + findings, one call); pcg_diff (just the structural diff); pcg_semver (recommend a major/minor/patch bump); pcg_changelog (draft a Changes entry from the diff).
+REFACTOR -- the five WRITE tools: pcg_rename (rename a sub/method within its package); pcg_move (move a sub to another existing package -- relocate its source + requalify calls to NewPkg::sub); pcg_inline (inline a simple function at its call sites as a do{} block + remove the definition, the inverse of extracting a helper); pcg_dedupe (de-duplicate a clone group: keep one canonical function, rewrite each EXACT type-1 duplicate to `{ goto &Canonical }`, the inverse of copy-paste); pcg_rm (safely delete a DEAD sub + cascade-remove the now-dead private helpers it solely used; refuses if still called or exported -- the actionable follow-up to pcg_unused). All edit ONLY resolver-confirmed sites and report what they can't verify, never editing it silently. Dry-run unless apply:true; call pcg_sync after.
 LIFECYCLE: if a read tool says "no index", call pcg_index once to build the graph (no restart needed). After you edit Perl files, call pcg_sync so queries reflect them. pcg_status reports graph health + how much is resolved.
 UNRESOLVED FRONTIER (high value): most "unresolved" calls are opaque `$obj->method` dispatch static analysis can't tie to a class. pcg_unresolved lists those that DO match real candidate methods; with by_receiver:true it groups by receiver and intersects the classes defining EVERY method called on it -- a unique intersection is a near-certain type. Confirm it (read the code if needed) and pass to pcg_resolve -- prefer the { caller, receiver, class } form, which types a receiver once and resolves all its calls. Those edges are `[llm]` and persist across reindex. (pcg_index deps:true resolves many dependency calls statically first.)
 MD
@@ -66,7 +66,7 @@ my @TOOLS = (
       inputSchema => { type => 'object', properties => { symbol => { type => 'string', description => 'Symbol name' } }, required => ['symbol'] } },
     { name => 'pcg_path', handler => 'path', description => 'Shortest call path from one symbol to another -- how A reaches B (or that it cannot).',
       inputSchema => { type => 'object', properties => { from => { type => 'string', description => 'Start symbol' }, to => { type => 'string', description => 'Target symbol' } }, required => ['from', 'to'] } },
-    { name => 'pcg_unused', handler => 'unused', description => 'Dead-code candidates: defined subs nothing in the indexed code references. The output notes its own blind spots (dynamic/string dispatch, cross-distribution callers). Set all=true to also include exported and lifecycle subs.',
+    { name => 'pcg_unused', handler => 'unused', description => 'Dead-code candidates: defined subs nothing in the indexed code references. The output notes its own blind spots (dynamic/string dispatch, cross-distribution callers). Set all=true to also include exported and lifecycle subs. To DELETE a confirmed dead sub (cascading into the private helpers it solely used), use pcg_rm.',
       inputSchema => { type => 'object', properties => { all => { type => 'boolean', description => 'Include exported + lifecycle subs (default false)' } } } },
     { name => 'pcg_affected', handler => 'affected', description => 'Files (or tests, with tests_only) impacted by changing the given files -- the reverse-dependency closure. Pass `files`, and/or `since REF` to take the changed files from `git diff --name-only REF` (CI triage in one call: which tests to run for the diff vs main).',
       inputSchema => { type => 'object', properties => {
@@ -84,7 +84,13 @@ my @TOOLS = (
       inputSchema => { type => 'object', properties => {} } },
     { name => 'pcg_checkcalls', handler => 'checkcalls', description => "Broken method calls -- a static BUG FINDER: `\$obj->method` sites where the receiver's class is KNOWN (a `\$self`/`\$class` invocant, an inferred `my \$x = Class->new`, or a bareword `Class->method`) and that class plus its FULL in-repo MRO defines no such method -- i.e. typos and calls into renamed/removed API, which Perl doesn't catch until runtime. Conservative: only flags when the class and every ancestor are in-repo and there is no AUTOLOAD (`has`/`field` accessors and Moo `is=>rwp` writers ARE understood), so false positives are rare. Still heuristic -- it can't see runtime-injected methods or `handles` delegation, so `pcg_index runtime:true` sharpens it; verify a finding before deleting the call.",
       inputSchema => { type => 'object', properties => {} } },
-    { name => 'pcg_duplication', handler => 'duplication', description => "Structural code clones: groups of subs whose BODY has an identical CST shape -- same structure with identifiers and literals abstracted away, so type-1 (exact) and type-2 (copy-paste with renamed vars / changed constants) duplicates are caught. Ranked by size x number of copies, so the biggest, most-copied groups -- the best extract-a-shared-helper / DRY targets -- come first. Near-duplicates with small edits (type-3) are NOT grouped, so a reported group is a real structural match, not a guess.",
+    { name => 'pcg_checkargs', handler => 'checkargs', description => "Wrong-arity calls -- a static BUG FINDER (sibling to pcg_checkcalls): calls that pass the wrong NUMBER of arguments to an in-repo sub whose SIGNATURE fixes its arity (`sub f (\$a, \$b)` -> exactly 2; `\$b = 5` default -> 1-2; a slurpy `\@rest`/`\%opt` -> variadic, not checked) -- too few or too many args, which Perl only catches at runtime. Re-parses each calling file to count the positional args at the call site; a `->method` call's implicit invocant is counted toward \@_, and a splat arg (\@list / a list-returning call) makes a site indeterminate and skipped. Only subs with an explicit signature and a determinate call site are checked, so findings are precise but not exhaustive (a `my (\$x) = \@_` sub has no signature to check). Heuristic -- verify before editing.",
+      inputSchema => { type => 'object', properties => {} } },
+    { name => 'pcg_doccheck', handler => 'doccheck', description => "Stale POD -- doc DRIFT (distinct from pcg_undocumented, which is MISSING docs): call-shaped POD entries (`=head2 name(\$args)` or `=item C<< \$obj->name >>`) documenting a method/function that no longer exists in the documenting file's package(s) or their \@ISA -- a method removed or renamed while its docs were left behind. Package + MRO aware, so an inherited method documented in a subclass is fine; auto-provided names (new/import/...) are skipped. Requires the call form (parens or `->`) so prose section headings ('DESCRIPTION', 'Configuration') never match. Heuristic -- verify.",
+      inputSchema => { type => 'object', properties => {} } },
+    { name => 'pcg_scaffold', handler => 'scaffold', description => "Generate a POD + test SKELETON (with TODO placeholders) for a sub, derived from its signature -- the actionable starting point for pcg_untested / pcg_undocumented. Returns a `=head2` POD stub (using \$obj->name and dropping the invocant for a method) and a Test2::V0 test stub that loads the package and calls the sub with one placeholder argument per parameter, plus an assertion to fill in. Read-only: it emits text to paste/adapt, it does not write any file.",
+      inputSchema => { type => 'object', properties => { symbol => { type => 'string', description => 'The sub to scaffold: Pkg::sub, or a unique bare name' } }, required => ['symbol'] } },
+    { name => 'pcg_duplication', handler => 'duplication', description => "Structural code clones: groups of subs whose BODY has an identical CST shape -- same structure with identifiers and literals abstracted away, so type-1 (exact) and type-2 (copy-paste with renamed vars / changed constants) duplicates are caught. Ranked by size x number of copies, so the biggest, most-copied groups -- the best extract-a-shared-helper / DRY targets -- come first. Near-duplicates with small edits (type-3) are NOT grouped, so a reported group is a real structural match, not a guess. To collapse an exact (type-1) duplicate group into a single canonical function, use pcg_dedupe.",
       inputSchema => { type => 'object', properties => {
           limit     => { type => 'integer', description => 'Max clone groups to return (default 20)' },
           min_nodes => { type => 'integer', description => 'Ignore subs whose body has fewer than N AST nodes (default 30)' },
@@ -108,6 +114,16 @@ my @TOOLS = (
           target => { type => 'string',  description => 'Function to inline: Pkg::sub, or a unique bare name' },
           apply  => { type => 'boolean', description => 'Write the edits to disk (default false = dry-run plan)' },
       }, required => ['target'] } },
+    { name => 'pcg_dedupe', handler => 'dedupe', description => "De-duplicate a structural clone group (from pcg_duplication) -- the FOURTH write tool, the inverse of copy-paste. Given a target function in a clone group, keep it as the canonical copy and rewrite every OTHER plain function in the group whose signature+body is BYTE-IDENTICAL into a one-line delegation `sub name { goto &Canonical }`, so the duplicated logic lives in one place while every name stays callable. Conservative by design: only EXACT (type-1) duplicate FUNCTIONS are rewritten; type-2 clones (renamed vars / changed literals) and methods are reported, never edited. It also refuses outright when the canonical carries a prototype or :attribute the goto-stub can't preserve, and skips a cross-package clone whose file does not `use` the canonical's package (the delegation would die). Returns the plan; set apply=true to write. Call pcg_sync after.",
+      inputSchema => { type => 'object', properties => {
+          target => { type => 'string',  description => 'A function in the clone group to keep as canonical: Pkg::sub, or a unique bare name' },
+          apply  => { type => 'boolean', description => 'Write the edits to disk (default false = dry-run plan)' },
+      }, required => ['target'] } },
+    { name => 'pcg_rm', handler => 'rm', description => "Safely DELETE a dead sub -- the FIFTH write tool. REFUSES if the target is still called by any in-repo node (lists the callers -- remove those first) or is exported (it may have out-of-repo consumers). When it IS dead, removes it AND cascade-removes the now-dead PRIVATE helpers it solely used (recursively, to a fixed point), so a whole dead subtree goes at once -- the actionable follow-up to pcg_unused. Returns the plan (what would be removed); set apply=true to write. Call pcg_sync after.",
+      inputSchema => { type => 'object', properties => {
+          target => { type => 'string',  description => 'The dead function/method to delete: Pkg::sub, or a unique bare name' },
+          apply  => { type => 'boolean', description => 'Write the deletions to disk (default false = dry-run plan)' },
+      }, required => ['target'] } },
     { name => 'pcg_hotspots', handler => 'hotspots', description => 'Call-graph hotspots, four lists: the most depended-upon symbols (fan-in, each with its transitive blast radius -- change with care), the symbols that make the most calls (fan-out), the most cyclomatically-complex symbols, and the most efferently-coupled modules. Good for review/refactor triage.',
       inputSchema => { type => 'object', properties => { limit => { type => 'integer', description => 'Top N per list (default 15)' } } } },
     { name => 'pcg_risk', handler => 'risk', description => 'History-aware risk: symbols ranked by git churn (commits touching their file) x fan-in (how many depend on them). Frequently-changed AND widely-depended-upon code is the top refactor/test target. With `since`, count only churn from commits since that ref (risk on the current branch). Needs a git work tree.',
@@ -125,8 +141,10 @@ my @TOOLS = (
           min_support => { type => 'integer', description => 'Min shared commits (default 3)' },
           max_files   => { type => 'integer', description => 'Skip commits touching more than N code files (default 25; filters version-bump sweeps)' },
       } } },
-    { name => 'pcg_semver', handler => 'semver', description => 'Recommend a Semantic Versioning bump (major/minor/patch) for the change vs a git ref, from the STRUCTURAL diff: removed or re-signatured PUBLIC API forces MAJOR; otherwise new public API is MINOR; otherwise internal-only changes are PATCH. Lists the evidence. Needs a git work tree.',
+    { name => 'pcg_semver', handler => 'semver', description => 'Recommend a Semantic Versioning bump (major/minor/patch) for the change vs a git ref, from the STRUCTURAL diff: removed or re-signatured PUBLIC API forces MAJOR; otherwise new public API is MINOR; otherwise internal-only changes are PATCH. Lists the evidence. To also draft the Changes entry text, use pcg_changelog. Needs a git work tree.',
       inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to compare against (e.g. the last release tag, or main)' } }, required => ['ref'] } },
+    { name => 'pcg_changelog', handler => 'changelog', description => "Draft a release-notes / Changes entry from the STRUCTURAL diff vs a git ref: the added, removed, and signature-changed functions/methods/constants/packages grouped under Added / Removed / Changed, each tagged public vs internal and breaking-vs-not, with the suggested version bump at the top. A ready-to-edit scaffold for a CPAN-style Changes entry (turn the bullet list into prose before release) -- complements pcg_semver (which only recommends the bump). Needs a git work tree.",
+      inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to compare against (the last release tag, or main)' } }, required => ['ref'] } },
     { name => 'pcg_diff', handler => 'diff', description => 'Structural ("semantic") diff vs a git ref: which functions/methods/constants/packages/classes were added, removed, or had their signature change between <ref> and the working tree -- with breaking changes (removed or re-signatured PUBLIC API) flagged. Ideal for reviewing a branch or PR. Needs a git work tree.',
       inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to compare against (e.g. main, HEAD~3)' } }, required => ['ref'] } },
     { name => 'pcg_review', handler => 'review', description => 'Review a branch/PR in one call: the structural diff vs a git ref (added/removed/re-signatured symbols, breaking PUBLIC API flagged), the blast radius (count of files affected by the change), the tests to run, and -- for each breaking symbol -- how many callers still reference it. Plus graph-derived findings: untested public changes (no test reaches them) and wide-blast-radius changes (a touched public symbol many things still call). Composes the structural diff with the affected-files closure. Needs a git work tree and an index.',
@@ -135,9 +153,9 @@ my @TOOLS = (
       inputSchema => { type => 'object', properties => { module => { type => 'string', description => 'Module name' } }, required => ['module'] } },
     { name => 'pcg_covers', handler => 'covers', description => 'Which test files (transitively) exercise a symbol -- the reverse of pcg_affected(tests_only). Limited to statically-resolved calls.',
       inputSchema => { type => 'object', properties => { symbol => { type => 'string', description => 'Symbol name' } }, required => ['symbol'] } },
-    { name => 'pcg_untested', handler => 'untested', description => "Untested public API: exported/public functions/methods/constants that no test file statically reaches. Omit `module` for the whole project. (A symbol exercised only via opaque \$obj->method dispatch from a test is invisible to static analysis and may appear here.)",
+    { name => 'pcg_untested', handler => 'untested', description => "Untested public API: exported/public functions/methods/constants that no test file statically reaches. Omit `module` for the whole project. (A symbol exercised only via opaque \$obj->method dispatch from a test is invisible to static analysis and may appear here.) To generate a test + POD skeleton for a symbol from this list, use pcg_scaffold.",
       inputSchema => { type => 'object', properties => { module => { type => 'string', description => 'Focus on one module (optional)' } } } },
-    { name => 'pcg_undocumented', handler => 'undocumented', description => "Undocumented public API: exported/public functions/methods/constants that carry no POD docstring. Omit `module` for the whole project. A documentation-coverage check for a release.",
+    { name => 'pcg_undocumented', handler => 'undocumented', description => "Undocumented public API: exported/public functions/methods/constants that carry no POD docstring (distinct from pcg_doccheck, which catches STALE docs -- a =head2 entry for a method that no longer exists). Omit `module` for the whole project. A documentation-coverage check for a release. To generate a POD + test skeleton for a symbol from this list, use pcg_scaffold.",
       inputSchema => { type => 'object', properties => { module => { type => 'string', description => 'Focus on one module (optional)' } } } },
     { name => 'pcg_dead_exports', handler => 'dead_exports', description => "Dead exports: exported functions/methods (\@EXPORT / \@EXPORT_OK) that NO other in-repo package calls -- public API you could stop exporting to shrink the surface. A caller in any OTHER package (tests included) makes an export live; same-package use does not. Constants are excluded (their bareword use isn't call-tracked). Honest caveat: a CPAN module's exports may be there for external/downstream consumers the graph can't see, so these are candidates to verify, not certain removals.",
       inputSchema => { type => 'object', properties => {} } },
@@ -268,7 +286,7 @@ sub _run_tool ($self, $handler, $args) {
     # read tools require a built graph -- except pcg_diff, which parses git directly
     # (no graph needed), matching the CLI `pcg diff`. pcg_review still needs the index.
     return "No index yet. Call pcg_index first to build the graph for this project."
-        unless $self->_indexed || $handler eq 'diff' || $handler eq 'semver';
+        unless $self->_indexed || $handler eq 'diff' || $handler eq 'semver' || $handler eq 'changelog';
     my $q = $self->query;
     my $sym = $args->{symbol} // '';
     if ($handler eq 'search') {
@@ -302,6 +320,9 @@ sub _run_tool ($self, $handler, $args) {
     return App::PerlGraph::Format::cycles([ $q->cycles ])                          if $handler eq 'cycles';
     return App::PerlGraph::Format::layers($q->layers)                              if $handler eq 'layers';
     return App::PerlGraph::Format::checkcalls($q->checkcalls)                      if $handler eq 'checkcalls';
+    return App::PerlGraph::Format::checkargs($q->checkargs($self->base))           if $handler eq 'checkargs';
+    return App::PerlGraph::Format::doccheck($q->doccheck($self->base))             if $handler eq 'doccheck';
+    return App::PerlGraph::Format::scaffold($q->scaffold($args->{symbol} // ''))    if $handler eq 'scaffold';
     return App::PerlGraph::Format::metrics($q->metrics)                            if $handler eq 'metrics';
     return App::PerlGraph::Format::dead_exports($q->dead_exports)                  if $handler eq 'dead_exports';
     return App::PerlGraph::Format::duplication($q->duplication(map { defined $args->{$_} ? ($_ => $args->{$_}) : () } qw(limit min_nodes))) if $handler eq 'duplication';
@@ -325,8 +346,20 @@ sub _run_tool ($self, $handler, $args) {
             App::PerlGraph::Refactor->new(store => $q->store, root => $self->base)
                 ->inline($args->{target} // '', ($args->{apply} ? (apply => 1) : ())));
     }
+    if ($handler eq 'dedupe') {
+        require App::PerlGraph::Refactor;
+        return App::PerlGraph::Format::dedupe(
+            App::PerlGraph::Refactor->new(store => $q->store, root => $self->base)
+                ->dedupe($args->{target} // '', ($args->{apply} ? (apply => 1) : ())));
+    }
+    if ($handler eq 'rm') {
+        require App::PerlGraph::Refactor;
+        return App::PerlGraph::Format::rm(
+            App::PerlGraph::Refactor->new(store => $q->store, root => $self->base)
+                ->rm($args->{target} // '', ($args->{apply} ? (apply => 1) : ())));
+    }
     return App::PerlGraph::Format::hotspots($q->hotspots(defined $args->{limit} ? (limit => $args->{limit}) : ())) if $handler eq 'hotspots';
-    if ($handler eq 'diff' || $handler eq 'review' || $handler eq 'semver') {
+    if ($handler eq 'diff' || $handler eq 'review' || $handler eq 'semver' || $handler eq 'changelog') {
         require App::PerlGraph::Git; require App::PerlGraph::Diff; require App::PerlGraph::Parser;
         my $git = App::PerlGraph::Git->new(root => $self->base);
         return "This needs a git work tree." unless $git->available;
@@ -338,6 +371,9 @@ sub _run_tool ($self, $handler, $args) {
         return App::PerlGraph::Format::semver(
             App::PerlGraph::Diff->new(root => $self->base, ref => $ref, parser => $parser)->diff, $ref)
             if $handler eq 'semver';
+        return App::PerlGraph::Format::changelog(
+            App::PerlGraph::Diff->new(root => $self->base, ref => $ref, parser => $parser)->diff, $ref)
+            if $handler eq 'changelog';
         require App::PerlGraph::Review;
         return App::PerlGraph::Format::review(
             App::PerlGraph::Review->new(root => $self->base, ref => $ref, parser => $parser, store => $q->store)->review);

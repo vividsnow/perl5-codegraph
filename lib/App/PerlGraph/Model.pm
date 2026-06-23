@@ -1,6 +1,6 @@
 package App::PerlGraph::Model;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Exporter 'import';
 use Digest::SHA qw(sha1_hex);
 

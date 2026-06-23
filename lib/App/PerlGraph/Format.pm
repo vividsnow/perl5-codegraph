@@ -1,6 +1,6 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use App::PerlGraph::Source;
 use App::PerlGraph::Model qw(package_of is_public);
 use Cpanel::JSON::XS ();
@@ -248,6 +248,64 @@ sub checkcalls ($findings) {
     return $out;
 }
 
+sub checkargs ($findings) {
+    my $out = "## Wrong-arity calls\n\n";
+    return $out . "_none found_ -- every checked call passes a fitting number of arguments.\n" unless @$findings;
+    $out .= scalar(@$findings)
+        . " call(s) passing the wrong number of arguments to a sub whose signature fixes its arity:\n\n";
+    for my $f (@$findings) {
+        $out .= sprintf "- `%s%s` -- %s:%s -- expects %s arg(s) in \@_, got %s (from `%s`)\n",
+            $f->{callee}, $f->{sig} // '', $f->{file} // '?', $f->{line} // '?', $f->{expected}, $f->{got}, $f->{caller};
+    }
+    $out .= "\n(checks calls to subs with an explicit signature -- a method call's implicit invocant is counted,"
+          . " splat args like \@list are skipped, a `my (...) = \@_` sub has none to check. Heuristic; verify.)\n";
+    return $out;
+}
+
+sub doccheck ($findings) {
+    my $out = "## Stale POD\n\n";
+    return $out . "_none found_ -- every `name(...)` / `\$obj->name` POD entry names a method that exists.\n"
+        unless @$findings;
+    $out .= scalar(@$findings)
+        . " POD entr" . (@$findings == 1 ? 'y' : 'ies') . " documenting a method/function that no longer exists"
+        . " (removed or renamed -- update the docs):\n\n";
+    for my $f (@$findings) {
+        $out .= sprintf "- `%s` -- %s:%s -- documented in POD, but no such sub in the package or its \@ISA\n",
+            $f->{name}, $f->{file} // '?', $f->{line} // '?';
+    }
+    $out .= "\n(checks call-shaped POD headings `=head2 name(...)` / `=item \$obj->name`; package + MRO aware, so an"
+          . " inherited method documented in a subclass is fine. Heuristic -- verify.)\n";
+    return $out;
+}
+
+sub scaffold ($r) {
+    return "## Scaffold\n\n**error**: $r->{error}\n" if $r->{error};
+    my $n     = $r->{node};
+    my $qn    = $n->{qualified_name} // $n->{name};
+    my $short = $qn =~ s/.*:://r;
+    my $pkg   = package_of($qn);
+    my @vis   = $r->{is_method} ? @{ $r->{params} }[1 .. $#{ $r->{params} }] : @{ $r->{params} };
+    my $sig   = '(' . join(', ', @vis) . ')';
+    my $out   = "## Scaffold for `$qn`\n\n";
+
+    $out .= "### POD skeleton (paste above the sub)\n\n```pod\n";
+    $out .= "=head2 " . ($r->{is_method} ? "\$obj->$short$sig" : "$short$sig") . "\n\n";
+    $out .= "TODO: one-line summary of what $short does.\n\n";
+    $out .= "TODO: describe " . (@vis ? 'the parameter(s) (' . join(', ', @vis) . ') and ' : '') . "the return value.\n\n";
+    $out .= "=cut\n```\n\n";
+
+    my $args = join ', ', map { (my $x = $_) =~ s/\A[\$\@%]//; "TODO_$x" } @vis;
+    $out .= "### Test skeleton\n\n```perl\nuse Test2::V0;\nuse $pkg;\n\n";
+    $out .= $r->{is_method}
+        ? "my \$obj = $pkg->new(TODO);   # TODO: construct an instance\nis \$obj->$short($args), TODO_expected, '$short: TODO describe the case';\n"
+        : "is ${pkg}::$short($args), TODO_expected, '$short: TODO describe the case';\n";
+    $out .= "\ndone_testing;\n```\n";
+
+    $out .= "\n(skeletons -- fill the TODOs. " . ($r->{has_pod} ? 'This sub already has POD. ' : 'This sub has no POD. ')
+          . "See pcg_untested / pcg_undocumented for what still needs these.)\n";
+    return $out;
+}
+
 sub layers ($r) {
     my $out = "## Architecture layers (module dependency stratification)\n\n";
     my $L = $r->{layers};
@@ -352,6 +410,38 @@ sub semver ($d, $ref) {
     }
     my $internal = (@{ $d->{added} } - @added_pub) + grep { !$_->{_breaking} } @{ $d->{changed} };
     $out .= sprintf "(%d internal / non-public change(s) -- do not raise the bump level)\n", $internal if $internal;
+    return $out;
+}
+
+sub changelog ($d, $ref) {
+    my @added    = @{ $d->{added} };
+    my @removed  = @{ $d->{removed} };
+    my @changed  = @{ $d->{changed} };
+    my $out = "## Draft changelog (vs $ref)\n\n";
+    return $out . "_no structural changes since `$ref`._\n" unless @added || @removed || @changed;
+    my @breaking = grep { $_->{_breaking} } @removed, @changed;
+    my @add_pub  = grep { is_public($_) } @added;
+    $out .= 'Suggested version bump: **' . (@breaking ? 'major' : @add_pub ? 'minor' : 'patch') . "**.\n\n";
+    if (@added) {
+        $out .= "### Added\n\n";
+        $out .= sprintf "- `%s` (%s)%s\n", $_->{qualified_name}, $_->{kind} // '?',
+            (is_public($_) ? '' : ' _(internal)_') for @added;
+        $out .= "\n";
+    }
+    if (@removed) {
+        $out .= "### Removed\n\n";
+        $out .= sprintf "- `%s` (%s)%s\n", $_->{qualified_name}, $_->{kind} // '?',
+            ($_->{_breaking} ? ' **(breaking -- was public)**' : '') for @removed;
+        $out .= "\n";
+    }
+    if (@changed) {
+        $out .= "### Changed (signature)\n\n";
+        $out .= sprintf "- `%s`: `%s` -> `%s`%s\n", $_->{new}{qualified_name},
+            $_->{old}{signature} // '()', $_->{new}{signature} // '()',
+            ($_->{_breaking} ? ' **(breaking)**' : '') for @changed;
+        $out .= "\n";
+    }
+    $out .= "_Draft from the structural diff -- edit into prose before release._\n";
     return $out;
 }
 
@@ -666,6 +756,43 @@ sub rename ($r) {
         $out .= sprintf "- `%s` L%d  (receiver `%s`)\n", $_->{file}, $_->{line}, $_->{receiver} // '?'
             for @{ $r->{frontier} };
     }
+    return $out;
+}
+
+sub dedupe ($r) {
+    return "## Deduplicate\n\n**error**: $r->{error}\n" . _dedupe_skipped($r) if $r->{error};
+    my $n = scalar @{ $r->{replaced} };
+    my $out = "## Deduplicate clone group -- canonical `$r->{canonical}`\n\n";
+    $out .= $r->{applied}
+        ? "Rewrote **$r->{applied}** exact-duplicate function(s) to delegate to `$r->{canonical}`. Run `pcg sync` to refresh.\n\n"
+        : "Plan (dry run -- add `--apply` / apply:true to write): rewrite $n exact-duplicate function(s) to `{ goto &$r->{canonical} }`:\n\n";
+    $out .= sprintf "- `%s` -- %s\n", $_->{name}, $_->{file} for @{ $r->{replaced} };
+    $out .= _dedupe_skipped($r);
+    $out .= "\n(only EXACT type-1 duplicate functions are merged -- each keeps its name but delegates; verify before apply.)\n";
+    return $out;
+}
+sub _dedupe_skipped ($r) {
+    my @s = @{ $r->{skipped} // [] };
+    return '' unless @s;
+    my $out = "\n_Not rewritten (clone group members that are not exact-duplicate functions -- handle manually):_\n";
+    $out .= sprintf "- `%s` -- %s\n", $_->{name}, $_->{why} for @s;
+    return $out;
+}
+
+sub rm ($r) {
+    if ($r->{error}) {
+        my $out = "## Remove\n\n**error**: $r->{error}\n";
+        $out .= "\nstill referenced by:\n" . join('', map { "- `$_`\n" } @{ $r->{blocked_by} }) if @{ $r->{blocked_by} // [] };
+        return $out;
+    }
+    my $n = scalar @{ $r->{removed} };
+    my $out = "## Remove `$r->{target}`\n\n";
+    $out .= $r->{applied}
+        ? "Removed **$r->{applied}** dead sub(s). Run `pcg sync` to refresh.\n\n"
+        : "Plan (dry run -- add `--apply` / apply:true to write): remove $n dead sub(s):\n\n";
+    $out .= sprintf "- `%s` -- %s%s\n", $_->{name}, $_->{file} // '?',
+        ($_->{cascade} ? ' (now-dead private helper it solely used)' : '') for @{ $r->{removed} };
+    $out .= "\n(refuses if the target is still called or exported; cascades only into the now-dead PRIVATE helpers.)\n";
     return $out;
 }
 

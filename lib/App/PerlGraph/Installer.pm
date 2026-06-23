@@ -1,6 +1,6 @@
 package App::PerlGraph::Installer;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);
@@ -75,18 +75,29 @@ routes/helpers, XSUBs), not text matches.
 - Who should review a change (authors of the changed files, ranked by how much of that code they wrote) -> **pcg_suggest_reviewers** `<ref>`.
 - Review a branch/PR in one call (diff + blast radius + tests + breaking + findings) -> **pcg_review** `<ref>`. Just the structural diff -> **pcg_diff**.
 - Recommend a semver bump (major/minor/patch) for a release from the structural diff -> **pcg_semver** `<ref>` (breaking public API->major, new public API->minor, internal->patch).
+- Draft a Changes / release-notes entry from the structural diff (added / removed / changed, grouped, with the bump) -> **pcg_changelog** `<ref>` (a ready-to-edit scaffold; turn into prose before release).
 - Security attack surface (command/SQL execution sites + which web endpoints reach them) -> **pcg_sinks** (flags sinks whose argument is dynamically built -- interpolated/concatenated -- as the injection-shaped sites; constant/placeholdered ones are safe).
 - Which tests exercise X -> **pcg_covers**.  Tests impacted by a diff -> **pcg_affected**.
 - Broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class doesn't
   define (a typo or a call into renamed/removed API) -> **pcg_checkcalls** (heuristic; `pcg_index runtime:true` sharpens it).
+- Wrong-arity calls -- the sibling BUG FINDER: a call passing too few / too many args to a sub whose
+  signature fixes its arity (a `->method` invocant is counted; splat args skipped) -> **pcg_checkargs** (heuristic).
 - Dead-code candidates -> **pcg_unused**.  Untested public API -> **pcg_untested**.
 - Undocumented public API (no POD) -> **pcg_undocumented**.
+- Stale POD -- a `=head2 name(...)` / `=item $obj->name` entry documenting a method that no longer exists
+  in the package or its @ISA (doc drift after a rename/removal) -> **pcg_doccheck** (heuristic).
+- A POD + test SKELETON (with TODOs) for a sub, from its signature -- the actionable starting point for an
+  untested / undocumented sub -> **pcg_scaffold** `<symbol>` (read-only: emits text to adapt, writes nothing).
 - Exported functions/methods no OTHER in-repo package calls (retractable public API) -> **pcg_dead_exports**.
-- Rename a function/method to a new name WITHIN ITS OWN PACKAGE across the codebase (the first of three WRITE
+- Rename a function/method to a new name WITHIN ITS OWN PACKAGE across the codebase (the first of five WRITE
   tools; for a cross-package move use pcg_move; edits only the call sites it can tie to the symbol, reports the
   dynamic ones) -> **pcg_rename** (dry-run unless apply:true; call pcg_sync after).
 - Move a function to another existing package (relocate its source + requalify call sites to NewPkg::sub) -> **pcg_move** (dry-run unless apply:true; call pcg_sync after).
 - Inline a simple function at its call sites (a do{} block) + remove the definition, the inverse of extract -> **pcg_inline** (dry-run unless apply:true; refuses unsafe bodies; call pcg_sync after).
+- De-duplicate a clone group (from pcg_duplication): keep one canonical function, rewrite each EXACT type-1 duplicate
+  to `{ goto &Canonical }`, the inverse of copy-paste -> **pcg_dedupe** (dry-run unless apply:true; type-2/methods reported, not touched; call pcg_sync after).
+- Safely DELETE a dead sub + cascade-remove the now-dead private helpers it solely used (the actionable follow-up to
+  pcg_unused; refuses if still called or exported) -> **pcg_rm** (dry-run unless apply:true; call pcg_sync after).
 
 ## Closing the unresolved frontier (high value)
 Opaque `$obj->method` dispatch that static analysis can't tie to a class (local

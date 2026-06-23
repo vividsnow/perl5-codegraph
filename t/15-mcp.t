@@ -20,7 +20,7 @@ is $mcp0->dispatch({ jsonrpc => '2.0', method => 'notifications/initialized' }),
 # --- tools/list ---
 my $tl = $mcp0->dispatch({ jsonrpc => '2.0', id => 2, method => 'tools/list' });
 my @tools = @{ $tl->{result}{tools} };
-is scalar(@tools), 41, 'forty-one tools (35 read + 3 write + index / sync / status)';
+is scalar(@tools), 47, 'forty-seven tools (39 read + 5 write + index / sync / status)';
 ok( (grep { $_->{name} eq 'pcg_callers'  } @tools), 'pcg_callers listed' );
 ok( (grep { $_->{name} eq 'pcg_hotspots' } @tools), 'pcg_hotspots listed' );
 ok( (grep { $_->{name} eq 'pcg_untested' } @tools), 'pcg_untested listed' );
@@ -110,11 +110,17 @@ like _call('pcg_sinks',    {}),                     qr/Security sinks/,         
 like _call('pcg_rename', { old => 'No::Such', new => 'x' }), qr/no function/i,        'pcg_rename dispatches (handler wiring + error path)';
 # the 6 sixth-wave tools dispatch through tools/call (handler wiring, not just Query/Format)
 like _call('pcg_checkcalls',  {}),                  qr/Broken method calls/,          'pcg_checkcalls dispatches';
+like _call('pcg_checkargs',   {}),                  qr/Wrong-arity calls/,            'pcg_checkargs dispatches';
+like _call('pcg_doccheck',    {}),                  qr/Stale POD/,                    'pcg_doccheck dispatches';
+like _call('pcg_scaffold', { symbol => 'P::run' }), qr/Scaffold for `P::run`/,        'pcg_scaffold dispatches';
 like _call('pcg_duplication', {}),                  qr/Duplicate code/,               'pcg_duplication dispatches';
 like _call('pcg_metrics',     {}),                  qr/Code health metrics/,          'pcg_metrics dispatches';
 like _call('pcg_dead_exports',{}),                  qr/Dead exports/,                 'pcg_dead_exports dispatches';
 like _call('pcg_inline', { target => 'No::Such' }), qr/no plain function/,            'pcg_inline dispatches (handler wiring + error path)';
+like _call('pcg_dedupe', { target => 'No::Such' }), qr/no plain function/,            'pcg_dedupe dispatches (handler wiring + error path)';
+like _call('pcg_rm', { target => 'No::Such' }), qr/no function.method/,               'pcg_rm dispatches (handler wiring + error path)';
 like _call('pcg_suggest_reviewers', {}),            qr/`ref` is required|needs git/i, 'pcg_suggest_reviewers dispatches (ref/git guard)';
+like _call('pcg_changelog', {}),                    qr/`ref` is required|git work tree/i, 'pcg_changelog dispatches (ref/git guard)';
 like _call('pcg_search', { query => 'run', semantic => 1 }), qr/Semantic search/,      'pcg_search semantic:true routes to the semantic handler (not keyword)';
 like _call('pcg_unresolved', {}),                   qr/Unresolved method calls/,       'pcg_unresolved dispatches';
 like _call('pcg_resolve', { resolutions => [] }),   qr/applied 0/,                     'pcg_resolve dispatches (empty input)';

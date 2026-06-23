@@ -1,6 +1,6 @@
 package App::PerlGraph::Resolver;
 use v5.36;
-our $VERSION = q{0.053};
+our $VERSION = q{0.059};
 use Moo;
 use App::PerlGraph::Model qw(package_of qualify is_builtin is_external is_universal);
 
