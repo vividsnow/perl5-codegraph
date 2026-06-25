@@ -16,10 +16,11 @@ my $d = tempdir; $d->child('lib')->mkpath; $d->child('.pcg')->mkpath;
 $d->child('lib/P.pm')->spew_utf8(<<'PL');
 package P;
 use v5.36;
-sub add  ($a, $b)     { $a + $b }
-sub opt  ($a, $b = 5) { $a + $b }
-sub vary ($a, @rest)  { $a }
-sub noarg ()          { 42 }
+sub add   ($a, $b)     { $a + $b }
+sub opt   ($a, $b = 5) { $a + $b }
+sub vary  ($a, @rest)  { $a }
+sub noarg ()           { 42 }
+sub three ($a, $b, $c) { 1 }
 sub run {
     my $ok    = add(1, 2);        # right -> no finding
     my $few   = add(1);           # too few  -> FINDING (expects 2, got 1)
@@ -29,6 +30,9 @@ sub run {
     my $nz    = noarg();          # right (0 args) -> no finding
     my @list  = (1, 2);
     my $splat = add(@list);       # splat -> indeterminate -> skipped
+    my $qw    = three(qw/x y z/); # qw// is 3 words = 3 args -> right -> no finding (not counted as 1)
+    my %h     = (a => 1, b => 2, c => 3);
+    my $slice = three(@h{qw/a b c/}); # a hash SLICE has an indeterminate count -> skipped (not counted as 1)
 }
 1;
 PL
@@ -40,9 +44,11 @@ use v5.36;
 sub new   { bless {}, shift }
 sub greet ($self, $name) { "hi $name" }
 sub use_it {
-    my $self = shift;
+    my $self  = shift;
+    my $other = Other::Thing->new;
     $self->greet("x");   # right (invocant + 1 = 2) -> no finding
     $self->greet();      # too few -> FINDING (sig arity 2, got 1 incl. invocant)
+    $other->greet();     # a NON-$self receiver of unknown type -> must NOT match Obj::greet (no false positive)
 }
 1;
 PL
@@ -63,6 +69,9 @@ is $by{'P::add/1'}{expected}, '2',     'a fixed signature reports an exact expec
 # none of the correct / defaulted / slurpy / splat calls produced a finding
 ok !(grep { $_->{callee} eq 'P::opt' }  @$f), 'a defaulted param (opt(1)) is within arity -- not flagged';
 ok !(grep { $_->{callee} eq 'P::vary' } @$f), 'a slurpy signature is variadic -- not checked';
+ok !(grep { $_->{callee} eq 'P::three' } @$f),'three(qw/x y z/) and three(@h{...}) are not flagged -- a qw// counts as its WORD count (3), a slice is indeterminate (skipped)';
+is scalar(grep { $_->{callee} eq 'Obj::greet' } @$f), 1,
+    'only $self->greet() is flagged -- a $other->greet() (non-$self receiver) is not matched to the same-package method';
 ok !(grep { $_->{got} == 2 } @$f),            'add(1,2) and $self->greet("x") (the right calls) are not flagged';
 
 # rendering

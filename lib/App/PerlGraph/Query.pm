@@ -1,9 +1,9 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.064};
+our $VERSION = q{0.065};
 use Moo;
 use App::PerlGraph::Model qw(package_of is_public is_universal);
-use App::PerlGraph::Grammar qw(NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_LIST_EXPR F_ARGUMENTS F_FUNCTION F_METHOD);
+use App::PerlGraph::Grammar qw(NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_LIST_EXPR F_ARGUMENTS F_FUNCTION F_METHOD F_INVOCANT);
 
 # Read-only graph queries over a Store. Symbols may be bare names ('run') or
 # qualified ('Foo::run').
@@ -688,13 +688,18 @@ sub checkcalls ($self) {
     my $s = $self->store;
     require App::PerlGraph::Resolver;
     my $r = App::PerlGraph::Resolver->new(store => $s);
-    my %in_repo = map { (($_->{qualified_name} // '') => 1) } $s->all_nodes(qw(package class));  # closed-MRO test, once
+    my @pkgs = $s->all_nodes(qw(package class));
+    my %in_repo = map { (($_->{qualified_name} // '') => 1) }              # closed-MRO test, once; a `--deps`-indexed
+                  grep { !(($_->{metadata} // {})->{cpan}) } @pkgs;        # CPAN dep is INCOMPLETE (XS methods unseen) -> external
+    my %is_role = map { (($_->{qualified_name} // '') => 1) }              # a role is composed into unknown
+                  grep { (($_->{metadata} // {})->{role}) } @pkgs;         # consumers, so its $self method set is open
     my (%seen, @out);
     for my $ref ($s->all_unresolved) {
         next unless ($ref->{reference_kind} // '') eq 'method_call';
         my $m = $ref->{reference_name};
         next if $m =~ /::/ || is_universal($m) || $CHECKCALLS_SKIP{$m};   # SUPER::/qualified, can/isa, lifecycle
         my $cls = $r->receiver_class($ref)              or next;          # only when we KNOW the receiver's class
+        next if $is_role{$cls};                                          # $self in a role is the consumer, not the role
         my @mro = $r->mro($cls)                         or next;
         next if grep { !$in_repo{$_} } @mro;                             # any MRO class (incl. $cls) external -> unsure
         next if $r->method_in_mro($cls, $m);                             # the method DOES exist -> fine
@@ -767,7 +772,10 @@ sub checkargs ($self, $root) {
             my $named = $calls{ $caller->{id} };
             for my $site (@sites) {
                 next unless defined $site->{argc} && $site->{line} >= $lo && $site->{line} <= $hi;
-                my $cands = $site->{method}       ? [ grep { $_->{pkg} eq $cpkg } @{ $named->{m}{ $site->{name} } // [] } ]
+                # a method site matches a same-package callee ONLY when the invocant is $self/$class
+                # (the intra-class case); a `$other->m` / `$_->m` receiver has an unknown type, so don't
+                # assume it targets a same-named method in the caller's own package (a common false positive).
+                my $cands = $site->{method}       ? ($site->{self} ? [ grep { $_->{pkg} eq $cpkg } @{ $named->{m}{ $site->{name} } // [] } ] : [])
                           : $site->{full} =~ /::/ ? $named->{fq}{ $site->{full} }
                           :                         $named->{f}{ $site->{name} };
                 $cands && @$cands or next;
@@ -842,7 +850,9 @@ sub _call_sites ($tree) {
         }
         elsif ($t eq NODE_METHOD_CALL) {
             if (my $m = $n->{fields}{ +F_METHOD }) {
+                my $inv = ($n->{fields}{ +F_INVOCANT } // {})->{text} // '';
                 push @sites, { name => ($m->{text} // ''), method => 1,        # method sites match by short name, never `full`
+                               self => ($inv =~ /\A\$(?:self|class)\z/ ? 1 : 0), # only $self/$class is the same-package case
                                line => $n->{sl}, argc => _count_args($n->{fields}{ +F_ARGUMENTS }) };
             }
         }
@@ -858,11 +868,19 @@ sub _count_args ($args) {
     my @top = (($args->{type} // '') eq NODE_LIST_EXPR)
         ? grep { ($_->{type} // '') !~ /\A[[:punct:]]+\z/ } @{ $args->{children} // [] }
         : ($args);
+    my $n = 0;
     for my $a (@top) {
         my $t = $a->{type} // '';
-        return undef if $t =~ /\A(?:array|hash)\z/ || $t =~ /(?:array|hash)_deref/ || $t =~ /_call_expression\z/;
+        # indeterminate element count -> can't check arity: an @array/%hash, a deref, a slice
+        # (@h{...} / @a[...]), or a list-returning call.
+        return undef if $t =~ /\A(?:array|hash)\z/ || $t =~ /(?:array|hash)_deref/ || $t =~ /slice/ || $t =~ /_call_expression\z/;
+        if ($t eq 'quoted_word_list') {                       # qw/a b c/ is its WORD COUNT, not one arg
+            (my $w = $a->{text} // '') =~ s/\A\s*qw\s*.//s; $w =~ s/.\s*\z//s;
+            $n += scalar split ' ', $w;
+        }
+        else { $n++ }
     }
-    return scalar @top;
+    return $n;
 }
 
 # POD documenting a method/function that no longer exists -- doc DRIFT (distinct from

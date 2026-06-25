@@ -1,6 +1,6 @@
 package App::PerlGraph::Indexer;
 use v5.36;
-our $VERSION = q{0.064};
+our $VERSION = q{0.065};
 use Moo;
 use Digest::SHA qw(sha1_hex);
 use Path::Iterator::Rule;
@@ -31,7 +31,7 @@ our $PERL_RX     = qr/\.(?:pl|pm|t|psgi|pod|xs)$/;
 # Bump when the extractor's output changes (new node/edge kinds, resolution rules)
 # so a `pcg index`/`sync` after an upgrade re-extracts unchanged files instead of
 # trusting their stale graph. Files carry the version they were extracted with.
-use constant EXTRACTION_VERSION => 8;   # 8: per-sub structural clone fingerprint (metadata.dup)
+use constant EXTRACTION_VERSION => 9;   # 9: role packages flagged metadata.role (Mojo::Base -role, Moo/Moose/Mouse::Role, Role::Tiny, native role)
 
 # The dir-pruning rule shared by file and directory scans: the named IGNORE_DIRS,
 # plus any non-root subdir that is itself a git repo/worktree (its own .git) --

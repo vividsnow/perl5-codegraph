@@ -33,10 +33,20 @@ $d->child('lib/E.pm')->spew_utf8("package E;\nuse parent 'Exporter';\nsub go { m
 $d->child('lib/A.pm')->spew_utf8("package A;\nsub AUTOLOAD { 1 }\nsub go { my \$self = shift; \$self->anything }\n1;\n");
 # O: an opaque $obj receiver -> unknown class -> never flagged
 $d->child('lib/O.pm')->spew_utf8("package O;\nsub go { my (\$self, \$obj) = \@_; \$obj->frob }\n1;\n");
+# R: a ROLE -- $self is the (unknown) consuming class, so $self->consumer_method is never flagged.
+# Mojo::Base -role needs the statement-text detection; Moo::Role goes via %MOOSEY.
+$d->child('lib/R.pm')->spew_utf8("package R;\nuse Mojo::Base -role, -signatures;\nsub work (\$self) { \$self->consumer_provided }\n1;\n");
+$d->child('lib/R2.pm')->spew_utf8("package R2;\nuse Moo::Role;\nsub work { my \$self = shift; \$self->also_from_consumer }\n1;\n");
 
 my $s = App::PerlGraph::Store->new(path => $d->child('.pcg/graph.db')->stringify); $s->init;
 App::PerlGraph::Indexer->new(store => $s, root => "$d")->index_all;
 my $f = App::PerlGraph::Query->new(store => $s)->checkcalls;
+
+# role packages are flagged at extraction so checkcalls can skip them
+my ($rn)  = $s->nodes_by_qname('R');  ok +($rn->{metadata}  // {})->{role}, 'a Mojo::Base -role package is flagged metadata.role';
+my ($r2n) = $s->nodes_by_qname('R2'); ok +($r2n->{metadata} // {})->{role}, 'a Moo::Role package is flagged metadata.role';
+ok !(grep { $_->{class} eq 'R'  } @$f), 'a role $self->method (consumer-provided) is NOT flagged (Mojo::Base -role)';
+ok !(grep { $_->{class} eq 'R2' } @$f), 'a role $self->method (consumer-provided) is NOT flagged (Moo::Role)';
 
 is scalar @$f, 1,                 'exactly one broken call found (the genuine one, no false positives)';
 is $f->[0]{class},  'M',              'finding: the receiver class';
@@ -50,6 +60,12 @@ ok !$flagged{'M->greet'},      'a real method is NOT flagged';
 ok !(grep { $_->{class} eq 'E' } @$f), 'a class with an external (non-closed) MRO is NOT flagged';
 ok !(grep { $_->{class} eq 'A' } @$f), 'a class with AUTOLOAD is NOT flagged';
 ok !(grep { $_->{class} eq 'O' } @$f), 'an opaque $obj receiver (unknown class) is NOT flagged';
+
+# a `--deps`-indexed CPAN dep has an INCOMPLETE API (XS methods unseen), so checkcalls must treat
+# it as external. Simulate one by flagging M cpan: its `missing_method` must then NOT be reported.
+$s->dbh->do(q{update nodes set metadata = '{"cpan":1}' where qualified_name = 'M' and kind in ('package','class')});
+my $f2 = App::PerlGraph::Query->new(store => $s)->checkcalls;
+ok !(grep { $_->{class} eq 'M' } @$f2), 'a cpan-flagged (--deps) class is treated as external -- its missing method is NOT flagged';
 
 my $txt = App::PerlGraph::Format::checkcalls($f);
 like $txt, qr/Broken method calls/,      'format: header';

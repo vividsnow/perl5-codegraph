@@ -1,6 +1,6 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.064};
+our $VERSION = q{0.065};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify sink_type);
 use App::PerlGraph::Grammar qw(:all);
@@ -158,6 +158,7 @@ sub _handle_class ($self, $n) {
         start_line => $n->{sl}, end_line => $n->{el} });
     $self->_edge($self->{_file}{id}, $cnode->{id}, 'contains');
     $self->_packages->{$name} = $cnode;
+    $cnode->{_is_role} = 1 if ($n->{type} // '') eq NODE_ROLE;   # native/Object::Pad `role NAME {...}`
     if (my $attrs = $n->{fields}{ +F_ATTRIBUTES }) {
         for my $a (@{ $attrs->{children} }) {
             next unless $a->{type} eq NODE_ATTRIBUTE;
@@ -347,7 +348,9 @@ sub _handle_use ($self, $n) {
     }
     if ($MOOSEY{$module}) {
         if ($self->{_pkg}) { $self->{_pkg}{_moosey} = 1 } else { $self->{_moosey_file} = 1 }
+        $self->{_pkg}{_is_role} = 1 if $self->{_pkg} && $module =~ /::Role\z/;   # Moo/Moose/Mouse::Role
     }
+    $self->{_pkg}{_is_role} = 1 if $self->{_pkg} && $module eq 'Role::Tiny';     # Role::Tiny role declaration
     # `use constant FOO => ...` / `use constant { A => 1, B => 2 }` define callable
     # symbols -> constant nodes (not an import).
     if ($module eq 'constant') {
@@ -358,6 +361,9 @@ sub _handle_use ($self, $n) {
     elsif ($module eq 'parent' || $module eq 'base' || $module eq 'Mojo::Base') {
         my @bases;
         $self->_collect_strings($n, \@bases);
+        # `use Mojo::Base -role` -- the -role flag isn't collected as a plain string, so read it
+        # off the statement text (the canonical Mojolicious role declaration).
+        $self->{_pkg}{_is_role} = 1 if $self->{_pkg} && $module eq 'Mojo::Base' && ($n->{text} // '') =~ /(?<![\w-])-role\b/;
         my $via = $module eq 'Mojo::Base' ? 'mojo_base' : 'parent';
         for my $base (@bases) {
             next if $base =~ /^-/;                       # -norequire / -base / -role / -signatures
@@ -820,7 +826,10 @@ sub _handle_method_call ($self, $n, $cur_sub) {
 }
 
 sub _postprocess ($self) {
-    for my $p (values %{ $self->_packages }) { $p->{kind} = 'class' if delete $p->{_is_class} }
+    for my $p (values %{ $self->_packages }) {
+        $p->{kind} = 'class' if delete $p->{_is_class};
+        ($p->{metadata} //= {})->{role} = 1 if delete $p->{_is_role};   # a role: composed into unknown consumers
+    }
     if (my @ex = keys %{ $self->_exports }) {
         my %want = map { $_ => 1 } @ex;
         for my $node (@{ $self->_nodes }) {

@@ -1,5 +1,33 @@
 Revision history for App-PerlGraph
 
+0.065     2026-06-26
+          - Fix (found by battle-testing pcg on a real 643-file Moose/Mojo app): `pcg checkcalls` produced
+            ~755 findings on it, ~91% FALSE POSITIVES. Two systematic causes, both now fixed -- the count
+            dropped to 65:
+            * ROLES. A role's `$self` is the (unknown) CONSUMING class, so a `$self->consumer_method` call
+              inside a role is unverifiable -- but checkcalls was treating the role itself as the receiver
+              class and flagging every such call (596 of the 755). The extractor now FLAGS role packages
+              (`metadata.role`) -- recognizing `use Mojo::Base -role`, `use Moo::Role` / `Moose::Role` /
+              `Mouse::Role`, `use Role::Tiny`, and the native/Object::Pad `role NAME {...}` -- and checkcalls
+              skips a receiver that is a role. EXTRACTION_VERSION 8 -> 9 (re-index picks it up).
+            * CPAN DEPS. A `pcg index --deps`-indexed dependency has an INCOMPLETE API (its XS methods aren't
+              in the .pm), so checkcalls reporting "class Foo defines no `add`" for a vendored XS class
+              (Algorithm::BloomFilter, Mojo::UserAgent, Sereal::Encoder, ...) is wrong. checkcalls now treats
+              a `metadata.cpan`-flagged class as external (excluded from the closed-MRO test), like any other
+              uncovered external class.
+          - Fix (same battle-test): three `pcg checkargs` false-positive sources. (1) a `qw/a b c/` argument was
+            counted as ONE arg instead of its WORD COUNT, so a correct call like `$self->m(qw/x y/)` could be
+            reported as too-few-args -- it now counts the words. (2) a hash/array SLICE argument (`@h{...}` /
+            `@a[...]`) has an indeterminate element count but was counted as one arg (so `$self->m($a, @h{qw/x y z/})`
+            looked like 2 args, not 4) -- a slice now makes the call indeterminate and skipped, like a splat.
+            (3) a `$obj->method` site was matched to a same-named method in the CALLER's own package even when the
+            invocant was NOT `$self`/`$class` (e.g. `$block->provider` wrongly matched a 3-arg `Campaign::provider`)
+            -- the same-package match is now restricted to `$self`/`$class` receivers (the intra-class case it is meant for).
+          - Tests +8 (1535 total): t/88 gains role-skip (Mojo::Base -role + Moo::Role, with the role flag
+            asserted at extraction) and cpan-exclusion (a cpan-flagged class's missing method is not flagged);
+            t/94 gains the qw// word-count and the non-$self-receiver cases. Genuine bugs are still reported and
+            the existing no-false-positive guarantees hold.
+
 0.064     2026-06-25
           - New: `pcg taint` / pcg_taint (52 MCP tools) -- SOURCE -> SINK taint paths, the security flagship of
             the 8th wave and a sharper pcg_sinks. It traces a call path from a user-input SOURCE to an injectable

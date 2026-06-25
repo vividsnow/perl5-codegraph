@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.064};
+our $VERSION = q{0.065};
 use Path::Tiny qw(path);
 use Cpanel::JSON::XS ();
 use App::PerlGraph::Store;
