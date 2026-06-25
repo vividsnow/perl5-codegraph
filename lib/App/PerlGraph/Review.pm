@@ -1,6 +1,6 @@
 package App::PerlGraph::Review;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Moo;
 use App::PerlGraph::Git;
 use App::PerlGraph::Diff;
@@ -49,6 +49,48 @@ sub review ($self) {
     };
 }
 
+# A scored PR-HEALTH GATE, built on top of review(): the same change analysis, PLUS the
+# changed files linted for call bugs (checkcalls / checkargs, scoped to the touched files --
+# you should fix broken calls in code you're editing), folded into one weighted 0-100 health
+# score and a PASS / REVIEW / BLOCK verdict for CI. Each concern type deducts; the renderer
+# lists them worst-first. A heuristic signal, not a substitute for human review.
+my %PR_WEIGHT = (breaking => 15, broken => 12, arity => 10, untested => 6, wide => 4);
+
+sub pr ($self) {
+    my $rv = $self->review;
+    my $q  = App::PerlGraph::Query->new(store => $self->store);
+    my %changed = map { ($_ => 1) } @{ $rv->{files} };
+    my $diff = $rv->{diff};
+
+    my @breaking = grep { $_->{_breaking} } @{ $diff->{removed} }, @{ $diff->{changed} };
+    my @broken   = grep { $changed{ $_->{file} // '' } } @{ $q->checkcalls };
+    my @arity    = grep { $changed{ $_->{file} // '' } } @{ $q->checkargs($self->root) };
+    my $untested = $rv->{findings}{untested};
+    my $wide     = $rv->{findings}{wide};
+
+    my %count = (breaking => scalar @breaking, broken => scalar @broken, arity => scalar @arity,
+                 untested => scalar @$untested, wide => scalar @$wide);
+    my $score = 100;
+    $score -= $PR_WEIGHT{$_} * $count{$_} for keys %count;
+    $score = 0 if $score < 0;
+    my $verdict = $score >= 85 ? 'PASS' : $score >= 60 ? 'REVIEW' : 'BLOCK';
+
+    return {
+        ref      => $self->ref,
+        score    => $score,
+        verdict  => $verdict,
+        counts   => \%count,
+        breaking => \@breaking,
+        broken   => \@broken,
+        arity    => \@arity,
+        untested => $untested,
+        wide     => $wide,
+        nfiles   => scalar @{ $rv->{files} },
+        tests    => $rv->{tests},
+        affected => $rv->{affected},
+    };
+}
+
 1;
 
 __END__
@@ -63,6 +105,10 @@ Combines L<App::PerlGraph::Diff> (structural diff vs a git ref), the affected-fi
 and affected-tests closure, and current caller counts into one review report:
 what changed, what breaks (removed / re-signatured public API), and which tests to
 run. Backs C<pcg review>.
+
+C<pr> builds on C<review> to produce a scored PR-health gate: the same analysis plus
+the changed files linted for call bugs (broken / wrong-arity calls), folded into a
+weighted 0-100 score and a PASS / REVIEW / BLOCK verdict for CI. Backs C<pcg pr>.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the
 C<pcg> command for the public interface.

@@ -1,6 +1,6 @@
 package App::PerlGraph::Refactor;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Moo;
 use App::PerlGraph::Model qw(package_of);
 use App::PerlGraph::Grammar qw(:all);
@@ -469,6 +469,183 @@ sub _apply_removals ($self, $nodes) {
     return $count;
 }
 
+# The SIXTH write tool: change a plain function's parameter list and propagate it to every
+# RESOLVED call site. Two conservative operations -- add a parameter (`add => SPEC`, at 1-based
+# position `at` or appended, inserting `value` (default `undef`) at each call site) or remove
+# one (`remove => N`, dropping the Nth positional argument at each site). Function-only: a
+# method ($self/$class first param) is refused, and a `$obj->method` call site is reported to
+# the frontier, because the invocant offsets the positions and the dispatch can't be statically
+# tied. A call site whose argument list is statically indeterminate (a splat / deref / call
+# result among the args) or that doesn't reach the touched position is reported, never edited.
+# The def's signature and every call site are byte-span edits. Dry-run unless apply => 1.
+sub change_signature ($self, $target, %opt) {
+    my $s = $self->store;
+    my $both = (exists $opt{add} && defined $opt{add}) + (exists $opt{remove} && defined $opt{remove});
+    return { error => "specify --add '\$param' or --remove N" } unless $both;
+    return { error => "use either --add or --remove, not both" }                       if $both > 1;
+    my $op = defined $opt{remove} ? 'remove' : 'add';
+
+    my @defs = grep { ($_->{kind} // '') eq 'function' }
+               ($target =~ /::/ ? $s->nodes_by_qname($target) : $s->nodes_by_name($target));
+    return { error => "no plain function named '$target'" }                            unless @defs;
+    return { error => "'$target' is ambiguous (@{[ scalar @defs ]} defs) -- qualify it" } if @defs > 1;
+    my $def   = $defs[0];
+    my $qn    = $def->{qualified_name};
+    my $short = $qn =~ s/.*:://r;
+    my $sigtext = $def->{signature};
+    return { error => "$qn has no explicit signature -- change-signature needs `sub $short (\$a, \$b)` to map call-site positions" }
+        unless defined $sigtext && $sigtext =~ /\A\s*\(.*\)\s*\z/s;
+    my @params = grep { length } map { s/\A\s+|\s+\z//gr } _split_top_commas($sigtext =~ s/\A\s*\(\s*|\s*\)\s*\z//gr);
+    return { error => "$qn looks like a method (first param is \$self/\$class) -- change-signature is function-only" }
+        if @params && $params[0] =~ /\A\$(?:self|class)\b/;
+
+    my ($newparams, $pos, $value);
+    if ($op eq 'remove') {
+        $pos = $opt{remove};
+        return { error => "--remove takes a 1-based position (this signature has @{[ scalar @params ]} param(s))" }
+            unless $pos =~ /\A[1-9][0-9]*\z/ && $pos <= @params;
+        my @np = @params; splice @np, $pos - 1, 1; $newparams = \@np;
+    }
+    else {
+        my $spec = $opt{add} =~ s/\A\s+|\s+\z//gr;
+        return { error => "--add takes a parameter, e.g. '\$verbose' or '\$n = 0'" }
+            unless $spec =~ /\A[\$\@%]\w+\s*(?:=.*)?\z/s;
+        $pos = defined $opt{at} ? $opt{at} : @params + 1;
+        return { error => "--at takes a 1-based position (1..@{[ scalar @params + 1 ]})" }
+            unless $pos =~ /\A[1-9][0-9]*\z/ && $pos <= @params + 1;
+        my @np = @params; splice @np, $pos - 1, 0, $spec; $newparams = \@np;
+        $value = defined $opt{value} ? $opt{value} : 'undef';
+    }
+    my $newsig = '(' . join(', ', @$newparams) . ')';
+    # the resulting signature must obey Perl's parameter-ordering rules, or it won't compile:
+    # a slurpy (@/%) must be LAST, and a required scalar can't follow an optional (defaulted)
+    # one. Inserting `$z` after `$n = 5`, or anything after a `@rest`, would break -- so refuse
+    # rather than write a broken sub.
+    my ($opt_seen, $slurpy_seen) = (0, 0);
+    for my $p (@$newparams) {
+        return { error => "the resulting signature `$newsig` would not compile -- a slurpy (\@/%) parameter must be last" }
+            if $slurpy_seen;
+        my $is_slurpy = $p =~ /\A[\@%]/;
+        my $is_opt    = $is_slurpy || $p =~ /=/;
+        return { error => "the resulting signature `$newsig` would not compile -- a required parameter can't follow an optional one; give it a default or change the position" }
+            if $opt_seen && !$is_opt;
+        $opt_seen    ||= $is_opt;
+        $slurpy_seen ||= $is_slurpy;
+    }
+
+    my $ddisk = path($self->root)->child($def->{file_path});
+    return { error => "cannot read $def->{file_path}" } unless $ddisk->is_file;
+    my $dtree = eval { $self->parser->parse_string($ddisk->slurp_raw) } or return { error => "could not parse $def->{file_path}" };
+    my $subnode = _find_sub($dtree, $short, $def->{start_line}) or return { error => "could not locate sub $short in $def->{file_path}" };
+    my ($signode) = grep { ($_->{type} // '') eq 'signature' } @{ $subnode->{children} // [] };
+    return { error => "could not locate the signature node of $qn (re-sync the index?)" } unless $signode;
+
+    # Removing a parameter still referenced elsewhere would leave a dangling variable that no
+    # longer compiles: in the BODY (`sub f () { $x }` after dropping $x) OR in a SURVIVING
+    # parameter's default (`sub f ($x, $y = $x + 1)` after dropping $x). We can't repair either,
+    # so refuse. Match any sigil + optional brace + the name (so `${x}` interpolation forms count
+    # too, not just a bare `$x`) -- err toward refusing, since a missed use corrupts.
+    if ($op eq 'remove' and my ($var, $name) = $params[$pos - 1] =~ /\A([\$\@%](\w+))/) {
+        my ($block) = grep { ($_->{type} // '') eq NODE_BLOCK } @{ $subnode->{children} // [] };
+        my $body_uses = $block && (($block->{text} // '') =~ /[\$\@%]\{?\Q$name\E\b/);
+        my $sig_uses  = grep { /[\$\@%]\{?\Q$name\E\b/ } @$newparams;   # a surviving param's default
+        return { error => "removing parameter #$pos ($var) would leave $qn still using $var "
+                        . ($body_uses ? 'in its body' : "in another parameter's default")
+                        . " -- remove its uses (or rename the parameter) first" }
+            if $body_uses || $sig_uses;
+    }
+
+    my @edits = ({ file => $def->{file_path}, line => $signode->{sl}, def => 1,
+                   span => [ @{$signode}{qw(sl sc el ec)} ], replacement => $newsig });
+
+    my $resolver = App::PerlGraph::Resolver->new(store => $s);
+    my %files = ($def->{file_path} => 1);
+    for my $e ($s->incoming_edges($def->{id}, 'calls', 'references')) {
+        my $n = $s->node($e->{source});
+        $files{ $n->{file_path} } = 1 if $n && defined $n->{file_path};
+    }
+    $files{ $_->{file_path} } = 1
+        for $s->_rows('select distinct file_path from unresolved_refs where reference_name = ?', $short);
+
+    my @frontier;
+    for my $file (sort keys %files) {
+        my $fdisk = path($self->root)->child($file);
+        next unless $fdisk->is_file;
+        my $fsrc  = $fdisk->slurp_raw;
+        my $ftree = eval { $self->parser->parse_string($fsrc) } or next;
+        my $calls = _calls_by_pos($ftree);
+        my $out   = eval { App::PerlGraph::Extractor->new(file_path => $file, source => $fsrc)->extract($ftree) } or next;
+        for my $r (@{ $out->{refs} }) {
+            next unless ($r->{reference_name} // '') eq $short || ($r->{reference_name} // '') eq $qn;
+            if (($r->{reference_kind} // '') eq 'method_call') {
+                push @frontier, { file => $file, line => $r->{line}, why => 'method call ($obj->...) -- function-only' };
+                next;
+            }
+            my $tn = $resolver->_resolve_call($r);
+            next unless $tn && $tn->{id} eq $def->{id};                          # provably this function
+            my $call = $calls->{ "$r->{line}:$r->{col}" };
+            if (!$call) { push @frontier, { file => $file, line => $r->{line}, why => 'could not pinpoint the call expression' }; next }
+            my $argsnode = $call->{fields}{ +F_ARGUMENTS };
+            my ($new, $why) = _rewrite_args($argsnode, $op, $pos, $value);
+            if (!defined $new) { push @frontier, { file => $file, line => $r->{line}, why => $why }; next }
+            push @edits, { file => $file, line => $r->{line},
+                           span => [ @{$argsnode}{qw(sl sc el ec)} ], replacement => $new };
+        }
+    }
+
+    my $applied = $opt{apply} ? $self->_apply_inline(\@edits, undef) : 0;
+    return { target => $qn, op => $op, position => $pos, signature => $sigtext, new_signature => $newsig,
+             value => $value, edits => \@edits, frontier => \@frontier, files => [ sort keys %files ], applied => $applied };
+}
+
+# Split on top-level commas (depth-aware), so a nested `foo(1, 2)` or `[1, 2]` arg stays whole.
+sub _split_top_commas ($str) {
+    my @out; my $buf = ''; my $depth = 0;
+    for my $ch (split //, $str) {
+        if    ($ch =~ /[(\[{]/)           { $depth++;        $buf .= $ch }
+        elsif ($ch =~ /[)\]}]/)           { $depth--;        $buf .= $ch }
+        elsif ($ch eq ',' && $depth == 0) { push @out, $buf; $buf = '' }
+        else                              {                  $buf .= $ch }
+    }
+    push @out, $buf if length $buf;
+    return @out;
+}
+
+# Statically determinate top-arg count of a call's F_ARGUMENTS node, or undef if a splat /
+# deref / list-returning call among the args makes the positions ambiguous (mirrors
+# Query::_count_args, the same rule pcg_checkargs uses).
+sub _arg_count ($argsnode) {
+    return 0 unless $argsnode;
+    my @top = (($argsnode->{type} // '') eq NODE_LIST_EXPR)
+        ? grep { ($_->{type} // '') !~ /\A[[:punct:]]+\z/ } @{ $argsnode->{children} // [] }
+        : ($argsnode);
+    for my $a (@top) {
+        my $t = $a->{type} // '';
+        return undef if $t =~ /\A(?:array|hash)\z/ || $t =~ /(?:array|hash)_deref/ || $t =~ /_call_expression\z/;
+    }
+    return scalar @top;
+}
+
+# Rewrite a call's argument text for the operation, or (undef, reason) when it can't be done
+# safely (indeterminate arg list, or the call doesn't reach the touched position).
+sub _rewrite_args ($argsnode, $op, $pos, $value) {
+    my $cnt = _arg_count($argsnode);
+    return (undef, 'indeterminate argument list (a splat / deref / call-result arg) -- positions are ambiguous')
+        unless defined $cnt;
+    my @args = grep { length } map { s/\A\s+|\s+\z//gr } ($argsnode ? _split_top_commas($argsnode->{text} // '') : ());
+    return (undef, "could not split the $cnt-arg call's argument list (a string/heredoc arg with a comma the splitter can't see?)")
+        if @args != $cnt;
+    if ($op eq 'remove') {
+        return (undef, "the call passes $cnt arg(s) -- it does not reach the removed position $pos") if $cnt < $pos;
+        my @na = @args; splice @na, $pos - 1, 1;
+        return (join(', ', @na), undef);
+    }
+    return (undef, 'the call has no argument list to extend -- add the argument manually') unless $argsnode;
+    return (undef, "the call passes $cnt arg(s) -- cannot insert at position $pos") if $pos > $cnt + 1;
+    my @na = @args; splice @na, $pos - 1, 0, $value;
+    return (join(', ', @na), undef);
+}
+
 # function_call_expression nodes keyed "line:col" (their start), to map a resolved ref back
 # to the full call expression (with its byte span + argument text) for replacement.
 sub _calls_by_pos ($tree) {
@@ -559,23 +736,27 @@ __END__
 
 =head1 NAME
 
-App::PerlGraph::Refactor - graph-driven rename / move / inline / dedupe / rm codemods
+App::PerlGraph::Refactor - graph-driven rename / move / inline / dedupe / change-signature / rm codemods
 
 =head1 DESCRIPTION
 
-The five graph-driven write tools. RENAMES a function/method within its own package; MOVES
+The six graph-driven write tools. RENAMES a function/method within its own package; MOVES
 a function to another existing package (relocating its source and requalifying call sites to
 NewPkg::sub); INLINES a simple function at its call sites as a C<do { ... }> block and
 removes the definition; DEDUPEs an exact (type-1) structural clone group by keeping one
 canonical function and rewriting each byte-identical duplicate to C<sub name { goto
-&Canonical }>; or safely RMs a dead sub, cascade-removing the now-dead private helpers it
-solely used. All use the resolved call graph to locate every reference precisely and the
-resolver to decide which call sites actually target the symbol. Dynamic C<$obj-E<gt>method>
+&Canonical }>; CHANGE_SIGNATUREs a plain function by adding or removing a parameter and
+propagating it to every resolved call site; or safely RMs a dead sub, cascade-removing the
+now-dead private helpers it solely used. All use the resolved call graph to locate every
+reference precisely and the resolver to decide which call sites actually target the symbol.
+Dynamic C<$obj-E<gt>method>
 dispatch that cannot be tied to the symbol is reported, not edited; rm refuses a sub that is
-still called or exported; and dedupe refuses outright if the canonical carries a prototype or
+still called or exported; dedupe refuses outright if the canonical carries a prototype or
 C<:attribute> the C<goto> stub cannot preserve, otherwise it skips type-2 clones, methods, and
-clones whose file cannot load the canonical. Internal to L<App::PerlGraph>; driven by C<pcg rename> / C<pcg
-move> / C<pcg inline> / C<pcg dedupe> / C<pcg rm> and the matching C<pcg_*> MCP tools.
+clones whose file cannot load the canonical; and change_signature is function-only, reporting
+a method or indeterminate-argument call site rather than editing it. Internal to
+L<App::PerlGraph>; driven by C<pcg rename> / C<pcg move> / C<pcg inline> / C<pcg dedupe> /
+C<pcg change-signature> / C<pcg rm> and the matching C<pcg_*> MCP tools.
 
 =head1 AUTHOR
 

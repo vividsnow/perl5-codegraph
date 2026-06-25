@@ -1,6 +1,6 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Moo;
 use App::PerlGraph::Model qw(package_of is_public is_universal);
 use App::PerlGraph::Grammar qw(NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_LIST_EXPR F_ARGUMENTS F_FUNCTION F_METHOD);
@@ -272,6 +272,82 @@ sub hotspots ($self, %opt) {
     };
 }
 
+# Structural refactoring smells over the call graph -- the named, actionable cousins of
+# hotspots (which just ranks fan-in/out/complexity). Three classic ones, all graph-only:
+#   - feature_envy: a method that makes >= FE_MIN calls into a SINGLE other class and NONE
+#                   into its own -- it lives in the wrong place (refactor: move it to that
+#                   class). Counts RESOLVED call edges only (one per distinct callee), so
+#                   opaque $obj->method layering doesn't trigger it -- but a deliberate thin
+#                   wrapper/facade can still match, so it's a candidate to verify.
+#   - god_class:    a class with >= GC_METHODS methods AND >= GC_FANIN distinct external
+#                   callers -- doing too much and depended on widely (refactor: split it).
+#   - long_params:  a sub whose signature declares >= LP_MIN parameters (a leading $self/
+#                   $class invocant dropped) -- (refactor: introduce a parameter object).
+#                   Signature-based, so old-style my(...)=@_ subs are invisible, like checkargs.
+sub smells ($self, %opt) {
+    my $limit = $opt{limit} || 20;
+    my $s = $self->store;
+    my $FE_MIN     = $opt{fe_min}     // 4;     # feature-envy: min calls into one foreign class
+    my $GC_METHODS = $opt{gc_methods} // 20;    # god-class: min methods
+    my $GC_FANIN   = $opt{gc_fanin}   // 15;    # god-class: min distinct external callers
+    my $LP_MIN     = $opt{lp_min}     // 5;     # long-parameter-list: min params (invocant aside)
+    # `main` (the script/test namespace -- every .t shares it) and indexed CPAN deps are not
+    # classes you'd refactor, and `main` aggregates unrelated subs across files into one bogus
+    # bucket, so exclude both from the analysis (callees and candidates alike).
+    my @subs  = grep { (($_->{metadata} // {})->{cpan} ? 0 : 1)
+                    && package_of($_->{qualified_name} // $_->{name} // '') ne 'main' }
+                $s->all_nodes(qw(function method));
+    my %byid  = map { $_->{id} => $_ } @subs;
+
+    my (%foreign, %own, %fanin, %meth_count);     # src->{class}=n ; src->n ; class->{src}=1 ; class->n
+    $meth_count{ package_of($_->{qualified_name} // $_->{name} // '') }++ for @subs;
+    for my $e ($s->edges_of_kind('calls')) {
+        my $src = $byid{ $e->{source} // '' } or next;
+        my $tgt = $byid{ $e->{target} // '' } or next;
+        my $sc  = package_of($src->{qualified_name} // '');
+        my $tc  = package_of($tgt->{qualified_name} // '');
+        next unless length $sc && length $tc;
+        if ($sc eq $tc) { $own{ $src->{id} }++ }
+        else { $foreign{ $src->{id} }{$tc}++; $fanin{$tc}{ $src->{id} } = 1 }
+    }
+
+    my @envy;
+    for my $m (@subs) {
+        next if $own{ $m->{id} };                                  # touches its own class -> not envious
+        my $f = $foreign{ $m->{id} } or next;
+        my ($best) = sort { $f->{$b} <=> $f->{$a} || $a cmp $b } keys %$f;
+        next unless $f->{$best} >= $FE_MIN;
+        push @envy, { node => $m, class => package_of($m->{qualified_name} // ''),
+                      envied => $best, foreign => $f->{$best} };
+    }
+    @envy = sort { $b->{foreign} <=> $a->{foreign}
+                || ($a->{node}{qualified_name} // '') cmp ($b->{node}{qualified_name} // '') } @envy;
+
+    my @god;
+    for my $c (keys %meth_count) {
+        my $fin = scalar keys %{ $fanin{$c} // {} };
+        next unless $meth_count{$c} >= $GC_METHODS && $fin >= $GC_FANIN;
+        push @god, { class => $c, methods => $meth_count{$c}, fanin => $fin };
+    }
+    @god = sort { $b->{methods} <=> $a->{methods} || $b->{fanin} <=> $a->{fanin} || $a->{class} cmp $b->{class} } @god;
+
+    my @long;
+    for my $m (@subs) {
+        my @p = _sig_params($m->{signature} // '');
+        shift @p if @p && $p[0] =~ /\A\$(?:self|class)\z/;         # the invocant isn't a passed parameter
+        next unless @p >= $LP_MIN;
+        push @long, { node => $m, count => scalar @p, params => [@p] };
+    }
+    @long = sort { $b->{count} <=> $a->{count}
+                || ($a->{node}{qualified_name} // '') cmp ($b->{node}{qualified_name} // '') } @long;
+
+    @envy = @envy[0 .. $limit - 1] if @envy > $limit;       # cap each category at the limit
+    @god  = @god [0 .. $limit - 1] if @god  > $limit;
+    @long = @long[0 .. $limit - 1] if @long > $limit;
+    return { feature_envy => \@envy, god_class => \@god, long_params => \@long,
+             thresholds => { fe_min => $FE_MIN, gc_methods => $GC_METHODS, gc_fanin => $GC_FANIN, lp_min => $LP_MIN } };
+}
+
 # Security sinks (command / SQL execution) and which web endpoints can reach them.
 # A route's handler -> forward call closure; any reached sub with a sink edge is on
 # that endpoint's attack surface. Heuristic by call name -- a placeholdered DBI call
@@ -311,6 +387,71 @@ sub sinks ($self, %opt) {
         push @reachable, { route => $route, sinks => \@hit } if @hit;
     }
     return { reachable => \@reachable, sites => \@sites };
+}
+
+# Source -> sink TAINT PATHS: trace a call path from a user-input SOURCE to an injectable
+# SINK. Sharper than pcg_sinks (which only does route->sink reachability): the sources are
+# broader -- a route handler (endpoint) OR any sub that calls a request accessor (param /
+# params / cookie(s) / upload(s) / header(s) / query_parameters / body_parameters /
+# route_parameters) -- and only DYNAMIC sinks
+# (whose command/SQL string is built from a variable -- the injectable ones) are targets, with
+# the actual call PATH shown. It is call-graph reachability, NOT value-flow: it proves user
+# input can REACH the sink's sub, not that the specific tainted value lands in the sink's
+# argument -- so a hit is a path to VERIFY (a `local` hit, source and sink in the SAME sub, is
+# the highest-confidence). $ENV / @ARGV / STDIN sources are not yet detected (a known gap).
+my %TAINT_SOURCE_CALLS = map { $_ => 1 } qw(
+    param params cookie cookies upload uploads header headers
+    query_parameters body_parameters route_parameters);
+sub taint ($self, %opt) {
+    my $s = $self->store;
+    my %sink;                                                 # sub id -> [ {type,name} ] (DYNAMIC sinks only)
+    for my $e ($s->edges_of_kind('sink')) {
+        my $m = $e->{metadata} // {};
+        next unless defined $e->{source} && $m->{dynamic};
+        push @{ $sink{ $e->{source} } }, { type => $m->{sink} // '?', name => $m->{name} // '?' };
+    }
+    return { paths => [], sinks => 0, sources => 0 } unless %sink;
+
+    my %source;                                               # sub id -> { kind, detail }
+    for my $route ($s->all_nodes('route')) {                  # endpoints: user input enters here
+        my ($he) = grep { (($_->{metadata} // {})->{via} // '') eq 'route' } $s->outgoing_edges($route->{id}, 'references');
+        $source{ $he->{target} } //= { kind => 'endpoint', detail => $route->{name} // 'route' } if $he && $he->{target};
+    }
+    for my $ref ($s->all_unresolved) {                        # subs that read a request accessor
+        my $nm = $ref->{reference_name} // '';
+        $source{ $ref->{from_node_id} } //= { kind => 'request', detail => $nm }
+            if $TAINT_SOURCE_CALLS{$nm} && $ref->{from_node_id};
+    }
+    return { paths => [], sinks => scalar keys %sink, sources => 0 } unless %source;
+
+    my @paths;                                                # forward BFS from each source to the nearest sinks
+    for my $src (sort keys %source) {
+        my %seen = ($src => 1); my @q = ([ $src ]); my $depth = 40; my %hit;
+        while (@q && $depth-- > 0) {
+            my @next;
+            for my $path (@q) {
+                my $id = $path->[-1];
+                push @paths, { source => $source{$src}, ids => [ @$path ], sinks => $sink{$id},
+                               local => ($id eq $src ? 1 : 0) }
+                    if $sink{$id} && !$hit{$id}++;
+                for my $e ($s->outgoing_edges($id, 'calls', 'references')) {
+                    push @next, [ @$path, $e->{target} ] if $e->{target} && !$seen{ $e->{target} }++;
+                }
+            }
+            @q = @next;
+        }
+    }
+    for my $p (@paths) {                                      # resolve ids -> qnames once, at the end
+        $p->{path}     = [ map { my $n = $s->node($_); $n ? ($n->{qualified_name} // $n->{name} // '?') : '?' } @{ $p->{ids} } ];
+        $p->{src_sub}  = $p->{path}[0];
+        $p->{sink_sub} = $p->{path}[-1];
+        delete $p->{ids};
+    }
+    @paths = sort { $b->{local} <=> $a->{local} || @{ $a->{path} } <=> @{ $b->{path} }
+                 || $a->{src_sub} cmp $b->{src_sub} || $a->{sink_sub} cmp $b->{sink_sub} } @paths;
+    my $limit = $opt{limit} || 50;
+    @paths = @paths[0 .. $limit - 1] if @paths > $limit;
+    return { paths => \@paths, sinks => scalar keys %sink, sources => scalar keys %source };
 }
 
 # A codebase orientation map for first contact with an unfamiliar project: scale,
@@ -879,6 +1020,25 @@ sub dead_exports ($self) {
         push @out, $n unless $live;
     }
     return [ sort { ($a->{qualified_name} // '') cmp ($b->{qualified_name} // '') } @out ];
+}
+
+# A one-call cleanup dashboard: the codebase's actionable tech-debt, each bucket paired with
+# the WRITE tool that fixes it. Graph-only, so it runs anywhere. Three disjoint buckets:
+#   - removable:   unreferenced, NON-exported subs `pcg rm` can delete outright (rm also
+#                  cascades to the private helpers they solely used). Exported dead code is
+#                  deliberately excluded here -- rm refuses exported subs -- and surfaces in:
+#   - retractable: exported subs no OTHER in-repo package uses (pcg dead_exports) -- stop
+#                  exporting first, then remove. Disjoint from `removable` (that is non-exported).
+#   - clones:      structural duplicate groups `pcg dedupe` can collapse (the type-1 ones).
+# A survey, not an apply: it names the exact follow-up commands but changes nothing itself.
+sub tidy ($self, %opt) {
+    my @removable = sort { ($a->{qualified_name} // '') cmp ($b->{qualified_name} // '') }
+                    grep { !$_->{is_exported} } $self->unused;
+    return {
+        removable   => \@removable,
+        retractable => $self->dead_exports,
+        clones      => $self->duplication(%opt),
+    };
 }
 
 # A one-call code-health snapshot for triage / release: composes the analyses into

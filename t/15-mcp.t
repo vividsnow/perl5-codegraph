@@ -20,7 +20,7 @@ is $mcp0->dispatch({ jsonrpc => '2.0', method => 'notifications/initialized' }),
 # --- tools/list ---
 my $tl = $mcp0->dispatch({ jsonrpc => '2.0', id => 2, method => 'tools/list' });
 my @tools = @{ $tl->{result}{tools} };
-is scalar(@tools), 47, 'forty-seven tools (39 read + 5 write + index / sync / status)';
+is scalar(@tools), 52, 'fifty-two tools (43 read + 6 write + index / sync / status)';
 ok( (grep { $_->{name} eq 'pcg_callers'  } @tools), 'pcg_callers listed' );
 ok( (grep { $_->{name} eq 'pcg_hotspots' } @tools), 'pcg_hotspots listed' );
 ok( (grep { $_->{name} eq 'pcg_untested' } @tools), 'pcg_untested listed' );
@@ -108,7 +108,7 @@ like _call('pcg_covers',  { symbol => 'P::help' }), qr/Tests covering P::help/, 
 like _call('pcg_overview', {}),                     qr/Codebase map/,                 'pcg_overview dispatches';
 like _call('pcg_sinks',    {}),                     qr/Security sinks/,               'pcg_sinks dispatches';
 like _call('pcg_rename', { old => 'No::Such', new => 'x' }), qr/no function/i,        'pcg_rename dispatches (handler wiring + error path)';
-# the 6 sixth-wave tools dispatch through tools/call (handler wiring, not just Query/Format)
+# the quality + codemod tools dispatch through tools/call (handler wiring, not just Query/Format)
 like _call('pcg_checkcalls',  {}),                  qr/Broken method calls/,          'pcg_checkcalls dispatches';
 like _call('pcg_checkargs',   {}),                  qr/Wrong-arity calls/,            'pcg_checkargs dispatches';
 like _call('pcg_doccheck',    {}),                  qr/Stale POD/,                    'pcg_doccheck dispatches';
@@ -121,6 +121,13 @@ like _call('pcg_dedupe', { target => 'No::Such' }), qr/no plain function/,      
 like _call('pcg_rm', { target => 'No::Such' }), qr/no function.method/,               'pcg_rm dispatches (handler wiring + error path)';
 like _call('pcg_suggest_reviewers', {}),            qr/`ref` is required|needs git/i, 'pcg_suggest_reviewers dispatches (ref/git guard)';
 like _call('pcg_changelog', {}),                    qr/`ref` is required|git work tree/i, 'pcg_changelog dispatches (ref/git guard)';
+# the eighth-wave tools dispatch through tools/call (handler wiring, not just Query/Format)
+like _call('pcg_tidy',   {}),                       qr/Tidy -- cleanup opportunities/, 'pcg_tidy dispatches';
+like _call('pcg_smells', {}),                       qr/Refactoring smells/,           'pcg_smells dispatches';
+like _call('pcg_taint',  {}),                       qr/Taint paths/,                  'pcg_taint dispatches';
+like _call('pcg_pr', {}),                           qr/`ref` is required|needs git/i, 'pcg_pr dispatches (ref/git guard)';
+like _call('pcg_change_signature', { target => 'No::Such', remove => 1 }), qr/no plain function/,
+     'pcg_change_signature dispatches (handler wiring + error path)';
 like _call('pcg_search', { query => 'run', semantic => 1 }), qr/Semantic search/,      'pcg_search semantic:true routes to the semantic handler (not keyword)';
 like _call('pcg_unresolved', {}),                   qr/Unresolved method calls/,       'pcg_unresolved dispatches';
 like _call('pcg_resolve', { resolutions => [] }),   qr/applied 0/,                     'pcg_resolve dispatches (empty input)';

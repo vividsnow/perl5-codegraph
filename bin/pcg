@@ -38,7 +38,7 @@ pcg - Perl code knowledge graph for AI agents
     pcg hotspots [--limit N] [path]   call-graph fan-in / fan-out / complexity / coupling leaders
     pcg risk [--limit N] [--since REF] [path]   git churn x fan-in (top refactor/test risk)
     pcg cochange [--min-support N] [--limit N] [--max-files N] [path]   files that change together
-    pcg diff <ref> / review <ref> [path]   structural diff / one-call PR review vs a git ref
+    pcg diff <ref> / review <ref> / pr <ref> [path]   structural diff / one-call PR review / scored CI gate
     pcg api <module> / covers <symbol> [path]   public surface / tests covering a symbol
     pcg unresolved [--name M] [--limit N] [--by-receiver] [path]   opaque $obj->method calls
                                               (--by-receiver groups by receiver + suggests its class)

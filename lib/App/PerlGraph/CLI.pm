@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Path::Tiny qw(path);
 use Cpanel::JSON::XS ();
 use App::PerlGraph::Store;
@@ -78,6 +78,10 @@ usage: pcg <command> [args] [path]
                         (the actionable starting point for untested / undocumented subs)
   duplication [--limit N] [--min-nodes N]   structural code clones: subs with an identical body shape
                         (type-1/2; names + literals aside) -- extract-a-shared-helper candidates
+  tidy [--limit N] [--min-nodes N]   one cleanup dashboard: removable dead code (-> rm),
+                        retractable exports, and clone groups (-> dedupe), each with its fix command
+  smells [--limit N]    structural refactoring smells: feature-envy (move-method), god-class (split),
+                        long-parameter-list (parameter object) -- the named cousins of hotspots
   hotspots [--limit N]  fan-in (+ blast radius), fan-out, cyclomatic-complexity, and most-coupled-module leaders
   risk [--limit N] [--since REF]   git churn x fan-in: frequently-changed + widely-depended-upon code
         (--since REF: count only churn from commits since REF -- risk on the current branch)
@@ -86,11 +90,15 @@ usage: pcg <command> [args] [path]
   suggest-reviewers <ref>   who should review the change vs <ref>: authors of the changed files,
                         ranked by how much of that code they wrote (git authorship x the diff)
   sinks                 command/SQL execution sites + which web endpoints reach them (attack surface)
+  taint [--limit N]     source -> sink paths: a user-input source (endpoint / request accessor) whose
+                        call graph reaches a dynamically-built command/SQL sink (reachability, to verify)
   diff <ref>            structural diff vs a git ref: added/removed/re-signatured symbols (+ breaking)
   semver <ref>          recommend a major/minor/patch bump from the diff (breaking->major, new public->minor)
   changelog <ref>       draft a Changes-style entry from the structural diff (added/removed/changed + bump)
   review <ref>          PR review: diff + blast radius + tests to run + breaking changes
                         + findings (untested public changes / wide blast radius), in one report
+  pr <ref>              SCORED PR-health gate: review + changed-file call-lint, folded into a
+                        0-100 score + PASS/REVIEW/BLOCK verdict (for CI) with concerns worst-first
   api <module>          a module's public/exported surface
   covers <symbol>       which tests exercise a symbol (reverse of affected --tests)
   unresolved [--name M] [--limit N] [--by-receiver]   opaque $obj->method calls with
@@ -104,6 +112,9 @@ usage: pcg <command> [args] [path]
                         remove the definition (dry-run; refuses unsafe bodies, reports method-call sites)
   dedupe <Pkg::sub> [--apply] [path]   de-duplicate a clone group: keep <Pkg::sub> canonical, rewrite each
                         EXACT-duplicate function to `{ goto &<Pkg::sub> }` (dry-run; type-2/methods reported)
+  change-signature <Pkg::func> (--add '$p [= dflt]' [--at N] [--value EXPR] | --remove N) [--apply] [path]
+                        add/remove a plain function's parameter + propagate to every resolved call site
+                        (function-only; dry-run; indeterminate/method call sites reported, not edited)
   rm <Pkg::sub> [--apply] [path]   safely DELETE a dead sub + cascade-remove the now-dead private helpers it
                         solely used (refuses if it's still called or exported; dry-run by default)
   export [--format dot|mermaid|json|html] [--around SYM] [--depth N]   render the graph
@@ -145,6 +156,8 @@ sub run ($class, @argv) {
         checkcalls => \&_cmd_checkcalls,
         checkargs  => \&_cmd_checkargs,
         doccheck   => \&_cmd_doccheck,
+        tidy       => \&_cmd_tidy,
+        smells     => \&_cmd_smells,
         scaffold   => \&_cmd_scaffold,
         duplication => \&_cmd_duplication,
         metrics   => \&_cmd_metrics,
@@ -152,11 +165,13 @@ sub run ($class, @argv) {
         undocumented => \&_cmd_undocumented,
         overview  => \&_cmd_overview,
         sinks     => \&_cmd_sinks,
+        taint     => \&_cmd_taint,
         prereqs   => \&_cmd_prereqs,
         rename    => \&_cmd_rename,
         move      => \&_cmd_move,
         inline    => \&_cmd_inline,
         dedupe    => \&_cmd_dedupe,
+        'change-signature' => \&_cmd_change_signature,
         rm        => \&_cmd_rm,
         hotspots  => \&_cmd_hotspots,
         risk      => \&_cmd_risk,
@@ -167,6 +182,7 @@ sub run ($class, @argv) {
         semver    => \&_cmd_semver,
         changelog => \&_cmd_changelog,
         review    => \&_cmd_review,
+        pr        => \&_cmd_pr,
         api       => \&_cmd_api,
         covers    => \&_cmd_covers,
         unresolved => \&_cmd_unresolved,
@@ -489,6 +505,36 @@ sub _cmd_duplication (@args) {
     return 0;
 }
 
+sub _cmd_tidy (@args) {
+    my (%opt, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--limit') { $opt{limit} = shift @args;
+            return _usage() unless defined $opt{limit} && $opt{limit} =~ /^\d+$/ && $opt{limit} >= 1 }
+        elsif ($a eq '--min-nodes') { $opt{min_nodes} = shift @args;
+            return _usage() unless defined $opt{min_nodes} && $opt{min_nodes} =~ /^\d+$/ && $opt{min_nodes} >= 1 }
+        else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my $q = _query($pos[0] // '.') or return 1;
+    print App::PerlGraph::Format::tidy($q->tidy(%opt));
+    return 0;
+}
+
+sub _cmd_smells (@args) {
+    my (%opt, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--limit') { $opt{limit} = shift @args;
+            return _usage() unless defined $opt{limit} && $opt{limit} =~ /^\d+$/ && $opt{limit} >= 1 }
+        else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my $q = _query($pos[0] // '.') or return 1;
+    print App::PerlGraph::Format::smells($q->smells(%opt));
+    return 0;
+}
+
 sub _cmd_rename (@args) {
     my ($apply, @pos);
     while (@args) {
@@ -557,6 +603,28 @@ sub _cmd_dedupe (@args) {
     return $plan->{error} ? 1 : 0;
 }
 
+sub _cmd_change_signature (@args) {
+    my (%opt, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if    ($a eq '--apply')  { $opt{apply}  = 1 }
+        elsif ($a eq '--add')    { $opt{add}    = shift @args; return _usage() unless defined $opt{add} }
+        elsif ($a eq '--remove') { $opt{remove} = shift @args; return _usage() unless defined $opt{remove} }
+        elsif ($a eq '--at')     { $opt{at}     = shift @args; return _usage() unless defined $opt{at} }
+        elsif ($a eq '--value')  { $opt{value}  = shift @args; return _usage() unless defined $opt{value} }
+        else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my ($target, $root) = @pos;
+    return _usage() unless defined $target && length $target;
+    my $q = _query($root // '.') or return 1;
+    require App::PerlGraph::Refactor;
+    my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
+        ->change_signature($target, %opt);
+    print App::PerlGraph::Format::change_signature($plan);
+    return $plan->{error} ? 1 : 0;
+}
+
 sub _cmd_rm (@args) {
     my ($apply, @pos);
     while (@args) {
@@ -578,6 +646,20 @@ sub _cmd_sinks (@args) {
     return _usage() if grep { /^--/ } @args;
     my $q = _query($args[0] // '.') or return 1;
     print App::PerlGraph::Format::sinks($q->sinks);
+    return 0;
+}
+
+sub _cmd_taint (@args) {
+    my (%opt, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--limit') { $opt{limit} = shift @args;
+            return _usage() unless defined $opt{limit} && $opt{limit} =~ /^\d+$/ && $opt{limit} >= 1 }
+        else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my $q = _query($pos[0] // '.') or return 1;
+    print App::PerlGraph::Format::taint($q->taint(%opt));
     return 0;
 }
 
@@ -682,6 +764,22 @@ sub _cmd_review (@args) {
     require App::PerlGraph::Review;
     my $rv = App::PerlGraph::Review->new(root => $root, ref => $ref, parser => $parser, store => $q->store)->review;
     print App::PerlGraph::Format::review($rv);
+    return 0;
+}
+
+sub _cmd_pr (@args) {
+    return _usage() if grep { /^--/ } @args;
+    my ($ref, $root) = @args;
+    return _usage() unless defined $ref && length $ref;
+    $root //= '.';
+    my $q = _query($root) or return 1;                 # checkcalls/affected/callers need the index
+    require App::PerlGraph::Git;
+    my $git = App::PerlGraph::Git->new(root => $root);
+    unless ($git->available) { print STDERR "Not a git repository: $root (pr needs git).\n"; return 1 }
+    my $parser = eval { App::PerlGraph::Parser->new } or do { print STDERR "parser unavailable: $@"; return 1 };
+    require App::PerlGraph::Review;
+    my $r = App::PerlGraph::Review->new(root => $root, ref => $ref, parser => $parser, store => $q->store)->pr;
+    print App::PerlGraph::Format::pr($r);
     return 0;
 }
 
@@ -848,8 +946,8 @@ App::PerlGraph::CLI - the pcg command-line dispatcher
 Parses @ARGV and dispatches to the pcg subcommands: index, sync, watch, the
 read queries (overview, metrics, search, node, explain, explore, callers, callees, impact,
 path, affected, unused, untested, undocumented, dead-exports, deps, cycles, layers, checkcalls,
-checkargs, doccheck, scaffold, duplication, prereqs, hotspots, risk, cochange, owners, suggest-reviewers, sinks,
-diff, semver, changelog, review, api, covers, unresolved), the graph-driven rename / move / inline / dedupe / rm codemods,
+checkargs, doccheck, scaffold, duplication, tidy, smells, prereqs, hotspots, risk, cochange, owners, suggest-reviewers, sinks, taint,
+diff, semver, changelog, review, pr, api, covers, unresolved), the graph-driven rename / move / inline / dedupe / change-signature / rm codemods,
 export, status, serve and install/uninstall.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the

@@ -1,6 +1,6 @@
 package App::PerlGraph::Indexer;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Moo;
 use Digest::SHA qw(sha1_hex);
 use Path::Iterator::Rule;

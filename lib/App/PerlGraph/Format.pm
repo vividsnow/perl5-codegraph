@@ -1,6 +1,6 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use App::PerlGraph::Source;
 use App::PerlGraph::Model qw(package_of is_public);
 use Cpanel::JSON::XS ();
@@ -206,6 +206,121 @@ sub dead_exports ($nodes) {
         . " (or kept only for external/downstream consumers, which the graph can't see):\n\n";
     $out .= sprintf "- `%s` (%s) -- %s\n", $_->{qualified_name} // $_->{name}, $_->{kind}, _loc($_) for @$nodes;
     $out .= "\n(verify a symbol isn't part of your public CPAN API before removing it from the export list.)\n";
+    return $out;
+}
+
+sub tidy ($r) {
+    my ($rm, $ret, $cl) = ($r->{removable}, $r->{retractable}, $r->{clones});
+    my $total = @$rm + @$ret + @$cl;
+    my $out = "## Tidy -- cleanup opportunities\n\n";
+    return $out . "_nothing to tidy_ -- no removable dead code, retractable exports, or structural clones.\n"
+        unless $total;
+    $out .= "$total cleanup opportunit" . ($total == 1 ? 'y' : 'ies')
+          . ", each paired with the command that fixes it (a survey -- nothing is changed):\n\n";
+    if (@$rm) {
+        $out .= '### Removable dead code (' . scalar(@$rm) . ") -- `pcg rm <name>`\n\n";
+        $out .= "Unreferenced, non-exported subs; `pcg rm` deletes each (cascading to the private helpers it solely used):\n\n";
+        $out .= sprintf "- `%s` (%s) -- %s\n", $_->{qualified_name} // $_->{name}, $_->{kind}, _loc($_) for @$rm;
+        $out .= "\n";
+    }
+    if (@$ret) {
+        $out .= '### Retractable exports (' . scalar(@$ret) . ") -- drop from \@EXPORT, then `pcg rm`\n\n";
+        $out .= "Exported, but no OTHER in-repo package uses them (verify no external consumer first):\n\n";
+        $out .= sprintf "- `%s` (%s) -- %s\n", $_->{qualified_name} // $_->{name}, $_->{kind}, _loc($_) for @$ret;
+        $out .= "\n";
+    }
+    if (@$cl) {
+        $out .= '### Clone groups (' . scalar(@$cl) . ") -- `pcg dedupe <name>`\n\n";
+        $out .= "Subs sharing an identical body structure; `pcg dedupe` collapses the exact (type-1) ones to a single canonical:\n\n";
+        my $i = 0;
+        for my $g (@$cl) {
+            $out .= sprintf "%d. **%d copies**, ~%d AST nodes each -- e.g. `pcg dedupe %s`:\n",
+                ++$i, $g->{count}, $g->{nodes}, $g->{members}[0]{qualified_name} // $g->{members}[0]{name};
+            $out .= sprintf "   - `%s`\n", $_->{qualified_name} // $_->{name} for @{ $g->{members} };
+        }
+        $out .= "\n";
+    }
+    $out .= "(dead-code and clone detection don't see dynamic dispatch or downstream consumers -- review each before applying.)\n";
+    return $out;
+}
+
+sub smells ($r) {
+    my ($fe, $gc, $lp) = ($r->{feature_envy}, $r->{god_class}, $r->{long_params});
+    my $t = $r->{thresholds} // {};
+    my $bar = sprintf 'thresholds: feature-envy >= %d foreign calls, god-class >= %d methods & >= %d external callers, long-param >= %d params',
+        $t->{fe_min} // 4, $t->{gc_methods} // 20, $t->{gc_fanin} // 15, $t->{lp_min} // 5;
+    my $out = "## Refactoring smells (structural)\n\n";
+    return $out . "_none found_ -- no feature-envy, god-class, or long-parameter-list smells above the\n"
+        . "current $bar. (A smaller codebase legitimately has few; the defaults are tuned to avoid flagging\n"
+        . "normal small classes.)\n"
+        unless @$fe || @$gc || @$lp;
+    if (@$gc) {
+        $out .= "### God class (" . scalar(@$gc) . ") -- large + widely depended-upon (consider splitting)\n\n";
+        $out .= sprintf "- `%s` -- %d methods, %d external caller(s)\n", $_->{class}, $_->{methods}, $_->{fanin} for @$gc;
+        $out .= "\n";
+    }
+    if (@$fe) {
+        $out .= "### Feature envy (" . scalar(@$fe) . ") -- a method more interested in another class (consider moving)\n\n";
+        $out .= sprintf "- `%s` -- calls %d distinct method(s) of `%s` and none of its own `%s` (move to `%s`?)\n",
+            $_->{node}{qualified_name} // $_->{node}{name}, $_->{foreign}, $_->{envied}, $_->{class}, $_->{envied} for @$fe;
+        $out .= "\n";
+    }
+    if (@$lp) {
+        $out .= "### Long parameter list (" . scalar(@$lp) . ") -- many parameters (consider a parameter object)\n\n";
+        $out .= sprintf "- `%s` -- %d params: %s\n",
+            $_->{node}{qualified_name} // $_->{node}{name}, $_->{count}, join(', ', map { "`$_`" } @{ $_->{params} }) for @$lp;
+        $out .= "\n";
+    }
+    $out .= "($bar.\n"
+          . "Heuristic, from RESOLVED call edges + signatures: feature-envy can flag a deliberate facade,"
+          . " long-param skips old-style my(...)=\@_ subs. Verify before refactoring.)\n";
+    return $out;
+}
+
+sub _pr_sym ($s) { $s->{new} ? $s->{new}{qualified_name} // $s->{new}{name} : $s->{qualified_name} // $s->{name} }
+sub pr ($r) {
+    my $c = $r->{counts};
+    my $out = sprintf "## PR health: %s (%d/100) vs `%s`\n\n", $r->{verdict}, $r->{score}, $r->{ref};
+    return $out . "_no structural changes vs `$r->{ref}`_ -- nothing to gate.\n" unless $r->{nfiles};
+    my $total = $c->{breaking} + $c->{broken} + $c->{arity} + $c->{untested} + $c->{wide};
+    $out .= sprintf "%d changed file(s); %s.\n\n", $r->{nfiles},
+        ($total ? "$total concern(s) below (worst-first)" : 'no concerns flagged');
+    if (@{ $r->{breaking} }) {
+        $out .= "### Breaking changes (" . scalar(@{ $r->{breaking} }) . ") -- removed / re-signatured public API\n\n";
+        $out .= sprintf "- `%s` (%s)%s\n", _pr_sym($_), ($_->{new} ? $_->{new}{kind} : $_->{kind}),
+            ($_->{new} ? ' -- signature changed' : ' -- removed') for @{ $r->{breaking} };
+        $out .= "\n";
+    }
+    if (@{ $r->{broken} }) {
+        $out .= "### Broken calls in changed files (" . scalar(@{ $r->{broken} }) . ") -- likely bugs\n\n";
+        $out .= sprintf "- `%s` calls `->%s` on `%s`, which doesn't define it -- %s:%s\n",
+            $_->{caller}, $_->{method}, $_->{class}, $_->{file} // '?', $_->{line} // '?' for @{ $r->{broken} };
+        $out .= "\n";
+    }
+    if (@{ $r->{arity} }) {
+        $out .= "### Wrong-arity calls in changed files (" . scalar(@{ $r->{arity} }) . ")\n\n";
+        $out .= sprintf "- `%s` -- %s:%s\n", $_->{callee} // $_->{name} // '?', $_->{file} // '?', $_->{line} // '?'
+            for @{ $r->{arity} };
+        $out .= "\n";
+    }
+    if (@{ $r->{untested} }) {
+        $out .= "### Untested public changes (" . scalar(@{ $r->{untested} }) . ") -- no test reaches them\n\n";
+        $out .= sprintf "- `%s` (%s)\n", $_->{qualified_name} // $_->{name}, $_->{kind} for @{ $r->{untested} };
+        $out .= "\n";
+    }
+    if (@{ $r->{wide} }) {
+        $out .= "### Wide blast radius (" . scalar(@{ $r->{wide} }) . ") -- touched public symbol many still call\n\n";
+        $out .= sprintf "- `%s` (%s) -- %d caller(s)\n", $_->{qualified_name} // $_->{name}, $_->{kind}, $_->{_callers} // 0
+            for @{ $r->{wide} };
+        $out .= "\n";
+    }
+    if (@{ $r->{tests} }) {
+        my @t = @{ $r->{tests} };
+        $out .= sprintf "**Run %d affected test(s):** %s\n\n", scalar @t,
+            join(', ', map { "`$_`" } @t[0 .. ($#t < 9 ? $#t : 9)]) . ($#t > 9 ? ' ...' : '');
+    }
+    $out .= "(score: 100 minus 15/breaking, 12/broken-call, 10/wrong-arity, 6/untested, 4/wide-blast."
+          . " >=85 PASS, 60-84 REVIEW, <60 BLOCK. Heuristic gate -- not a substitute for human review.)\n";
     return $out;
 }
 
@@ -796,6 +911,36 @@ sub rm ($r) {
     return $out;
 }
 
+sub change_signature ($r) {
+    return "## Change signature\n\n**error**: $r->{error}\n" if $r->{error};
+    my $verb = $r->{op} eq 'remove' ? "remove parameter \#$r->{position}" : "add parameter at \#$r->{position}";
+    my $out  = "## Change signature `$r->{target}` -- $verb\n\n";
+    $out .= "`$r->{signature}` -> `$r->{new_signature}`\n\n";
+    my $files = scalar @{ $r->{files} };
+    my @sites = grep { !$_->{def} } @{ $r->{edits} };
+    if ($r->{applied}) {
+        $out .= "Applied **$r->{applied}** edit(s) (the definition + "
+              . scalar(@sites) . " call site(s)) across $files file(s). Run `pcg sync` to refresh the graph.\n\n";
+    }
+    else {
+        $out .= scalar(@{ $r->{edits} }) . " edit(s) planned across $files file(s) (dry run -- add `--apply` / apply:true to write):\n";
+        my %byf; push @{ $byf{ $_->{file} } }, $_ for @{ $r->{edits} };
+        for my $f (sort keys %byf) {
+            $out .= "- `$f`\n";
+            $out .= sprintf "    L%d  %s-> `%s`\n", $_->{line}, ($_->{def} ? 'signature ' : 'call '), $_->{replacement}
+                for sort { $a->{line} <=> $b->{line} } @{ $byf{$f} };
+        }
+        $out .= "\n";
+    }
+    if (@{ $r->{frontier} }) {
+        $out .= "**Manual review** -- " . scalar(@{ $r->{frontier} })
+              . " call site(s) the codemod would not touch (a `\$obj->method` dispatch, or an indeterminate"
+              . " argument list it can't position-map):\n";
+        $out .= sprintf "- `%s` L%d -- %s\n", $_->{file}, $_->{line}, $_->{why} for @{ $r->{frontier} };
+    }
+    return $out;
+}
+
 sub sinks ($r) {
     my $out = "## Security sinks -- command / SQL execution\n\n";
     return $out . "_none found_ (no system/exec or DBI do/execute/select* calls)\n" unless @{ $r->{sites} };
@@ -816,6 +961,30 @@ sub sinks ($r) {
     }
     $out .= "\n(**[dynamic]** = the command/SQL string is built from a variable (interpolated or concatenated) -- the\n"
           . "injection-shaped sites to VERIFY. Unmarked sinks pass a constant or use placeholders, and are safe.)\n";
+    return $out;
+}
+
+sub taint ($r) {
+    my $out = "## Taint paths -- user input -> injectable sink\n\n";
+    return $out . "_no dynamic sinks found_ (no command/SQL site builds its argument from a variable).\n"
+        unless $r->{sinks};
+    return $out . "_$r->{sinks} dynamic sink(s) found, but no user-input source reaches any of them._"
+        . " (sources looked for: web endpoints + request accessors -- param / params / cookie(s) /"
+        . " upload(s) / header(s) / query_parameters / body_parameters / route_parameters.)\n"
+        unless @{ $r->{paths} };
+    $out .= scalar(@{ $r->{paths} }) . " taint path(s) -- a user-input source whose call graph REACHES a"
+          . " dynamically-built command/SQL sink ($r->{sources} source(s), $r->{sinks} dynamic sink(s)):\n\n";
+    for my $p (@{ $r->{paths} }) {
+        my $src = $p->{source}{kind} eq 'endpoint' ? "endpoint `$p->{source}{detail}`"
+                                                   : "reads `->$p->{source}{detail}`";
+        my $sinks = join(', ', map { "$_->{type}:$_->{name}" } @{ $p->{sinks} });
+        $out .= sprintf "- %s%s\n", ($p->{local} ? '**[local]** ' : ''), $src;
+        $out .= '    ' . join(' -> ', map { "`$_`" } @{ $p->{path} }) . "\n";
+        $out .= "    sink: **$sinks**" . ($p->{local} ? " (read and used in the SAME sub -- highest confidence)\n" : "\n");
+    }
+    $out .= "\n(call-graph REACHABILITY, not value-flow: it proves input can reach the sink's sub, not that the\n"
+          . "tainted value lands in the sink's argument -- VERIFY each. A **[local]** hit is the strongest. \$ENV /\n"
+          . "\@ARGV / STDIN sources are not yet detected.)\n";
     return $out;
 }
 

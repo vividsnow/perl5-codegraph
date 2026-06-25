@@ -1,5 +1,110 @@
 Revision history for App-PerlGraph
 
+0.064     2026-06-25
+          - New: `pcg taint` / pcg_taint (52 MCP tools) -- SOURCE -> SINK taint paths, the security flagship of
+            the 8th wave and a sharper pcg_sinks. It traces a call path from a user-input SOURCE to an injectable
+            SINK: the sources are broader than pcg_sinks' routes -- a web endpoint OR any sub that calls a request
+            accessor (param / cookie / upload / headers / query_parameters / body_parameters) -- and only DYNAMIC
+            sinks (whose command/SQL string is built from a variable, i.e. the injectable ones) are targets, with
+            the actual call PATH shown (source -> ... -> sink). A `[local]` hit (source and sink in the SAME sub)
+            is ranked first as the highest-confidence. IMPORTANT: this is call-graph REACHABILITY, not value-flow
+            -- it proves user input can REACH the sink's sub, not that the specific tainted value lands in the
+            sink's argument, so each path is a lead to VERIFY, not a confirmed vulnerability (and $ENV / @ARGV /
+            STDIN sources are not yet detected). New Query::taint (dynamic-sink edges + source classification +
+            forward BFS over the call graph); Format::taint; CLI `pcg taint`. Closes the 8th wave (deeper
+            analysis & action: tidy, smells, pr, change-signature, taint).
+          - Fixes (found by the pre-release review loop dogfooding `change-signature` -- it must never write
+            non-compiling Perl): three ways it could produce an invalid sub now REFUSE instead.
+            (1) `--remove` of a parameter still referenced in the BODY (`sub f () { $x }` after dropping `$x`) --
+            the check spans every sigil + the braced `${x}` interpolation form. (2) `--remove` of a parameter
+            still referenced in a SURVIVING parameter's DEFAULT (`sub f ($x, $y = $x + 1)` after dropping `$x`).
+            (3) any edit whose resulting signature violates Perl's parameter ordering -- a required parameter
+            after an optional one (`($a, $b = 5, $c)`), or anything after a slurpy (a `@rest`/`%opts` must be
+            last). Each refusal explains how to proceed (remove the uses, rename, give a default, or reorder),
+            consistent with the other write tools' refuse-when-unsafe stance. t/103 gains a `perl -c` regression
+            guard on the applied result and refusal tests for all five cases.
+          - Tests +44 (1528 total): t/104 (+17: a cross-sub path handler -> run_cmd to a dynamic system() sink,
+            a local same-sub hit ranked first, a constant-arg system('ls','-l') correctly excluded, the source
+            classified a request accessor, the renderer's path arrows + [local] marker + caveat + both empty
+            states). t/15 + t/46 assert 52 advertised tools; t/15's doc-sync guard (+2) confirms pcg_taint.
+            +25 from the pre-release review hardening: t/15 tools/call dispatch smokes for the five new tools;
+            t/102's broken-call + wide-blast render + the affected-tests line; t/103's --at mid-insert, the
+            applied-plan render, the remove-used-param refusal + perl -c guard, and the no-signature / malformed-
+            add / out-of-range-position / error-render guards; t/104's two Query-level early returns.
+
+0.063     2026-06-25
+          - New: `pcg change-signature` / pcg_change_signature (51 MCP tools) -- the SIXTH write tool: change a
+            plain function's PARAMETER LIST and propagate it to every resolved call site, the actionable fix for
+            a parameter change pcg_checkargs would otherwise flag everywhere. Two conservative operations: ADD a
+            parameter (--add '$p' or '$n = 0', at 1-based --at N or appended, inserting --value EXPR (default
+            `undef`) at each call site) or REMOVE one (--remove N, dropping that positional argument at each
+            site). Function-only: a method ($self/$class first param) is refused, and a $obj->method call site is
+            reported to the frontier, because the invocant offsets the positions and the dispatch can't be
+            statically tied. A call site whose argument list is statically indeterminate (a splat / deref /
+            call-result among the args) or that doesn't reach the touched position is reported for manual review,
+            never edited. The definition's signature and every call site are byte-span edits; dry-run unless
+            --apply / apply:true. New Refactor::change_signature (+ _rewrite_args / _arg_count / _split_top_commas,
+            reusing the inline codemod's call-site machinery); Format::change_signature; CLI `pcg change-signature`;
+            wired into the MCP write-tool dispatch beside dedupe/rm.
+          - Tests +26 (1484 total): t/103 (+24: add appends to the signature + inserts the value at each
+            determinate call site (the splat call and the $obj->method call going to the frontier); remove drops
+            the parameter from the definition, every plain call site, and the recursive self-call, leaving the
+            indeterminate + method sites untouched; a method is refused; out-of-range position / unknown function
+            / missing or conflicting operation are rejected; the renderer). t/15 + t/46 assert 51 advertised
+            tools and "six write tools"; t/15's doc-sync guard (+2) confirms pcg_change_signature is surfaced.
+
+0.062     2026-06-25
+          - New: `pcg pr <ref>` / pcg_pr (50 MCP tools) -- a SCORED PR-HEALTH GATE for CI, built on top of
+            pcg_review: the same change analysis folded into a single 0-100 health score and a PASS / REVIEW /
+            BLOCK verdict, so a branch gets one yes/no-ish signal instead of a report to read. Adds what review
+            doesn't: it LINTS THE CHANGED FILES for call bugs -- pcg_checkcalls + pcg_checkargs scoped to the
+            touched files (broken $obj->method calls and wrong-arity calls in code the PR edits). Score = 100
+            minus weighted concerns: 15 per breaking public-API change, 12 per broken call, 10 per wrong-arity
+            call, 6 per untested public change, 4 per wide-blast-radius change (>=85 PASS, 60-84 REVIEW, <60
+            BLOCK); concerns listed worst-first, with the affected tests to run. A heuristic signal, not a
+            substitute for human review. New Review::pr (reuses review() + the changed-file lint + scoring);
+            Format::pr; CLI `pcg pr`; wired into the MCP git-block beside review/diff/semver/changelog.
+          - Tests +17 (1458 total): t/102 (+15: a fixture removing a public sub (breaking), adding an untested
+            public sub, and adding a wrong-arity call in a changed file -> score 100-15-10-6 = 69 = REVIEW; the
+            arity finding is scoped to the changed file; the renderer's per-concern sections + scoring legend;
+            a clean no-change PR renders PASS 100). t/15 + t/46 assert 50 advertised tools; doc-sync guard (+2).
+
+0.061     2026-06-25
+          - New: `pcg smells` / pcg_smells (49 MCP tools) -- structural REFACTORING SMELLS, the named,
+            actionable cousins of pcg_hotspots (which only ranks fan-in/out/complexity). Three classic ones,
+            all from the call graph: FEATURE ENVY (a method making >= 4 calls into a SINGLE other class and
+            none into its own -- it lives in the wrong place; refactor: move it there), GOD CLASS (a class
+            with >= 20 methods AND >= 15 distinct external callers -- doing too much; refactor: split it), and
+            LONG PARAMETER LIST (a sub whose signature declares >= 5 params, a $self/$class invocant aside;
+            refactor: introduce a parameter object). Each smell names its refactoring. Heuristic: feature-envy
+            counts only RESOLVED call edges (opaque $obj->method layering doesn't trigger it, though a
+            deliberate facade still can) and long-param is signature-based (old-style my(...)=@_ subs invisible).
+            `package main` (the shared script/test namespace) and indexed CPAN deps are excluded -- they are
+            not classes you'd refactor, and `main` would otherwise aggregate every .t's subs into one bogus
+            bucket. New Query::smells (single pass over call edges -> feature-envy + god-class + long-param);
+            Format::smells; CLI `pcg smells`; thresholds tunable via opts (fe_min / gc_methods / gc_fanin / lp_min).
+          - Tests +18 (1441 total): t/101 (+16: feature-envy names the envied class and ignores a below-
+            threshold caller; god-class reports method + external-caller counts and skips a low-fan-in class;
+            long-param drops the invocant; the renderer's three sections + clean-state). t/15 + t/46 assert 49
+            advertised tools; t/15's doc-sync guard (+2) confirms pcg_smells is in INSTRUCTIONS and the skill.
+
+0.060     2026-06-25
+          - New: `pcg tidy` / pcg_tidy (48 MCP tools) -- a one-call CLEANUP DASHBOARD that composes the
+            detectors into one curated, de-overlapped survey so an agent gets the whole cleanup surface in a
+            single call, each item paired with the WRITE tool that fixes it. Three disjoint buckets:
+            REMOVABLE (unreferenced, non-exported subs `pcg rm` deletes outright), RETRACTABLE (exported subs
+            no other in-repo package uses -- stop exporting, then remove; kept separate because rm refuses
+            exported subs), and CLONES (structural duplicate groups `pcg dedupe` collapses). A survey, not an
+            apply: it names the exact follow-up commands but changes nothing. Same dead-code/clone caveats as
+            its components (dynamic dispatch + downstream consumers are invisible). Opens the 8th wave.
+            New Query::tidy (composes unused + dead_exports + duplication); Format::tidy; CLI `pcg tidy`;
+            `--limit` / `--min-nodes` tune the clones bucket.
+          - Tests +18 (1423 total): t/100 (+16: the three buckets are disjoint and correctly populated -- an
+            orphan private sub is removable, a called clone is not, an exported dead sub is retractable not
+            removable, a cross-package-called export is neither; the renderer names the rm/dedupe commands and
+            the clean-state message). t/15 + t/46 assert 48 advertised tools; t/15's doc-sync guard (+2)
+            confirms pcg_tidy is surfaced in both the MCP INSTRUCTIONS catalog and the deployed skill.
+
 0.059     2026-06-23
           - New: `pcg scaffold <symbol>` / pcg_scaffold (47 MCP tools) -- generate a POD + test SKELETON
             (with TODO placeholders) for a sub, derived from its signature: a `=head2` POD stub (using

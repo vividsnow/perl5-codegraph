@@ -1,6 +1,6 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify sink_type);
 use App::PerlGraph::Grammar qw(:all);

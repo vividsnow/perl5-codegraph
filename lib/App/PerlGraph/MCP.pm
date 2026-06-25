@@ -1,6 +1,6 @@
 package App::PerlGraph::MCP;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Moo;
 use Cpanel::JSON::XS ();
 use App::PerlGraph ();
@@ -31,10 +31,10 @@ use constant INSTRUCTIONS => <<'MD';
 
 ORIENT in an unfamiliar repo: pcg_overview (the map -- scale, frameworks, entry points, most-central symbols; the best FIRST call); pcg_metrics (a one-call code-health snapshot -- resolution %, test/doc coverage, complexity, dead code, clones, cycles + concerns; for triage / a release gate, NOT an orientation map -- use pcg_overview to get oriented); pcg_explore <term> (matching symbols + source + relationships in one call; beats grep); pcg_search <name> (locate a symbol; semantic:true ranks by meaning when embeddings exist).
 UNDERSTAND a symbol: pcg_explain (one-call dossier -- source + callers/callees + transitive blast radius + covering tests); pcg_context (a paste-ready EDITING set -- the symbol + the full source of every project callee it depends on + tests, budget-capped; a non-symbol arg becomes a search). Finer-grained: pcg_node (def + source); pcg_callers / pcg_callees; pcg_impact (transitive callers = blast radius); pcg_path A B (shortest call chain).
-ARCHITECTURE: pcg_deps (import/inheritance graph); pcg_cycles (circular deps); pcg_layers (modules stratified by dependency depth; cycles = violations); pcg_hotspots (fan-in / fan-out / complexity / coupling leaders); pcg_duplication (structural code clones -- DRY / extract-a-helper targets).
+ARCHITECTURE: pcg_deps (import/inheritance graph); pcg_cycles (circular deps); pcg_layers (modules stratified by dependency depth; cycles = violations); pcg_hotspots (fan-in / fan-out / complexity / coupling leaders); pcg_smells (NAMED refactoring smells: feature-envy / god-class / long-parameter-list, each with its refactoring); pcg_duplication (structural code clones -- DRY / extract-a-helper targets).
 HISTORY (needs a git work tree): pcg_risk (churn x fan-in = what's risky to change); pcg_cochange (files that change together = hidden coupling); pcg_owners (per-file author x importance = bus-factor risk); pcg_suggest_reviewers <ref> (who should review a change -- authors of the changed files ranked by how much of that code they wrote).
-QUALITY & RELEASE: pcg_checkcalls (broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class does not define, i.e. a typo or a call into removed API; heuristic, `index runtime:true` sharpens it); pcg_checkargs (wrong-arity calls -- the sibling bug finder: a call passing too few/many args to a sub whose signature fixes its arity); pcg_unused (dead code); pcg_untested (public API no test reaches); pcg_undocumented (public API without POD); pcg_doccheck (stale POD -- documents a method that no longer exists); pcg_scaffold (a POD + test skeleton for a sub from its signature -- the fix for untested/undocumented); pcg_dead_exports (exported functions no other in-repo package calls -- retractable API); pcg_sinks (command/SQL injection surface -- `[dynamic]` sites are built from a variable, the ones to verify); pcg_prereqs (declared CPAN deps vs actually-used); pcg_api (a module's public surface); pcg_covers (tests exercising a symbol); pcg_affected (files/tests impacted by a change). Branch/PR review (needs git): pcg_review (diff + blast radius + tests + findings, one call); pcg_diff (just the structural diff); pcg_semver (recommend a major/minor/patch bump); pcg_changelog (draft a Changes entry from the diff).
-REFACTOR -- the five WRITE tools: pcg_rename (rename a sub/method within its package); pcg_move (move a sub to another existing package -- relocate its source + requalify calls to NewPkg::sub); pcg_inline (inline a simple function at its call sites as a do{} block + remove the definition, the inverse of extracting a helper); pcg_dedupe (de-duplicate a clone group: keep one canonical function, rewrite each EXACT type-1 duplicate to `{ goto &Canonical }`, the inverse of copy-paste); pcg_rm (safely delete a DEAD sub + cascade-remove the now-dead private helpers it solely used; refuses if still called or exported -- the actionable follow-up to pcg_unused). All edit ONLY resolver-confirmed sites and report what they can't verify, never editing it silently. Dry-run unless apply:true; call pcg_sync after.
+QUALITY & RELEASE: pcg_checkcalls (broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class does not define, i.e. a typo or a call into removed API; heuristic, `index runtime:true` sharpens it); pcg_checkargs (wrong-arity calls -- the sibling bug finder: a call passing too few/many args to a sub whose signature fixes its arity); pcg_unused (dead code); pcg_untested (public API no test reaches); pcg_undocumented (public API without POD); pcg_doccheck (stale POD -- documents a method that no longer exists); pcg_scaffold (a POD + test skeleton for a sub from its signature -- the fix for untested/undocumented); pcg_dead_exports (exported functions no other in-repo package calls -- retractable API); pcg_tidy (one cleanup dashboard -- composes unused + dead_exports + duplication into removable/retractable/clone buckets, each paired with the rm/dedupe command that fixes it); pcg_sinks (command/SQL injection surface -- `[dynamic]` sites are built from a variable, the ones to verify); pcg_taint (source->sink paths -- a user-input source (endpoint / request accessor) whose call graph reaches a dynamic sink, with the path shown; reachability to verify, not value-flow); pcg_prereqs (declared CPAN deps vs actually-used); pcg_api (a module's public surface); pcg_covers (tests exercising a symbol); pcg_affected (files/tests impacted by a change). Branch/PR review (needs git): pcg_review (diff + blast radius + tests + findings, one call); pcg_pr (review folded into a scored 0-100 PASS/REVIEW/BLOCK gate for CI + a lint of the changed files for call bugs); pcg_diff (just the structural diff); pcg_semver (recommend a major/minor/patch bump); pcg_changelog (draft a Changes entry from the diff).
+REFACTOR -- the six WRITE tools: pcg_rename (rename a sub/method within its package); pcg_move (move a sub to another existing package -- relocate its source + requalify calls to NewPkg::sub); pcg_inline (inline a simple function at its call sites as a do{} block + remove the definition, the inverse of extracting a helper); pcg_dedupe (de-duplicate a clone group: keep one canonical function, rewrite each EXACT type-1 duplicate to `{ goto &Canonical }`, the inverse of copy-paste); pcg_change_signature (add/remove a plain function's parameter + propagate to every resolved call site -- the actionable fix for a parameter change pcg_checkargs would flag); pcg_rm (safely delete a DEAD sub + cascade-remove the now-dead private helpers it solely used; refuses if still called or exported -- the actionable follow-up to pcg_unused). All edit ONLY resolver-confirmed sites and report what they can't verify, never editing it silently. Dry-run unless apply:true; call pcg_sync after.
 LIFECYCLE: if a read tool says "no index", call pcg_index once to build the graph (no restart needed). After you edit Perl files, call pcg_sync so queries reflect them. pcg_status reports graph health + how much is resolved.
 UNRESOLVED FRONTIER (high value): most "unresolved" calls are opaque `$obj->method` dispatch static analysis can't tie to a class. pcg_unresolved lists those that DO match real candidate methods; with by_receiver:true it groups by receiver and intersects the classes defining EVERY method called on it -- a unique intersection is a near-certain type. Confirm it (read the code if needed) and pass to pcg_resolve -- prefer the { caller, receiver, class } form, which types a receiver once and resolves all its calls. Those edges are `[llm]` and persist across reindex. (pcg_index deps:true resolves many dependency calls statically first.)
 MD
@@ -95,8 +95,21 @@ my @TOOLS = (
           limit     => { type => 'integer', description => 'Max clone groups to return (default 20)' },
           min_nodes => { type => 'integer', description => 'Ignore subs whose body has fewer than N AST nodes (default 30)' },
       } } },
+    { name => 'pcg_tidy', handler => 'tidy', description => "One-call cleanup dashboard: the codebase's actionable tech-debt, each item paired with the WRITE tool that fixes it -- composes pcg_unused + pcg_dead_exports + pcg_duplication into one curated, de-overlapped survey so an agent gets the whole cleanup surface in a single call. Three disjoint buckets: REMOVABLE (unreferenced, non-exported subs `pcg_rm` deletes outright), RETRACTABLE (exported subs no other in-repo package uses -- stop exporting, then remove; kept separate because pcg_rm refuses exported subs), and CLONES (structural duplicate groups `pcg_dedupe` collapses). A survey, not an apply: it names the exact follow-up commands but changes nothing. Same dead-code/clone caveats as its components (dynamic dispatch and downstream consumers are invisible) -- review each before acting.",
+      inputSchema => { type => 'object', properties => {
+          limit     => { type => 'integer', description => 'Max clone groups in the clones bucket (default 20)' },
+          min_nodes => { type => 'integer', description => 'Ignore clones whose body has fewer than N AST nodes (default 30)' },
+      } } },
+    { name => 'pcg_smells', handler => 'smells', description => "Structural refactoring smells -- the NAMED, actionable cousins of pcg_hotspots (which just ranks fan-in/out/complexity). Three classic ones, all from the call graph: FEATURE ENVY (a method making several calls into a SINGLE other class and none into its own -- it lives in the wrong place; refactor: move it there), GOD CLASS (a class with many methods AND many distinct external callers -- doing too much; refactor: split it), and LONG PARAMETER LIST (a sub whose signature declares many params, a \$self/\$class invocant aside; refactor: introduce a parameter object). Each smell names its refactoring. Heuristic: feature-envy counts only RESOLVED call edges (opaque \$obj->method layering doesn't trigger it, but a deliberate facade still can) and long-param is signature-based (old-style my(...)=\@_ subs are invisible) -- verify before refactoring.",
+      inputSchema => { type => 'object', properties => {
+          limit => { type => 'integer', description => 'Max items per smell category (default 20)' },
+      } } },
     { name => 'pcg_sinks', handler => 'sinks', description => 'Security attack surface: command-execution (system/exec/syscall) and SQL-execution (DBI do/execute/select*) call sites, and -- for a web app -- which routes/endpoints can transitively REACH each sink (route handler -> call closure). Each sink is flagged [dynamic] when its command/SQL STRING is built from a variable (interpolated or concatenated) -- the injection-shaped sites to verify; a constant or placeholdered call is parameterized and safe. Still heuristic (no full taint dataflow), so a [dynamic] reached sink is a site to VERIFY for tainted input, not a confirmed bug.',
       inputSchema => { type => 'object', properties => {} } },
+    { name => 'pcg_taint', handler => 'taint', description => "Source -> sink TAINT PATHS: trace a call path from a user-input SOURCE to an injectable SINK. Sharper than pcg_sinks (route->sink reachability): the SOURCES are broader -- a web endpoint OR any sub that calls a request accessor (param / params / cookie(s) / upload(s) / header(s) / query_parameters / body_parameters / route_parameters) -- and only DYNAMIC sinks (whose command/SQL string is built from a variable -- the injectable ones) are targets, with the actual call PATH shown (source -> ... -> sink). A `[local]` hit (source and sink in the SAME sub) is the highest-confidence. IMPORTANT -- this is call-graph REACHABILITY, not value-flow: it proves user input can REACH the sink's sub, NOT that the specific tainted value lands in the sink's argument, so each path is a lead to VERIFY, not a confirmed vulnerability. (\$ENV / \@ARGV / STDIN sources are not yet detected.)",
+      inputSchema => { type => 'object', properties => {
+          limit => { type => 'integer', description => 'Max taint paths to return (default 50)' },
+      } } },
     { name => 'pcg_rename', handler => 'rename', description => 'Rename a function/method to a new name within its OWN package, using the graph to locate every reference precisely and the resolver to decide which call sites actually target it (a same-named method on a different class is left alone). Returns the edit plan; set apply=true to write the files. Dynamic `$obj->method` dispatch of the same name that the resolver could not tie to this symbol is reported for manual review, never silently edited. Call pcg_sync after apply. (Sync first if you have unsaved edits.)',
       inputSchema => { type => 'object', properties => {
           old   => { type => 'string',  description => 'Symbol to rename: Pkg::sub, or a unique bare name' },
@@ -124,6 +137,15 @@ my @TOOLS = (
           target => { type => 'string',  description => 'The dead function/method to delete: Pkg::sub, or a unique bare name' },
           apply  => { type => 'boolean', description => 'Write the deletions to disk (default false = dry-run plan)' },
       }, required => ['target'] } },
+    { name => 'pcg_change_signature', handler => 'change_signature', description => "Change a plain function's PARAMETER LIST and propagate it to every resolved call site -- the SIXTH write tool, the actionable fix for a parameter change pcg_checkargs would otherwise flag everywhere. Two conservative operations: ADD a parameter (`add`, e.g. '\$verbose' or '\$n = 0', at 1-based position `at` or appended, inserting `value` (default `undef`) at each call site) or REMOVE one (`remove`: a 1-based position, dropping that positional argument at each site). Function-only: a method (\$self/\$class first param) is refused, and a `\$obj->method` call site is reported to the frontier, because the invocant offsets the positions and the dispatch can't be statically tied. A call site whose argument list is statically indeterminate (a splat / deref / call-result among the args) or that doesn't reach the touched position is reported for manual review, never edited. Returns the plan (the new signature + the per-site edits); set apply=true to write. Call pcg_sync after.",
+      inputSchema => { type => 'object', properties => {
+          target => { type => 'string',  description => 'The function to re-signature: Pkg::func, or a unique bare name' },
+          add    => { type => 'string',  description => "A parameter to add, e.g. '\$verbose' or '\$n = 0' (mutually exclusive with remove)" },
+          remove => { type => 'integer', description => 'The 1-based parameter position to remove (mutually exclusive with add)' },
+          at     => { type => 'integer', description => 'For add: the 1-based position to insert at (default: appended)' },
+          value  => { type => 'string',  description => "For add: the argument expression to insert at each call site (default 'undef')" },
+          apply  => { type => 'boolean', description => 'Write the edits to disk (default false = dry-run plan)' },
+      }, required => ['target'] } },
     { name => 'pcg_hotspots', handler => 'hotspots', description => 'Call-graph hotspots, four lists: the most depended-upon symbols (fan-in, each with its transitive blast radius -- change with care), the symbols that make the most calls (fan-out), the most cyclomatically-complex symbols, and the most efferently-coupled modules. Good for review/refactor triage.',
       inputSchema => { type => 'object', properties => { limit => { type => 'integer', description => 'Top N per list (default 15)' } } } },
     { name => 'pcg_risk', handler => 'risk', description => 'History-aware risk: symbols ranked by git churn (commits touching their file) x fan-in (how many depend on them). Frequently-changed AND widely-depended-upon code is the top refactor/test target. With `since`, count only churn from commits since that ref (risk on the current branch). Needs a git work tree.',
@@ -149,6 +171,8 @@ my @TOOLS = (
       inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to compare against (e.g. main, HEAD~3)' } }, required => ['ref'] } },
     { name => 'pcg_review', handler => 'review', description => 'Review a branch/PR in one call: the structural diff vs a git ref (added/removed/re-signatured symbols, breaking PUBLIC API flagged), the blast radius (count of files affected by the change), the tests to run, and -- for each breaking symbol -- how many callers still reference it. Plus graph-derived findings: untested public changes (no test reaches them) and wide-blast-radius changes (a touched public symbol many things still call). Composes the structural diff with the affected-files closure. Needs a git work tree and an index.',
       inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to review against (e.g. main, HEAD~3)' } }, required => ['ref'] } },
+    { name => 'pcg_pr', handler => 'pr', description => "A SCORED PR-HEALTH GATE for CI -- pcg_review folded into a single 0-100 health score and a PASS / REVIEW / BLOCK verdict, so a branch gets one yes/no-ish signal instead of a report to read. Adds to review what review doesn't do: it LINTS THE CHANGED FILES for call bugs (pcg_checkcalls + pcg_checkargs scoped to the touched files -- broken \$obj->method calls and wrong-arity calls in code this PR edits). The score is 100 minus weighted concerns: 15 per breaking public-API change, 12 per broken call, 10 per wrong-arity call, 6 per untested public change, 4 per wide-blast-radius change (>=85 PASS, 60-84 REVIEW, <60 BLOCK); concerns are listed worst-first, with the affected tests to run. Heuristic signal, not a substitute for human review. Needs a git work tree and an index.",
+      inputSchema => { type => 'object', properties => { ref => { type => 'string', description => 'Git ref to gate against (e.g. main, HEAD~3)' } }, required => ['ref'] } },
     { name => 'pcg_api', handler => 'api', description => "A module's public surface: its exported and public (non-_) functions/methods/constants. To find which of those no other in-repo package calls, use pcg_dead_exports.",
       inputSchema => { type => 'object', properties => { module => { type => 'string', description => 'Module name' } }, required => ['module'] } },
     { name => 'pcg_covers', handler => 'covers', description => 'Which test files (transitively) exercise a symbol -- the reverse of pcg_affected(tests_only). Limited to statically-resolved calls.',
@@ -326,8 +350,11 @@ sub _run_tool ($self, $handler, $args) {
     return App::PerlGraph::Format::metrics($q->metrics)                            if $handler eq 'metrics';
     return App::PerlGraph::Format::dead_exports($q->dead_exports)                  if $handler eq 'dead_exports';
     return App::PerlGraph::Format::duplication($q->duplication(map { defined $args->{$_} ? ($_ => $args->{$_}) : () } qw(limit min_nodes))) if $handler eq 'duplication';
+    return App::PerlGraph::Format::tidy($q->tidy(map { defined $args->{$_} ? ($_ => $args->{$_}) : () } qw(limit min_nodes))) if $handler eq 'tidy';
+    return App::PerlGraph::Format::smells($q->smells(map { defined $args->{$_} ? ($_ => $args->{$_}) : () } qw(limit))) if $handler eq 'smells';
     return App::PerlGraph::Format::overview($q->overview(defined $args->{limit} ? (limit => $args->{limit}) : ())) if $handler eq 'overview';
     return App::PerlGraph::Format::sinks($q->sinks) if $handler eq 'sinks';
+    return App::PerlGraph::Format::taint($q->taint(map { defined $args->{$_} ? ($_ => $args->{$_}) : () } qw(limit))) if $handler eq 'taint';
     if ($handler eq 'rename') {
         require App::PerlGraph::Refactor;
         return App::PerlGraph::Format::rename(
@@ -346,6 +373,14 @@ sub _run_tool ($self, $handler, $args) {
             App::PerlGraph::Refactor->new(store => $q->store, root => $self->base)
                 ->inline($args->{target} // '', ($args->{apply} ? (apply => 1) : ())));
     }
+    if ($handler eq 'change_signature') {
+        require App::PerlGraph::Refactor;
+        return App::PerlGraph::Format::change_signature(
+            App::PerlGraph::Refactor->new(store => $q->store, root => $self->base)->change_signature(
+                $args->{target} // '',
+                (map { defined $args->{$_} ? ($_ => $args->{$_}) : () } qw(add remove at value)),
+                ($args->{apply} ? (apply => 1) : ())));
+    }
     if ($handler eq 'dedupe') {
         require App::PerlGraph::Refactor;
         return App::PerlGraph::Format::dedupe(
@@ -359,7 +394,7 @@ sub _run_tool ($self, $handler, $args) {
                 ->rm($args->{target} // '', ($args->{apply} ? (apply => 1) : ())));
     }
     return App::PerlGraph::Format::hotspots($q->hotspots(defined $args->{limit} ? (limit => $args->{limit}) : ())) if $handler eq 'hotspots';
-    if ($handler eq 'diff' || $handler eq 'review' || $handler eq 'semver' || $handler eq 'changelog') {
+    if ($handler eq 'diff' || $handler eq 'review' || $handler eq 'semver' || $handler eq 'changelog' || $handler eq 'pr') {
         require App::PerlGraph::Git; require App::PerlGraph::Diff; require App::PerlGraph::Parser;
         my $git = App::PerlGraph::Git->new(root => $self->base);
         return "This needs a git work tree." unless $git->available;
@@ -375,6 +410,9 @@ sub _run_tool ($self, $handler, $args) {
             App::PerlGraph::Diff->new(root => $self->base, ref => $ref, parser => $parser)->diff, $ref)
             if $handler eq 'changelog';
         require App::PerlGraph::Review;
+        return App::PerlGraph::Format::pr(
+            App::PerlGraph::Review->new(root => $self->base, ref => $ref, parser => $parser, store => $q->store)->pr)
+            if $handler eq 'pr';
         return App::PerlGraph::Format::review(
             App::PerlGraph::Review->new(root => $self->base, ref => $ref, parser => $parser, store => $q->store)->review);
     }

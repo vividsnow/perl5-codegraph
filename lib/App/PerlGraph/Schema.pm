@@ -1,6 +1,6 @@
 package App::PerlGraph::Schema;
 use v5.36;
-our $VERSION = q{0.059};
+our $VERSION = q{0.064};
 use Exporter 'import';
 our @EXPORT_OK = qw(DDL);
 
