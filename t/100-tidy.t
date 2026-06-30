@@ -91,5 +91,60 @@ like $txt, qr/`Helper::dead_one`/,             'format: lists the dead export';
 like $txt, qr/Clone groups.*`pcg dedupe/s,     'format: clones bucket names the dedupe command';
 like App::PerlGraph::Format::tidy({ removable => [], retractable => [], clones => [] }),
     qr/_nothing to tidy_/, 'format: clean-state message';
+like $txt, qr/pcg tidy --apply/, 'format: survey points at --apply to execute the safe subset';
+
+# --- APPLY: dedupe the clone group + rm the orphan, keep the rest, result compiles ----------
+require App::PerlGraph::Refactor;
+my $d2 = tempdir; $d2->child('lib')->mkpath; $d2->child('.pcg')->mkpath;
+# `entry` is exported (anchors the call graph so it isn't itself removable) and calls both clones
+# + kept; `orphan` is private + uncalled (removable). dup_a/dup_b are byte-identical (a clone group).
+$d2->child('lib/App.pm')->spew_utf8(<<'PL');
+package App;
+use Exporter 'import';
+our @EXPORT_OK = ('entry');
+sub entry { App::dup_a([]) + App::dup_b([]) + kept() }
+sub kept { 7 }
+sub dup_a {
+    my ($self, $items) = @_;
+    my @out;
+    for my $it (@$items) {
+        next unless $it->{ok};
+        push @out, $it->{val} * 2;
+    }
+    return \@out;
+}
+sub dup_b {
+    my ($self, $items) = @_;
+    my @out;
+    for my $it (@$items) {
+        next unless $it->{ok};
+        push @out, $it->{val} * 2;
+    }
+    return \@out;
+}
+sub orphan { 99 }
+1;
+PL
+my $s2 = App::PerlGraph::Store->new(path => $d2->child('.pcg/graph.db')->stringify); $s2->init;
+App::PerlGraph::Indexer->new(store => $s2, root => "$d2")->index_all;
+my $ra = App::PerlGraph::Refactor->new(store => $s2, root => "$d2")->tidy(min_nodes => 15, apply => 1);
+
+ok $ra->{applied}, 'apply: result is flagged applied';
+is scalar @{ $ra->{deduped} }, 1, 'apply: one clone group deduped';
+ok( (grep { $_ eq 'App::dup_b' } map { @{ $_->{replaced} } } @{ $ra->{deduped} }), 'apply: dup_b rewritten to the canonical' );
+ok( (grep { $_->{name} eq 'App::orphan' } @{ $ra->{removed} }), 'apply: the orphan sub was removed' );
+
+my $src = $d2->child('lib/App.pm')->slurp_utf8;
+like   $src, qr/sub entry/,                          'apply: the exported entry is kept';
+like   $src, qr/sub dup_a \{\n\s+my \(\$self/,       'apply: the canonical clone keeps its real body';
+like   $src, qr/sub dup_b \{ goto &App::dup_a \}/,   'apply: the duplicate is now a goto stub';
+unlike $src, qr/sub orphan/,                         'apply: the orphan is gone';
+
+my $compile = `$^X -I@{[ $d2->child('lib') ]} -c @{[ $d2->child('lib/App.pm') ]} 2>&1`;
+like $compile, qr/syntax OK/, 'apply: the rewritten file still compiles';
+
+# nothing-to-do apply
+like App::PerlGraph::Format::tidy({ applied => 1, deduped => [], removed => [], skipped => [] }),
+    qr/_nothing to apply_/, 'format: applied clean-state message';
 
 done_testing;

@@ -1,6 +1,6 @@
 package App::PerlGraph::Grammar;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Exporter 'import';
 
 # Node-type names — verified against tree-sitter-perl v1.1.2 (see docs/grammar-ground-truth.md).

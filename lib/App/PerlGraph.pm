@@ -1,6 +1,6 @@
 package App::PerlGraph;
 use v5.36;
-our $VERSION = '0.065';
+our $VERSION = '0.072';
 1;
 
 __END__
@@ -36,7 +36,7 @@ App::PerlGraph - a Perl-native code knowledge graph for AI agents
     pcg unresolved [--by-receiver]    # opaque $obj->method calls (--by-receiver suggests each receiver's class)
     pcg hotspots                      # fan-in / fan-out / complexity / coupling leaders
     pcg duplication                   # structural code clones (type-1/2): extract-a-shared-helper targets
-    pcg tidy                          # one cleanup dashboard: removable dead code, retractable exports, clones + fix commands
+    pcg tidy [--apply]                # cleanup dashboard: removable dead code, retractable exports, clones (--apply executes the safe subset)
     pcg smells                        # refactoring smells: feature-envy (move), god-class (split), long-parameter-list
     pcg risk [--since main]           # git churn x fan-in (--since: churn on the current branch)
     pcg cochange                      # files that change together (logical coupling)
@@ -52,8 +52,9 @@ App::PerlGraph - a Perl-native code knowledge graph for AI agents
     pcg rename Foo::bar baz [--apply] # graph-driven rename within a package (dry-run by default)
     pcg move Foo::bar Other::Pkg [--apply]  # move a sub to another package: relocate source + requalify calls
     pcg inline Foo::helper [--apply]  # inline a simple function at its call sites (do{} block) + remove def
+    pcg extract lib/F.pm 8-12 helper [--apply]  # inverse of inline: lift a statement range into a new sub
     pcg dedupe Foo::canon [--apply]   # de-duplicate a clone group: each exact dup -> { goto &Foo::canon }
-    pcg change-signature Foo::f --remove 2   # add/remove a function param + propagate to every resolved call site
+    pcg change-signature Foo::f --remove 2   # add / remove / --reorder '2,1,3' a function's params + propagate to every call site
     pcg rm Foo::dead [--apply]        # safely delete a dead sub + cascade now-dead private helpers
     pcg search --semantic "intent"    # rank symbols by meaning (needs `index --embed` + a local provider)
     pcg export --format html          # render the graph (dot|mermaid|json|html -- html is interactive)

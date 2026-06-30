@@ -1,6 +1,6 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify sink_type);
 use App::PerlGraph::Grammar qw(:all);
@@ -34,6 +34,21 @@ my %FRAMEWORK  = ('Dancer2' => 'dancer', 'Dancer' => 'dancer', 'Mojolicious::Lit
 my %ROUTE_VERB = map { $_ => 1 } qw(get post put del delete patch options any);
 my %CAT_ATTR   = map { $_ => 1 } qw(Path Local Global Chained Args Method Private Regex LocalRegex);
 my %MOOSEY     = map { $_ => 1 } qw(Moo Moose Moo::Role Moose::Role Mouse Mouse::Role);
+# accessor-GENERATOR modules. `list`: `use X qw(a b)` -- the imports ARE the accessor names
+# (Class::Tiny / Object::Tiny). `xs`: `use Class::XSAccessor getters => {m=>f}, ...` -- the
+# accessor names are the KEYS of each option hash / the elements of each option array.
+my %ACCESSOR_USE = map { $_ => 'list' } qw(Class::Tiny Object::Tiny Object::Tiny::RW Object::Tiny::XS);
+$ACCESSOR_USE{$_} = 'xs' for qw(Class::XSAccessor Class::XSAccessor::Array);
+# class-method accessor generators: `__PACKAGE__->mk_accessors(qw(a b))` (Class::Accessor[::Fast]).
+my %ACCESSOR_METHOD = map { $_ => 1 } qw(mk_accessors mk_ro_accessors mk_wo_accessors);
+# Class::XSAccessor OPTION keywords. In the hashref calling form (`use Class::XSAccessor { getters
+# => {...}, constructor => 'new' }`) these are hash KEYS structurally identical to real accessor
+# entries (`name => value`), so the key-walk would emit them as bogus accessors -- the keyword set
+# is the only way to tell them apart, so it must be the COMPLETE documented set. None is a plausible
+# real accessor name.
+my %XS_OPTION = map { $_ => 1 } qw(accessors getters setters lvalue_accessors predicates
+                                   exists_predicates exists_predicate constructor constructors
+                                   true false replace chained);
 my %MODIFIER   = map { $_ => 1 } qw(before after around);
 # field attributes that generate a getter (`field $x :reader` -> `$self->x`)
 my %FIELD_ACCESSOR = map { $_ => 1 } qw(reader accessor mutator);
@@ -218,6 +233,8 @@ sub _handle_sub ($self, $n) {
     $meta{complexity} = $cx if $cx > 1;                         # omit the trivial cx=1
     if (my $r = $self->_return_class($n)) { $meta{returns} = $r }   # a `Class->new` builder
     if (my $dup = $self->_body_fingerprint($n)) { $meta{dup} = $dup }  # structural clone fingerprint
+    if (my $ts = _taint_source(_decomment($n))) { $meta{taint_source} = $ts }  # reads external input ($ENV/@ARGV/STDIN)
+    $meta{taint_flow} = 1 if _value_flow($n);   # a tainted value reaches a sink ARGUMENT within this sub
     my $snode = $self->_emit({
         kind           => ($n->{type} eq NODE_METHOD_DECL ? 'method' : 'function'),
         name           => $name,
@@ -230,6 +247,79 @@ sub _handle_sub ($self, $n) {
     $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $snode->{id}, 'contains');
     $self->_handle_catalyst($n, $snode);
     return $snode;
+}
+
+# A sub that reads EXTERNAL process input -- the non-web taint sources (CLI / env injection)
+# that pcg_taint pairs with command/SQL sinks. Text scan over the sub's source (so it also
+# catches reads inside nested closures); the label is shown to the user.
+# The sub's source text with its comments removed -- so a `# reads $ENV{X}` note is not mistaken
+# for a real read. Comments are separate tree-sitter nodes, so removing their exact text leaves
+# code (including `#` inside strings/regexes) untouched, unlike a blanket `s/#.*//`.
+sub _decomment ($node) {
+    my $text = $node->{text} // '';
+    my @stack = ($node);
+    while (my $c = pop @stack) {
+        if (($c->{type} // '') eq 'comment') { my $ct = $c->{text} // ''; $text =~ s/\Q$ct\E// if length $ct }
+        else { push @stack, @{ $c->{children} // [] } }
+    }
+    return $text;
+}
+
+sub _taint_source ($text) {
+    return undef unless defined $text;
+    return '$ENV'  if $text =~ /\$ENV\s*\{/;                       # $ENV{PATH}
+    return '@ARGV' if $text =~ /(?<!\w)\@ARGV\b/ || $text =~ /\$ARGV\s*\[/;   # @ARGV / $ARGV[0]
+    return 'STDIN' if $text =~ /<\s*(?:STDIN|ARGV)?\s*>/;          # <STDIN> / <> / <ARGV>
+    return undef;
+}
+
+# Any taint SOURCE expression -- the external reads above plus web request accessors.
+my $TAINT_SOURCE_RX = qr/\$ENV\s*\{|(?<!\w)\@ARGV\b|\$ARGV\s*\[|<\s*(?:STDIN|ARGV)?\s*>
+    |(?:->\s*|\b)(?:param|params|cookies?|uploads?|headers?|query_parameters|body_parameters|route_parameters)\s*\(/x;
+
+# Intra-procedural VALUE-FLOW: does a tainted value actually reach a command/SQL sink's
+# ARGUMENT inside this one sub? (vs. pcg_taint's default, which only proves the sub both reads
+# input AND has a sink -- they might be unrelated.) Heuristic forward taint over the sub's
+# assignments: a var assigned from a source is tainted; taint propagates through later
+# assignments that mention it; the answer is whether a sink call's argument mentions a tainted
+# var (or a source directly). A `local` hit with this set is value-flow-confirmed, not just co-located.
+sub _value_flow ($sub) {
+    my (@assign, @sink_arg);
+    my @stack = ($sub);
+    while (my $n = pop @stack) {
+        my $t = $n->{type} // '';
+        if ($t eq 'assignment_expression') {
+            my @k = @{ $n->{children} // [] };
+            my ($lhs) = grep { ($_->{type} // '') =~ /variable_declaration|\Ascalar\z|\Aarray\z|\Ahash\z/ } @k;
+            my $rhs = $k[-1];
+            push @assign, [ [ ($lhs->{text} // '') =~ /([\$\@%]\w+)/g ], $rhs->{text} // '' ]
+                if $lhs && $rhs && $rhs != $lhs;
+        }
+        elsif ($t =~ /function_call_expression|method_call_expression/) {
+            my $f = $n->{fields}{ +F_FUNCTION } // $n->{fields}{ +F_METHOD };
+            my $nm = $f ? (split /::/, ($f->{text} // ''))[-1] : '';
+            push @sink_arg, (($n->{fields}{ +F_ARGUMENTS } // {})->{text} // '')
+                if defined sink_type($nm, ($t =~ /method/ ? 1 : 0));
+        }
+        push @stack, @{ $n->{children} // [] };
+    }
+    return 0 unless @sink_arg;
+    my %t;                                                          # tainted variable names
+    for my $a (grep { $_->[1] =~ $TAINT_SOURCE_RX } @assign) { $t{$_} = 1 for @{ $a->[0] } }   # seed
+    my $changed = 1;
+    while ($changed) {                                             # fixed point
+        $changed = 0;
+        for my $a (@assign) {
+            next unless grep { !$t{$_} } @{ $a->[0] };             # all LHS already tainted -> nothing to add
+            next unless grep { $a->[1] =~ /\Q$_\E\b/ } keys %t;    # RHS mentions no tainted var (yet)
+            $t{$_} = 1, $changed = 1 for @{ $a->[0] };             # taint ALL LHS (over-taint is the safe direction)
+        }
+    }
+    for my $arg (@sink_arg) {
+        return 1 if $arg =~ $TAINT_SOURCE_RX;                      # a source used directly in the sink
+        return 1 if grep { $arg =~ /\Q$_\E\b/ } keys %t;           # a tainted var in the sink arg
+    }
+    return 0;
 }
 
 # A structural fingerprint of a sub BODY for clone detection: the pre-order sequence
@@ -376,6 +466,10 @@ sub _handle_use ($self, $n) {
         if ($module eq 'Mojo::Base') {
             if ($self->{_pkg}) { $self->{_pkg}{_mojo} = 1 } else { $self->{_mojo_file} = 1 }
         }
+    }
+    elsif (my $kind = $ACCESSOR_USE{$module}) {       # accessor-generator: emit the accessor methods + record the import
+        $self->_handle_accessor_use($n, $kind);
+        $self->_edge($self->_src_id, undef, 'imports', metadata => { via => 'use', module => $module });
     }
     elsif (!$PRAGMA{$module}) {
         # record the explicitly-imported symbols (`use Foo qw(a b)` / `use Foo 'a'`)
@@ -668,6 +762,53 @@ sub _emit_accessor ($self, $pkg, $name, $n, $returns = undef) {
     return $node;
 }
 
+# `use Class::Tiny qw(a b)` / `use Class::XSAccessor getters => {m=>f}, accessors => [qw/x y/]`
+# -> accessor methods. `list`: the imported strings ARE the names. `xs`: the names are the KEYS
+# of each option hash (left of `=>`) and the elements of each option array.
+sub _handle_accessor_use ($self, $n, $kind) {
+    my $pkg = $self->{_pkg} or return;
+    my @names;
+    if ($kind eq 'list') {
+        # `use Class::Tiny qw(a b)` -- the list elements ARE the names; `use Class::Tiny { a => $def }`
+        # (Class::Tiny's hash-default form) -- the KEYS are the names, the string defaults are NOT. So
+        # collect qw/string list elements + hash keys, but do not descend into hash VALUES.
+        my @stack = ($n);
+        while (my $x = pop @stack) {
+            my $t = $x->{type} // '';
+            if    ($t eq 'anonymous_hash_expression') { _keys_before_fatcomma($x, \@names) }
+            elsif ($t eq NODE_QW)             { my $c = $x->{fields}{ +F_CONTENT }; push @names, split ' ', $c->{text} if $c }
+            elsif ($t eq NODE_STRING_CONTENT) { push @names, $x->{text} }
+            else  { push @stack, @{ $x->{children} // [] } }
+        }
+    }
+    else {
+        my @stack = ($n);
+        while (my $x = pop @stack) {
+            my $t = $x->{type} // '';
+            if    ($t eq 'anonymous_hash_expression')  { _keys_before_fatcomma($x, \@names) }
+            elsif ($t eq 'anonymous_array_expression') { $self->_collect_strings($x, \@names) }
+            push @stack, @{ $x->{children} // [] };
+        }
+        @names = grep { !$XS_OPTION{$_} } @names;                  # drop option keywords the hashref-wrapper form collects
+    }
+    my %seen;
+    $self->_emit_accessor($pkg, $_, $n) for grep { /\A\w+\z/ && !$seen{$_}++ } @names;
+    $pkg->{_is_class} = 1 if @names;
+}
+
+# Hash keys = each token immediately followed by a `=>` sibling, recursively (Perl flattens
+# `a => b, c => d` into nested lists, so the keys can appear at any depth).
+sub _keys_before_fatcomma ($node, $acc) {
+    my @kids = @{ $node->{children} // [] };
+    for my $i (0 .. $#kids) {
+        if ((($kids[$i + 1] // {})->{type} // '') eq '=>') {
+            (my $name = $kids[$i]{text} // '') =~ s/\A['"]|['"]\z//g;
+            push @$acc, $name;
+        }
+        _keys_before_fatcomma($kids[$i], $acc);
+    }
+}
+
 # Mojolicious helper registration: `helper name => sub {...}` or
 # `$app->helper(name => sub {...})`. A helper is callable as `$c->name` on any
 # controller, so it becomes a method node the resolver matches by name (framework
@@ -762,7 +903,7 @@ sub _sink_dynamic ($self, $args) {
     return 0;
 }
 sub _has_interp_var ($node) {
-    return 1 if ($node->{type} // '') =~ /\Ascalar\z|\Aarray\z|scalar_deref|array_element/;
+    return 1 if ($node->{type} // '') =~ /\Ascalar\z|\Aarray\z|scalar_deref|array_element|hash_element|hash_deref/;
     _has_interp_var($_) && return 1 for @{ $node->{children} // [] };
     return 0;
 }
@@ -786,6 +927,20 @@ sub _handle_method_call ($self, $n, $cur_sub) {
     my $m = $n->{fields}{ +F_METHOD } or return;
     my $meth = $m->{text};
     return unless defined $meth && length $meth;
+    # `__PACKAGE__->mk_accessors(qw/a b/)` -> accessor methods. Only when the invocant is the CLASS
+    # (__PACKAGE__, the current package name, or a Capitalized bareword) -- NOT `$obj->mk_accessors`
+    # on a real instance / a same-named method on some other class, which would attach phantom
+    # accessors here + swallow the call edge.
+    if ($ACCESSOR_METHOD{$meth} && $self->{_pkg}) {
+        my $inv = (($n->{fields}{ +F_INVOCANT }) // {})->{text} // '';
+        if ($inv eq '__PACKAGE__' || $inv eq ($self->{_pkg}{name} // "\0") || $inv =~ /\A[A-Z][\w:]*\z/) {
+            my @names;
+            $self->_collect_strings($n->{fields}{ +F_ARGUMENTS }, \@names) if $n->{fields}{ +F_ARGUMENTS };
+            my %seen;
+            $self->_emit_accessor($self->{_pkg}, $_, $n) for grep { /\A\w+\z/ && !$seen{$_}++ } @names;
+            if (@names) { $self->{_pkg}{_is_class} = 1; return }
+        }
+    }
     my $inv  = $n->{fields}{ +F_INVOCANT };
     my $recv = $inv ? $inv->{text} : undef;
     my %cand;

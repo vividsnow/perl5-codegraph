@@ -1,6 +1,6 @@
 package App::PerlGraph::Review;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Moo;
 use App::PerlGraph::Git;
 use App::PerlGraph::Diff;
@@ -34,6 +34,7 @@ sub review ($self) {
     for my $s (@{ $diff->{added} }, map { $_->{new} } @{ $diff->{changed} }) {   # added/changed public API no test reaches
         next unless is_public($s) && defined $s->{qualified_name}
                  && ($s->{kind} // '') =~ /\A(?:function|method|constant)\z/;
+        next if ($s->{metadata} // {})->{accessor};                              # generated accessors need no test of their own
         push @untested, $s unless scalar $q->covers($s->{qualified_name});
     }
     for my $s (@{ $diff->{removed} }, map { $_->{new} } @{ $diff->{changed} }) { # changed/removed symbol many things still call

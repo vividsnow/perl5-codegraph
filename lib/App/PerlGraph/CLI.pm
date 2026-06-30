@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Path::Tiny qw(path);
 use Cpanel::JSON::XS ();
 use App::PerlGraph::Store;
@@ -78,8 +78,9 @@ usage: pcg <command> [args] [path]
                         (the actionable starting point for untested / undocumented subs)
   duplication [--limit N] [--min-nodes N]   structural code clones: subs with an identical body shape
                         (type-1/2; names + literals aside) -- extract-a-shared-helper candidates
-  tidy [--limit N] [--min-nodes N]   one cleanup dashboard: removable dead code (-> rm),
-                        retractable exports, and clone groups (-> dedupe), each with its fix command
+  tidy [--limit N] [--min-nodes N] [--apply]   one cleanup dashboard: removable dead code (-> rm),
+                        retractable exports, and clone groups (-> dedupe), each with its fix command;
+                        --apply executes the safe subset (dedupe + rm, re-syncing; dead exports excluded)
   smells [--limit N]    structural refactoring smells: feature-envy (move-method), god-class (split),
                         long-parameter-list (parameter object) -- the named cousins of hotspots
   hotspots [--limit N]  fan-in (+ blast radius), fan-out, cyclomatic-complexity, and most-coupled-module leaders
@@ -112,8 +113,9 @@ usage: pcg <command> [args] [path]
                         remove the definition (dry-run; refuses unsafe bodies, reports method-call sites)
   dedupe <Pkg::sub> [--apply] [path]   de-duplicate a clone group: keep <Pkg::sub> canonical, rewrite each
                         EXACT-duplicate function to `{ goto &<Pkg::sub> }` (dry-run; type-2/methods reported)
-  change-signature <Pkg::func> (--add '$p [= dflt]' [--at N] [--value EXPR] | --remove N) [--apply] [path]
-                        add/remove a plain function's parameter + propagate to every resolved call site
+  change-signature <Pkg::func> (--add '$p [= dflt]' [--at N] [--value EXPR] | --remove N | --reorder '2,1,3') [--apply] [path]
+  extract <file> <START-END> <new_name> [--apply] [path]   lift a statement range into a new sub (inputs/outputs inferred)
+                        add/remove/reorder a plain function's parameter(s) + propagate to every resolved call site
                         (function-only; dry-run; indeterminate/method call sites reported, not edited)
   rm <Pkg::sub> [--apply] [path]   safely DELETE a dead sub + cascade-remove the now-dead private helpers it
                         solely used (refuses if it's still called or exported; dry-run by default)
@@ -172,6 +174,7 @@ sub run ($class, @argv) {
         inline    => \&_cmd_inline,
         dedupe    => \&_cmd_dedupe,
         'change-signature' => \&_cmd_change_signature,
+        extract   => \&_cmd_extract,
         rm        => \&_cmd_rm,
         hotspots  => \&_cmd_hotspots,
         risk      => \&_cmd_risk,
@@ -513,10 +516,17 @@ sub _cmd_tidy (@args) {
             return _usage() unless defined $opt{limit} && $opt{limit} =~ /^\d+$/ && $opt{limit} >= 1 }
         elsif ($a eq '--min-nodes') { $opt{min_nodes} = shift @args;
             return _usage() unless defined $opt{min_nodes} && $opt{min_nodes} =~ /^\d+$/ && $opt{min_nodes} >= 1 }
+        elsif ($a eq '--apply') { $opt{apply} = 1 }
         else { push @pos, $a }
     }
     return _usage() if grep { /^--/ } @pos;
     my $q = _query($pos[0] // '.') or return 1;
+    if ($opt{apply}) {                                           # execute the safe cleanup (dedupe + rm), re-syncing as it goes
+        require App::PerlGraph::Refactor;
+        print App::PerlGraph::Format::tidy(
+            App::PerlGraph::Refactor->new(store => $q->store, root => ($pos[0] // '.'))->tidy(%opt));
+        return 0;
+    }
     print App::PerlGraph::Format::tidy($q->tidy(%opt));
     return 0;
 }
@@ -607,11 +617,12 @@ sub _cmd_change_signature (@args) {
     my (%opt, @pos);
     while (@args) {
         my $a = shift @args;
-        if    ($a eq '--apply')  { $opt{apply}  = 1 }
-        elsif ($a eq '--add')    { $opt{add}    = shift @args; return _usage() unless defined $opt{add} }
-        elsif ($a eq '--remove') { $opt{remove} = shift @args; return _usage() unless defined $opt{remove} }
-        elsif ($a eq '--at')     { $opt{at}     = shift @args; return _usage() unless defined $opt{at} }
-        elsif ($a eq '--value')  { $opt{value}  = shift @args; return _usage() unless defined $opt{value} }
+        if    ($a eq '--apply')   { $opt{apply}   = 1 }
+        elsif ($a eq '--add')     { $opt{add}     = shift @args; return _usage() unless defined $opt{add} }
+        elsif ($a eq '--remove')  { $opt{remove}  = shift @args; return _usage() unless defined $opt{remove} }
+        elsif ($a eq '--reorder') { $opt{reorder} = shift @args; return _usage() unless defined $opt{reorder} }
+        elsif ($a eq '--at')      { $opt{at}      = shift @args; return _usage() unless defined $opt{at} }
+        elsif ($a eq '--value')   { $opt{value}   = shift @args; return _usage() unless defined $opt{value} }
         else { push @pos, $a }
     }
     return _usage() if grep { /^--/ } @pos;
@@ -622,6 +633,23 @@ sub _cmd_change_signature (@args) {
     my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
         ->change_signature($target, %opt);
     print App::PerlGraph::Format::change_signature($plan);
+    return $plan->{error} ? 1 : 0;
+}
+
+sub _cmd_extract (@args) {
+    my ($apply, @pos);
+    while (@args) {
+        my $a = shift @args;
+        if ($a eq '--apply') { $apply = 1 } else { push @pos, $a }
+    }
+    return _usage() if grep { /^--/ } @pos;
+    my ($file, $range, $name, $root) = @pos;
+    return _usage() unless defined $file && defined $range && defined $name;
+    my $q = _query($root // '.') or return 1;
+    require App::PerlGraph::Refactor;
+    my $plan = App::PerlGraph::Refactor->new(store => $q->store, root => ($root // '.'))
+        ->extract($file, $range, $name, ($apply ? (apply => 1) : ()));
+    print App::PerlGraph::Format::extract($plan);
     return $plan->{error} ? 1 : 0;
 }
 
@@ -947,7 +975,7 @@ Parses @ARGV and dispatches to the pcg subcommands: index, sync, watch, the
 read queries (overview, metrics, search, node, explain, explore, callers, callees, impact,
 path, affected, unused, untested, undocumented, dead-exports, deps, cycles, layers, checkcalls,
 checkargs, doccheck, scaffold, duplication, tidy, smells, prereqs, hotspots, risk, cochange, owners, suggest-reviewers, sinks, taint,
-diff, semver, changelog, review, pr, api, covers, unresolved), the graph-driven rename / move / inline / dedupe / change-signature / rm codemods,
+diff, semver, changelog, review, pr, api, covers, unresolved), the graph-driven rename / move / inline / extract / dedupe / change-signature / rm codemods,
 export, status, serve and install/uninstall.
 
 This is an internal module of L<App::PerlGraph>; see L<App::PerlGraph> and the

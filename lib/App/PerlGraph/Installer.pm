@@ -1,6 +1,6 @@
 package App::PerlGraph::Installer;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);
@@ -81,8 +81,8 @@ routes/helpers, XSUBs), not text matches.
 - Recommend a semver bump (major/minor/patch) for a release from the structural diff -> **pcg_semver** `<ref>` (breaking public API->major, new public API->minor, internal->patch).
 - Draft a Changes / release-notes entry from the structural diff (added / removed / changed, grouped, with the bump) -> **pcg_changelog** `<ref>` (a ready-to-edit scaffold; turn into prose before release).
 - Security attack surface (command/SQL execution sites + which web endpoints reach them) -> **pcg_sinks** (flags sinks whose argument is dynamically built -- interpolated/concatenated -- as the injection-shaped sites; constant/placeholdered ones are safe).
-- Source -> sink TAINT PATHS (a user-input source -- endpoint / request accessor -- whose call graph reaches a dynamic
-  command/SQL sink, with the path shown) -> **pcg_taint** (reachability to VERIFY, not value-flow; `[local]` same-sub hits are strongest).
+- Source -> sink TAINT PATHS (a user-input source -- endpoint / request accessor / $ENV / @ARGV / STDIN -- whose call graph
+  reaches a dynamic command/SQL sink, with the path shown) -> **pcg_taint** (a `[value-flow]` hit confirms the tainted value reaches the sink ARG in-sub; `[local]`/cross-sub are reachability to VERIFY).
 - Which tests exercise X -> **pcg_covers**.  Tests impacted by a diff -> **pcg_affected**.
 - Broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class doesn't
   define (a typo or a call into renamed/removed API) -> **pcg_checkcalls** (heuristic; `pcg_index runtime:true` sharpens it).
@@ -96,17 +96,20 @@ routes/helpers, XSUBs), not text matches.
   untested / undocumented sub -> **pcg_scaffold** `<symbol>` (read-only: emits text to adapt, writes nothing).
 - Exported functions/methods no OTHER in-repo package calls (retractable public API) -> **pcg_dead_exports**.
 - The whole cleanup surface in ONE call -- removable dead code (-> pcg_rm), retractable exports, and clone groups
-  (-> pcg_dedupe), each item paired with its fix command -> **pcg_tidy** (composes unused + dead_exports + duplication; a survey, changes nothing).
-- Rename a function/method to a new name WITHIN ITS OWN PACKAGE across the codebase (the first of six WRITE
+  (-> pcg_dedupe), each item paired with its fix command -> **pcg_tidy** (composes unused + dead_exports + duplication; a survey by default, or `apply:true` to ORCHESTRATE the safe subset -- dedupe + rm, re-syncing between, dead exports excluded).
+- Rename a function/method to a new name WITHIN ITS OWN PACKAGE across the codebase (the first of seven WRITE
   tools; for a cross-package move use pcg_move; edits only the call sites it can tie to the symbol, reports the
   dynamic ones) -> **pcg_rename** (dry-run unless apply:true; call pcg_sync after).
 - Move a function to another existing package (relocate its source + requalify call sites to NewPkg::sub) -> **pcg_move** (dry-run unless apply:true; call pcg_sync after).
 - Inline a simple function at its call sites (a do{} block) + remove the definition, the inverse of extract -> **pcg_inline** (dry-run unless apply:true; refuses unsafe bodies; call pcg_sync after).
+- Extract a statement RANGE out of a sub into a new sub -- the inverse of inline (and the actor for a duplication /
+  long-method finding); params are inferred from outer vars it reads, the return list from locals used after ->
+  **pcg_extract** `<file> <START-END> <name>` (conservative: refuses non-local control flow / mutated-outer / @_ / state; dry-run unless apply:true; call pcg_sync after).
 - De-duplicate a clone group (from pcg_duplication): keep one canonical function, rewrite each EXACT type-1 duplicate
   to `{ goto &Canonical }`, the inverse of copy-paste -> **pcg_dedupe** (dry-run unless apply:true; type-2/methods reported, not touched; call pcg_sync after).
-- Add or remove a plain function's PARAMETER and propagate it to every resolved call site (the actionable fix for a
-  parameter change pcg_checkargs would flag everywhere; function-only, indeterminate/method sites reported) ->
-  **pcg_change_signature** `--add '$p'` / `--remove N` (dry-run unless apply:true; call pcg_sync after).
+- Add, remove, or reorder a plain function's PARAMETER(S) and propagate to every resolved call site (the actionable fix
+  for a parameter change pcg_checkargs would flag everywhere; function-only, indeterminate/method sites reported) ->
+  **pcg_change_signature** `--add '$p'` / `--remove N` / `--reorder '2,1,3'` (dry-run unless apply:true; call pcg_sync after).
 - Safely DELETE a dead sub + cascade-remove the now-dead private helpers it solely used (the actionable follow-up to
   pcg_unused; refuses if still called or exported) -> **pcg_rm** (dry-run unless apply:true; call pcg_sync after).
 

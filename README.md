@@ -80,6 +80,7 @@ pcg checkcalls                    # broken method calls: a method the receiver's
 pcg checkargs                     # wrong-arity calls: too few / too many args to a sub whose signature fixes its arity
 pcg duplication                   # structural code clones (type-1/2): extract-a-shared-helper targets
 pcg tidy                          # one cleanup dashboard: removable dead code (-> rm), retractable exports, clones (-> dedupe)
+pcg tidy --apply                  # ...and execute the safe subset: dedupe clones + rm removable, re-syncing between (dead exports excluded)
 pcg smells                        # refactoring smells: feature-envy (move), god-class (split), long-parameter-list
 pcg hotspots                      # fan-in (+ blast radius) / fan-out / complexity / most-coupled-modules triage
 pcg risk                          # git churn x fan-in: frequently-changed + widely-depended-upon code
@@ -103,8 +104,9 @@ pcg rename Foo::bar baz [--apply]   # graph-driven rename within a package; repo
                                   #   $obj->method sites it can't verify. Dry-run unless --apply
 pcg move Foo::bar Other::Pkg [--apply]   # move a sub to another package: relocate source + requalify calls
 pcg inline Pkg::helper [--apply]         # inline a simple function at its call sites (do{} block) + remove def
+pcg extract lib/M.pm 10-15 helper [--apply]   # inverse of inline: lift a statement range into a new sub (params/returns inferred)
 pcg dedupe Pkg::canonical [--apply]      # de-dup a clone group: rewrite each EXACT duplicate to { goto &Pkg::canonical }
-pcg change-signature Pkg::f --remove 2 [--apply]   # add/remove a function's param + propagate to every resolved call site
+pcg change-signature Pkg::f --remove 2 [--apply]   # add / remove / --reorder '2,1,3' a function's params + propagate to every resolved call site
 pcg rm Pkg::dead [--apply]               # safely delete a dead sub + cascade now-dead private helpers (refuses if used/exported)
 pcg export --format mermaid --around Some::Module::run   # render the (sub)graph for docs/review (dot|mermaid|json|html -- html is a self-contained interactive viz)
 pcg search  thing
@@ -146,7 +148,7 @@ reverses them:
 Tools exposed (52): the read tools `pcg_overview`, `pcg_metrics`, `pcg_explore`, `pcg_explain`, `pcg_context`, `pcg_node`, `pcg_search`,
 `pcg_callers`, `pcg_callees`, `pcg_impact`, `pcg_path`, `pcg_unused`,
 `pcg_affected`, `pcg_deps`, `pcg_cycles`, `pcg_layers`, `pcg_checkcalls`, `pcg_checkargs`, `pcg_duplication`, `pcg_prereqs`, `pcg_hotspots`, `pcg_risk`, `pcg_owners`, `pcg_suggest_reviewers`, `pcg_cochange`, `pcg_semver`, `pcg_changelog`, `pcg_diff`, `pcg_review`, `pcg_pr`, `pcg_api`, `pcg_covers`, `pcg_untested`, `pcg_undocumented`, `pcg_doccheck`, `pcg_scaffold`, `pcg_dead_exports`, `pcg_tidy`, `pcg_smells`, `pcg_sinks`, `pcg_taint`,
-`pcg_unresolved`, `pcg_resolve`, the six write tools `pcg_rename` (rename), `pcg_move` (cross-package move), `pcg_inline` (inline a function), `pcg_dedupe` (merge a clone group), `pcg_change_signature` (add/remove a parameter across call sites) and `pcg_rm` (safe delete),
+`pcg_unresolved`, `pcg_resolve`, the seven write tools `pcg_rename` (rename), `pcg_move` (cross-package move), `pcg_inline` (inline a function), `pcg_extract` (extract a statement range into a new sub), `pcg_dedupe` (merge a clone group), `pcg_change_signature` (add/remove/reorder parameters across call sites) and `pcg_rm` (safe delete),
 plus lifecycle tools `pcg_index` (with
 `runtime`, `deps` and `embed` options), `pcg_sync` and `pcg_status`. The
 agent can therefore build and refresh the graph
@@ -258,8 +260,11 @@ Static resolvers connect indirection that plain parsing misses (provenance
   `@ISA`/`parent`/`base`/Moo·Moose `extends`/`Mojo::Base`/native `class :isa`, plus
   composed `with`/`:does` roles) all
   become edges — the `$self`/`$class`/role ones as `heuristic` provenance.
-  Attribute accessors resolve too: Moo/Moose `has` and native `field :reader`
-  emit accessor methods, so `$self->attr` links statically. Moo/Moose modifiers
+  Attribute accessors resolve too: Moo/Moose/Mojo `has`, native `field :reader`,
+  and the common accessor-generator modules — `Class::XSAccessor`/`::Array`
+  (`getters`/`setters`/`accessors`/`predicates`), `Class::Tiny`, `Object::Tiny`,
+  and `Class::Accessor`'s `__PACKAGE__->mk_accessors(...)` — all emit accessor
+  methods, so `$self->attr` links statically. Moo/Moose modifiers
   (`before`/`after`/`around`) link as `overrides`.
 - **Type inference** — when a receiver's class is known statically, its method
   call resolves against that class's MRO deterministically (provenance

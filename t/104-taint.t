@@ -60,7 +60,8 @@ my $txt = App::PerlGraph::Format::taint($r);
 like $txt, qr/Taint paths/,                    'format: header';
 like $txt, qr/\*\*\[local\]\*\*/,              'format: flags the local hit';
 like $txt, qr/`App::handler` -> `App::run_cmd`/, 'format: renders the call path';
-like $txt, qr/REACHABILITY, not value-flow/,   'format: the honest caveat';
+like $txt, qr/\[value-flow\].*strongest/s,     'format: the caveat ranks [value-flow] as the strongest tier (not [local])';
+like $txt, qr/REACHABILITY only/,              'format: an untagged cross-sub path is called reachability-only';
 like App::PerlGraph::Format::taint({ paths => [], sinks => 0, sources => 0 }),
     qr/_no dynamic sinks found_/, 'format: clean-state (no dynamic sinks)';
 like App::PerlGraph::Format::taint({ paths => [], sinks => 3, sources => 0 }),
@@ -81,5 +82,38 @@ my $nosrc = _taint_of("package Z;\nuse v5.36;\nsub f (\$x) { system(\"\$x\") }\n
 is $nosrc->{sinks}, 1,            'Query: a dynamic sink with no user-input source still counts the sink';
 is $nosrc->{sources}, 0,         'Query: ...but reports zero sources';
 is scalar @{ $nosrc->{paths} }, 0, 'Query: ...and no taint paths';
+
+# --- external (non-web) sources: $ENV / @ARGV / STDIN -> a dynamic sink (CLI / env injection) ---
+my $env = _taint_of("package Z;\nuse v5.36;\nsub run { my \$c = \$ENV{CMD}; system(\"echo \$c\") }\n1;\n");
+is scalar @{ $env->{paths} }, 1,         'Query: a sub reading $ENV that runs a dynamic command is a taint path';
+is $env->{paths}[0]{source}{kind}, 'external', 'Query: $ENV is classified an external source';
+is $env->{paths}[0]{source}{detail}, '$ENV',   'Query: the source detail names $ENV';
+ok $env->{paths}[0]{local},              'Query: read + used in one sub is a [local] hit';
+my $argv = _taint_of("package Z;\nuse v5.36;\nsub run { my \$f = \$ARGV[0]; system(\"cat \$f\") }\n1;\n");
+is $argv->{paths}[0]{source}{detail}, '@ARGV', 'Query: \$ARGV[0] / \@ARGV is detected as an external source';
+my $stdin = _taint_of("package Z;\nuse v5.36;\nsub run { my \$l = <STDIN>; system(\"grep \$l\") }\n1;\n");
+is $stdin->{paths}[0]{source}{detail}, 'STDIN', 'Query: <STDIN> is detected as an external source';
+
+# --- intra-procedural VALUE-FLOW: confirm the tainted value reaches the sink ARGUMENT ----
+my $vf = _taint_of("package Z;\nuse v5.36;\nsub run { my \$c = \$ENV{CMD}; system(\"echo \$c\") }\n1;\n");
+ok $vf->{paths}[0]{value_flow}, 'Query: $ENV value assigned then interpolated into system() is value-flow-confirmed';
+ok $vf->{paths}[0]{local},      'Query: ...and still a local hit';
+# co-located but NOT value-flow: reads $ENV, but the sink interpolates an UNTAINTED var
+my $co = _taint_of("package Z;\nuse v5.36;\nsub cfg { '/t' }\nsub run { my \$u = \$ENV{U}; my \$d = cfg(); system(\"ls \$d\") }\n1;\n");
+my ($corun) = grep { $_->{src_sub} =~ /::run/ } @{ $co->{paths} };
+ok $corun && $corun->{local},        'Query: source + sink in one sub is a local hit';
+ok $corun && !$corun->{value_flow},  'Query: ...but NOT value-flow when the sink arg is an untainted var (co-located only)';
+# the source interpolated DIRECTLY into the sink (hash-element interp is a dynamic sink + value-flow)
+my $di = _taint_of("package Z;\nuse v5.36;\nsub run { system(\"run \$ENV{X}\") }\n1;\n");
+ok $di->{paths}[0] && $di->{paths}[0]{value_flow}, 'Query: $ENV{X} interpolated straight into system() is a dynamic sink AND value-flow';
+# taint propagates through a LIST assignment whose RHS holds a tainted var, even though one LHS
+# could already be tainted -- the fixed point must not bail on the whole multi-target assignment.
+my $li = _taint_of("package Z;\nuse v5.36;\nsub run { my \$c = \$ENV{CMD}; my (\$a, \$b) = split(/ /, \$c); system(\"go \$a\") }\n1;\n");
+ok $li->{paths}[0] && $li->{paths}[0]{value_flow}, 'Query: $ENV -> $c -> ($a,$b)=split(...$c) -> system($a) is value-flow (list-assignment propagation)';
+# a source named only in a COMMENT is not a real read -- must not flag the sub as a taint source
+my $cmt = _taint_of("package Z;\nuse v5.36;\nsub run (\$x) {\n    # historically read \$ENV{PATH} here\n    system(\"\$x\");\n}\n1;\n");
+is $cmt->{sources}, 0, 'Query: a $ENV mentioned only in a full-line comment is NOT counted as a taint source';
+my $icmt = _taint_of("package Z;\nuse v5.36;\nsub run (\$x) {\n    system(\"\$x\");  # avoids \$ENV{HOME} on sandboxed runs\n}\n1;\n");
+is $icmt->{sources}, 0, 'Query: a $ENV in an INLINE (trailing) comment is NOT counted as a taint source either';
 
 done_testing;

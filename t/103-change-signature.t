@@ -93,7 +93,25 @@ like App::PerlGraph::Format::change_signature($rm), qr/Applied \*\*\d+\*\* edit/
 like $rf->change_signature('M::recur', remove => 9)->{error}, qr/1-based position/, 'rejects an out-of-range remove position';
 like $rf->change_signature('M::nope', remove => 1)->{error},  qr/no plain function/, 'rejects an unknown function';
 like $rf->change_signature('M::recur')->{error}, qr/--add.*--remove/, 'requires an operation';
-like $rf->change_signature('M::recur', add => 1, remove => 1)->{error}, qr/either --add or --remove/, 'rejects both operations';
+like $rf->change_signature('M::recur', add => 1, remove => 1)->{error}, qr/only one of/, 'rejects more than one operation';
+
+# --- reorder: permute the signature + every resolved call site's argument list -----------
+my $ro = $rf->change_signature('M::area', reorder => '2,1', apply => 1);
+ok !$ro->{error}, 'reorder succeeds' or diag $ro->{error};
+is $ro->{op}, 'reorder',          'op is reorder';
+is $ro->{position}, '2,1',        'the permutation is reported';
+is $ro->{new_signature}, '($h, $w)', 'the signature parameters are swapped';
+my $rosrc = $dir->child('lib/M.pm')->slurp_utf8;
+like $rosrc, qr/sub area \(\$h, \$w\)/, 'the signature is reordered on disk';
+like $rosrc, qr/M::area\(4, 3\)/,       'a literal call M::area(3, 4) -> (4, 3)';
+like $rosrc, qr/M::area\(6, 5\)/,       'a literal call M::area(5, 6) -> (6, 5)';
+like $rosrc, qr/M::area\(\$h, \$w\)/,   'the recursive call M::area($w, $h) -> ($h, $w)';
+ok( (grep { ($_->{why} // '') =~ /method call/ }   @{ $ro->{frontier} }), 'the $self->area method call is reported, not reordered' );
+ok( (grep { ($_->{why} // '') =~ /indeterminate/ } @{ $ro->{frontier} }), 'the splat call M::area(@d) is reported, not reordered' );
+like $rf->change_signature('M::opt', reorder => '2,2')->{error},   qr/permutation of 1\.\.2/, 'rejects a non-permutation (a repeated position)';
+like $rf->change_signature('M::opt', reorder => '1,2')->{error},   qr/current order/,         'rejects a no-op reorder';
+like $rf->change_signature('M::opt', reorder => '2,1,3')->{error}, qr/permutation of 1\.\.2/, 'rejects a reorder of the wrong length';
+like App::PerlGraph::Format::change_signature($ro), qr/reorder parameters \(2,1\)/, 'format: the reorder verb names the permutation';
 like $rf->change_signature('M::run', remove => 1)->{error}, qr/no explicit signature/, 'refuses a sub with no explicit signature (cannot map positions)';
 like $rf->change_signature('M::recur', add => '123bad')->{error}, qr/takes a parameter/, 'rejects a malformed --add spec';
 like $rf->change_signature('M::recur', add => '$z', at => 99)->{error}, qr/1-based position/, 'rejects an out-of-range --at position';

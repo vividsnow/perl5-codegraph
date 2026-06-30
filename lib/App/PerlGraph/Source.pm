@@ -1,6 +1,6 @@
 package App::PerlGraph::Source;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Path::Tiny qw(path);
 
 # Read a node's verbatim source from its file by line range, so queries can

@@ -1,5 +1,134 @@
 Revision history for App-PerlGraph
 
+0.072     2026-06-30
+          - Post-wave-9 REVIEW-LOOP HARDENING (a 3-reviewers-per-round adversarial pass over the 0.066-0.071
+            changes; real findings fixed, false positives filtered):
+            - pcg_taint value-flow: the intra-procedural fixed point no longer bails on a MULTI-TARGET assignment
+              when one LHS is already tainted -- it propagates while any LHS is still untainted (over-tainting is
+              the safe direction for taint), so `my $c=$ENV{X}; my ($a,$b)=split(/ /,$c); system($a)` is now
+              correctly value-flow instead of a false negative.
+            - Format::taint footer corrected: it claimed `[local]` was the strongest tier, but value-flow now
+              outranks it everywhere else (the sort, the per-path labels, the MCP description) -- the confidence
+              note now names `[value-flow]` strongest, then `[local]`, then untagged cross-sub reachability.
+            - pcg_extract refuses a range whose last line also holds the sub's closing brace (`stmt }` on one
+              line) -- the line-based splice would otherwise eat the `}` and corrupt the file.
+            - pcg_extract also refuses a range that declares a `state` variable -- a `state` var's cross-call
+              persistence (and any post-range write-back) would silently change meaning once moved into a new sub.
+            - taint sources: `_taint_source` now scans the sub source with its COMMENTS removed (via the
+              tree-sitter comment nodes, so both full-line and inline `# ... $ENV{X} ...` notes are stripped
+              without disturbing `#` inside strings/regexes), so a sub whose comment merely mentions
+              `$ENV{...}` / `@ARGV` (but never reads it) is not flagged as a taint source.
+            - Class::Tiny's HASH-DEFAULT form `use Class::Tiny { attr => $default }`: the list-branch now
+              collects the hash KEYS (the attributes) instead of running `_collect_strings` over the whole
+              statement, which had collected the string DEFAULTS as bogus accessors and missed the real keys.
+            - accessor generators: the `mk_accessors` family now fires ONLY for a class invocant
+              (`__PACKAGE__` / a Pkg name / a Capitalized bareword) -- `$obj->mk_accessors(...)` on a real
+              instance (or a same-named method on another class) no longer attaches phantom accessors to the
+              current package and swallow its call edge.
+            - pcg_extract: refuses a range with MORE THAN ONE array/hash OUTPUT (mirroring the existing input
+              guard) -- `my (@a, @b) = f()` would let @a swallow every return value; the single allowed array/hash
+              return is placed last.
+            - pcg_extract variable detection (`_var_used`) now recognizes the BRACED forms `${x}` / `@{x}` / `%{x}`
+              (and braced element/slice access) across all sigils -- a variable used only via braced interpolation
+              (`"${tag}suffix"`) was missed, so it was silently dropped from the inferred inputs/outputs, generating
+              broken code. (change_signature --remove already handled braces; extract now matches.)
+            - generated accessors (metadata.accessor: has / Class::Tiny / Class::XSAccessor / mk_accessors) are
+              now excluded from pcg_untested, pcg_undocumented, pcg_metrics, pcg_review's untested findings, and
+              pcg_context's callee bodies -- they're real public surface (still in pcg_api) but need no per-accessor
+              test/POD, so they no longer flood those reports (the long-dead metadata.accessor flag now does its job).
+            - doc-sync: the `extract` header comment + the agent-facing pcg_extract MCP/skill descriptions now
+              list the `state` and closing-brace-line refusals; the change_signature header ("Two operations" ->
+              three, with reorder) and the Refactor module POD ("six write tools" -> seven + the tidy orchestrator)
+              were stale after the 0.070/0.071 additions.
+            - Accessor generators: Class::XSAccessor's hashref-WRAPPER calling form `use X { getters => {...},
+              constructor => 'new', chained => 1 }` no longer emits the option keywords as bogus accessor method
+              nodes -- the filter is the COMPLETE documented option set (accessors/getters/setters/
+              lvalue_accessors/predicates/exists_predicates/constructor/constructors/true/false/replace/chained),
+              since in that form they're structurally identical to real `name => value` accessor entries.
+          - Tests +22 (1633): t/104 (list-assignment value-flow, the corrected footer tiers, full-line + inline
+            comment-only sources), t/106 (the brace-eating + `state` + 2-array-output refusals; braced-var
+            input/output detection), t/49 (the wrapper form excludes hash/array + scalar/boolean option keywords;
+            the Class::Tiny hash-default form; the mk_accessors class-invocant guard; the untested accessor
+            filter). Also dropped a redundant `exists &&` from the op-count guard.
+
+0.071     2026-06-30
+          - `pcg change-signature --reorder '2,1,3'` (pcg_change_signature reorder) -- the THIRD signature
+            operation, completing the codemod (alongside --add / --remove from 0.064). Takes a permutation of
+            the 1-based parameter positions and reorders BOTH the signature AND the argument list at every
+            resolved call site to match. Same conservative guarantees as add/remove: function-only (a `$self`/
+            `$class` first param is refused), a `$obj->method` dispatch or a statically-indeterminate argument
+            list (splat / deref / call-result) is reported to the frontier rather than mis-rewritten, and the
+            reordered signature is still checked against Perl's parameter-ordering rules (slurpy-last,
+            required-before-optional). Rejects a non-permutation, a wrong-length list, or a no-op.
+          - Tests +14 (1611 total): t/103 gains a real reorder (signature swapped on disk, literal + variable +
+            recursive call sites rewritten, the method + splat calls reported to the frontier) and the
+            permutation-validation refusals; the reorder verb in the renderer. (The "one of --add/--remove/
+            --reorder" guard replaced the old two-op message.)
+
+0.070     2026-06-30
+          - `pcg extract <file> <START-END> <name>` (pcg_extract) -- the SEVENTH write tool, the inverse of
+            pcg_inline: lift a contiguous statement range out of a sub into a new named sub. The interface is
+            inferred from variable liveness -- variables declared OUTSIDE the range that it reads become the new
+            sub's parameters; variables it `my`-declares that are read AFTER it become the return list (with a
+            `my (...) =` binding at the call site). CONSERVATIVE: refuses anything it can't prove behaviour-
+            preserving -- non-local control flow in the range (return/next/last/redo/goto/wantarray), a direct
+            @_ read, an outer variable the range MUTATES, a range that splits a statement, or more than one
+            array/hash parameter. Dry-run by default (shows the generated sub + the call that replaces the range
+            + the inferred inputs/outputs); --apply / apply:true writes, placing the new sub after the enclosing
+            one. Wired through the CLI, the MCP (pcg_extract), and a Format renderer.
+          - Tool count 52 -> 53; the dedicated WRITE tools 6 -> 7 (rename/move/inline/EXTRACT/dedupe/change_signature/rm).
+          - Tests +29 (1597 total): t/106 dogfoods a matrix -- clean scalar extraction (+ placement + a recompiling
+            result), a void block, array I/O, and the refusals (control flow, mutated outer, split statement, @_,
+            no-enclosing-sub, bad range, bad name), plus dry-run-writes-nothing; t/15 + t/46 updated to 53.
+            Found + fixed a leading-digit name slipping past `\w+` (now a strict identifier check).
+
+0.069     2026-06-30
+          - `pcg tidy --apply` (pcg_tidy apply:true) closes the detect->fix loop: the cleanup dashboard can now
+            EXECUTE its safe subset, not just name the commands. Phase 1 dedupes each exact-clone group (rewrites
+            copies to `goto &Canonical`); phase 2 rm's each unused sub (with rm's own export/caller guards +
+            dead-private-helper cascade), looping so helpers freed by a removal surface after each graph re-sync.
+            Dead EXPORTS are reported but never auto-retracted (removing public API may break out-of-repo
+            consumers). Safe to batch because each write tool re-parses the file for byte-precise spans and a
+            survey's removable subs are mutually independent (an unused sub has no caller, so none calls another).
+            New App::PerlGraph::Refactor::tidy orchestrator; the survey footer now points at --apply.
+          - Tests +11 (1568 total): t/100 gains an end-to-end apply (clone deduped to a goto stub, orphan removed,
+            exported entry + canonical kept, the rewritten file recompiles) + the applied/empty renderer; the MCP
+            apply dispatch verified. pcg_tidy MCP/CLI/skill/README/SYNOPSIS docs gain the apply mode.
+
+0.068     2026-06-30
+          - `pcg taint` now does INTRA-PROCEDURAL VALUE-FLOW (the 9th wave's marquee). The same-sub case is
+            no longer just "this sub reads input AND has a sink" (they could be unrelated): a heuristic forward
+            taint over the sub's assignments tracks a value from a source through later assignments, and a
+            `[value-flow]` hit is reported only when a tainted variable actually reaches a command/SQL sink's
+            ARGUMENT (or a source is interpolated straight into it). A plain `[local]` hit is now downgraded to
+            "co-located -- verify"; `[value-flow]` ranks above it. Computed at extraction (metadata.taint_flow),
+            so the query stays graph-only. On jakutia this split the 7 same-sub hits into 2 confirmed value-flow
+            vs 5 co-located. EXTRACTION_VERSION 11 -> 12.
+          - Sink detection: a hash-element interpolation in a sink string (`system("... $ENV{cmd} ...")`,
+            `"...$cfg{x}..."`) is now recognized as a DYNAMIC (injectable) sink -- `_has_interp_var` previously
+            saw only scalar/array interpolation, so `$ENV{X}` / `$h{k}` straight into a sink was missed.
+          - Tests +5 (1557 total): t/104 gains value-flow confirmation, the co-located-but-not-flow case, and
+            the hash-element-interp dynamic sink. Query docstring + pcg_taint MCP/skill docs updated for the tiers.
+          - `pcg taint` / pcg_taint now detects EXTERNAL (non-web) input sources -- the CLI / environment
+            injection vector that was a documented gap. A sub that reads `$ENV{...}`, `@ARGV` / `$ARGV[N]`, or
+            `<STDIN>` / `<>` is flagged at extraction (metadata.taint_source) and treated as a taint SOURCE, so
+            taint pairs it with the same dynamic command/SQL sinks as the web sources. So a CLI tool doing
+            `system("... $ENV{CMD} ...")` is now a `[local]` taint path. EXTRACTION_VERSION 10 -> 11.
+          - Tests +6 (1552 total): t/104 gains $ENV, @ARGV and STDIN source detection (each a local path to a
+            dynamic system() sink, with the source kind classified `external`).
+          - Resolution depth (opens the 9th wave; battle-test-motivated -- jakutia uses Class::XSAccessor):
+            the extractor now recognizes the common ACCESSOR-GENERATOR modules and emits their accessor
+            methods, so `$self->attr` resolves (and stops being an unresolved call or a checkcalls/checkargs
+            false positive). Covered: `Class::XSAccessor` / `Class::XSAccessor::Array` (the method names are
+            the KEYS of each `getters`/`setters`/`accessors`/`predicates`/`exists_predicates` option hash, or
+            the elements of its array form), `Class::Tiny`, `Object::Tiny` (+::RW/::XS) via `use X qw(a b)`,
+            and `Class::Accessor`[::Fast]'s `__PACKAGE__->mk_accessors` / `mk_ro_accessors` / `mk_wo_accessors`.
+            EXTRACTION_VERSION 9 -> 10 (re-index picks it up). On jakutia this dropped checkcalls 65 -> 60
+            (the Class::XSAccessor-backed Cache::LMDB `->path`/`->pages` false positives are gone).
+          - Tests +11 (1546 total): t/49 gains the four generator families (hash + array XSAccessor forms,
+            the predicates method, the qw-list modules, and the mk_* class methods), and confirms `$self->path`
+            now resolves to the generated accessor and the module name is not mistaken for one.
+
 0.065     2026-06-26
           - Fix (found by battle-testing pcg on a real 643-file Moose/Mojo app): `pcg checkcalls` produced
             ~755 findings on it, ~91% FALSE POSITIVES. Two systematic causes, both now fixed -- the count

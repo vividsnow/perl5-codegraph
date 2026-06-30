@@ -1,6 +1,6 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use App::PerlGraph::Source;
 use App::PerlGraph::Model qw(package_of is_public);
 use Cpanel::JSON::XS ();
@@ -210,6 +210,30 @@ sub dead_exports ($nodes) {
 }
 
 sub tidy ($r) {
+    if ($r->{applied}) {                                          # `pcg tidy --apply` -- the executed result
+        my ($dd, $rm, $sk) = ($r->{deduped}, $r->{removed}, $r->{skipped});
+        my $out = "## Tidy -- applied\n\n";
+        return $out . "_nothing to apply_ -- no exact clones to dedupe and no removable dead code.\n"
+            unless @$dd || @$rm || @$sk;
+        $out .= scalar(@$rm) . " sub(s) removed, " . scalar(@$dd) . " clone group(s) deduped"
+              . (@$sk ? ', ' . scalar(@$sk) . ' skipped' : '') . " (graph re-synced after each phase):\n\n";
+        if (@$dd) {
+            $out .= "### Deduped -- rewritten to `goto &canonical`\n";
+            $out .= "- **$_->{canonical}** <- " . join(', ', map { "`$_`" } @{ $_->{replaced} }) . "\n" for @$dd;
+            $out .= "\n";
+        }
+        if (@$rm) {
+            $out .= "### Removed\n";
+            $out .= "- `$_->{name}`" . ($_->{cascade} ? ' (cascade -- a now-dead private helper)' : '') . "\n" for @$rm;
+            $out .= "\n";
+        }
+        if (@$sk) {
+            $out .= "### Skipped (left for you)\n";
+            $out .= "- $_->{op} `$_->{target}` -- $_->{why}\n" for @$sk;
+            $out .= "\n";
+        }
+        return $out . "_Dead exports were NOT auto-retracted (removing public API can break out-of-repo consumers); `pcg tidy` lists them._\n";
+    }
     my ($rm, $ret, $cl) = ($r->{removable}, $r->{retractable}, $r->{clones});
     my $total = @$rm + @$ret + @$cl;
     my $out = "## Tidy -- cleanup opportunities\n\n";
@@ -241,6 +265,8 @@ sub tidy ($r) {
         $out .= "\n";
     }
     $out .= "(dead-code and clone detection don't see dynamic dispatch or downstream consumers -- review each before applying.)\n";
+    $out .= "Run `pcg tidy --apply` to execute the safe subset in one pass (dedupe clones + rm removable, re-syncing between; dead exports excluded).\n"
+        if @$rm || @$cl;
     return $out;
 }
 
@@ -911,9 +937,24 @@ sub rm ($r) {
     return $out;
 }
 
+sub extract ($r) {
+    return "## Extract\n\n**error**: $r->{error}\n" if $r->{error};
+    my $out = "## Extract `$r->{name}` " . ($r->{applied} ? '-- applied' : '-- dry run') . "\n\n";
+    $out .= "Lifted lines $r->{lines} of `$r->{sub}` into a new sub `$r->{name}` -- "
+          . 'inputs: ' . (@{ $r->{inputs} }  ? join(', ', map { "`$_`" } @{ $r->{inputs} })  : 'none') . '; '
+          . 'returns: ' . (@{ $r->{outputs} } ? join(', ', map { "`$_`" } @{ $r->{outputs} }) : 'nothing') . ".\n\n";
+    $out .= "Call site (replaces the range):\n```perl\n$r->{call}```\n\n";
+    $out .= "New sub:\n```perl\n$r->{new_sub}```\n";
+    $out .= $r->{applied} ? "\nApplied. Run `pcg sync` to refresh the graph.\n"
+                          : "\n(dry run -- add `--apply` / apply:true to write it; review the inferred inputs/outputs first.)\n";
+    return $out;
+}
+
 sub change_signature ($r) {
     return "## Change signature\n\n**error**: $r->{error}\n" if $r->{error};
-    my $verb = $r->{op} eq 'remove' ? "remove parameter \#$r->{position}" : "add parameter at \#$r->{position}";
+    my $verb = $r->{op} eq 'remove'  ? "remove parameter \#$r->{position}"
+             : $r->{op} eq 'reorder' ? "reorder parameters ($r->{position})"
+             :                         "add parameter at \#$r->{position}";
     my $out  = "## Change signature `$r->{target}` -- $verb\n\n";
     $out .= "`$r->{signature}` -> `$r->{new_signature}`\n\n";
     my $files = scalar @{ $r->{files} };
@@ -969,22 +1010,28 @@ sub taint ($r) {
     return $out . "_no dynamic sinks found_ (no command/SQL site builds its argument from a variable).\n"
         unless $r->{sinks};
     return $out . "_$r->{sinks} dynamic sink(s) found, but no user-input source reaches any of them._"
-        . " (sources looked for: web endpoints + request accessors -- param / params / cookie(s) /"
-        . " upload(s) / header(s) / query_parameters / body_parameters / route_parameters.)\n"
+        . " (sources looked for: web endpoints, request accessors -- param / cookie(s) / upload(s) /"
+        . " header(s) / query_parameters / body_parameters / route_parameters -- and external input \$ENV / \@ARGV / STDIN.)\n"
         unless @{ $r->{paths} };
     $out .= scalar(@{ $r->{paths} }) . " taint path(s) -- a user-input source whose call graph REACHES a"
           . " dynamically-built command/SQL sink ($r->{sources} source(s), $r->{sinks} dynamic sink(s)):\n\n";
     for my $p (@{ $r->{paths} }) {
         my $src = $p->{source}{kind} eq 'endpoint' ? "endpoint `$p->{source}{detail}`"
-                                                   : "reads `->$p->{source}{detail}`";
+                : $p->{source}{kind} eq 'external' ? "reads `$p->{source}{detail}`"        # $ENV / @ARGV / STDIN
+                :                                    "reads `->$p->{source}{detail}`";       # request accessor
         my $sinks = join(', ', map { "$_->{type}:$_->{name}" } @{ $p->{sinks} });
-        $out .= sprintf "- %s%s\n", ($p->{local} ? '**[local]** ' : ''), $src;
+        my $tag = $p->{value_flow} ? '**[value-flow]** ' : $p->{local} ? '**[local]** ' : '';
+        $out .= sprintf "- %s%s\n", $tag, $src;
         $out .= '    ' . join(' -> ', map { "`$_`" } @{ $p->{path} }) . "\n";
-        $out .= "    sink: **$sinks**" . ($p->{local} ? " (read and used in the SAME sub -- highest confidence)\n" : "\n");
+        $out .= "    sink: **$sinks**"
+              . ($p->{value_flow} ? " (the tainted value FLOWS into the sink argument -- confirmed in-sub)\n"
+               : $p->{local}      ? " (source + sink share the sub, but the value may not reach the sink arg -- verify)\n"
+               :                    "\n");
     }
-    $out .= "\n(call-graph REACHABILITY, not value-flow: it proves input can reach the sink's sub, not that the\n"
-          . "tainted value lands in the sink's argument -- VERIFY each. A **[local]** hit is the strongest. \$ENV /\n"
-          . "\@ARGV / STDIN sources are not yet detected.)\n";
+    $out .= "\nCONFIDENCE: **[value-flow]** = the tainted value provably reaches the sink's ARGUMENT in one sub (the\n"
+          . "strongest); **[local]** = source + sink share a sub but the value may not reach the argument; an\n"
+          . "untagged cross-sub path is call-graph REACHABILITY only -- it proves input can reach the sink's sub,\n"
+          . "not that the tainted value lands in its argument. VERIFY each.\n";
     return $out;
 }
 

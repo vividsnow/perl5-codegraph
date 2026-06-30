@@ -1,6 +1,6 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Moo;
 use App::PerlGraph::Model qw(package_of is_public is_universal);
 use App::PerlGraph::Grammar qw(NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_LIST_EXPR F_ARGUMENTS F_FUNCTION F_METHOD F_INVOCANT);
@@ -391,14 +391,16 @@ sub sinks ($self, %opt) {
 
 # Source -> sink TAINT PATHS: trace a call path from a user-input SOURCE to an injectable
 # SINK. Sharper than pcg_sinks (which only does route->sink reachability): the sources are
-# broader -- a route handler (endpoint) OR any sub that calls a request accessor (param /
+# broader -- a route handler (endpoint), any sub that calls a request accessor (param /
 # params / cookie(s) / upload(s) / header(s) / query_parameters / body_parameters /
-# route_parameters) -- and only DYNAMIC sinks
+# route_parameters), OR any sub that reads external process input ($ENV / @ARGV / STDIN,
+# flagged metadata.taint_source at extraction) -- and only DYNAMIC sinks
 # (whose command/SQL string is built from a variable -- the injectable ones) are targets, with
-# the actual call PATH shown. It is call-graph reachability, NOT value-flow: it proves user
-# input can REACH the sink's sub, not that the specific tainted value lands in the sink's
-# argument -- so a hit is a path to VERIFY (a `local` hit, source and sink in the SAME sub, is
-# the highest-confidence). $ENV / @ARGV / STDIN sources are not yet detected (a known gap).
+# the actual call PATH shown. A same-sub case is sharpened by INTRA-PROCEDURAL value-flow
+# (metadata.taint_flow): a `value_flow` hit means the tainted value provably reaches the sink's
+# ARGUMENT (highest confidence); a plain `local` hit is co-located (source + sink in the sub, but
+# the value may not reach the arg). Cross-sub paths are call-graph reachability only -- they prove
+# user input can REACH the sink's sub, not that the tainted value lands in its argument; VERIFY them.
 my %TAINT_SOURCE_CALLS = map { $_ => 1 } qw(
     param params cookie cookies upload uploads header headers
     query_parameters body_parameters route_parameters);
@@ -422,6 +424,10 @@ sub taint ($self, %opt) {
         $source{ $ref->{from_node_id} } //= { kind => 'request', detail => $nm }
             if $TAINT_SOURCE_CALLS{$nm} && $ref->{from_node_id};
     }
+    for my $fn ($s->all_nodes(qw(function method))) {         # subs that read external process input
+        my $ts = ($fn->{metadata} // {})->{taint_source} or next;   # $ENV / @ARGV / STDIN
+        $source{ $fn->{id} } //= { kind => 'external', detail => $ts };
+    }
     return { paths => [], sinks => scalar keys %sink, sources => 0 } unless %source;
 
     my @paths;                                                # forward BFS from each source to the nearest sinks
@@ -432,7 +438,10 @@ sub taint ($self, %opt) {
             for my $path (@q) {
                 my $id = $path->[-1];
                 push @paths, { source => $source{$src}, ids => [ @$path ], sinks => $sink{$id},
-                               local => ($id eq $src ? 1 : 0) }
+                               local => ($id eq $src ? 1 : 0),
+                               # a local hit whose sub has intra-procedural value-flow is CONFIRMED:
+                               # the tainted value actually reaches the sink argument, not just co-located.
+                               value_flow => ($id eq $src && (($s->node($id)->{metadata} // {})->{taint_flow}) ? 1 : 0) }
                     if $sink{$id} && !$hit{$id}++;
                 for my $e ($s->outgoing_edges($id, 'calls', 'references')) {
                     push @next, [ @$path, $e->{target} ] if $e->{target} && !$seen{ $e->{target} }++;
@@ -447,7 +456,7 @@ sub taint ($self, %opt) {
         $p->{sink_sub} = $p->{path}[-1];
         delete $p->{ids};
     }
-    @paths = sort { $b->{local} <=> $a->{local} || @{ $a->{path} } <=> @{ $b->{path} }
+    @paths = sort { $b->{value_flow} <=> $a->{value_flow} || $b->{local} <=> $a->{local} || @{ $a->{path} } <=> @{ $b->{path} }
                  || $a->{src_sub} cmp $b->{src_sub} || $a->{sink_sub} cmp $b->{sink_sub} } @paths;
     my $limit = $opt{limit} || 50;
     @paths = @paths[0 .. $limit - 1] if @paths > $limit;
@@ -611,7 +620,9 @@ sub untested ($self, $module = undef) {
         : map { $_->{qualified_name} // $_->{name} } grep { !($_->{metadata} // {})->{cpan} } $s->all_nodes(qw(package class));
     my (%seen, @out);
     for my $m (@modules) {
-        push @out, grep { !$reached{ $_->{id} } && !$seen{ $_->{id} }++ } $self->api($m);
+        # GENERATED accessors (has / Class::Tiny / Class::XSAccessor / mk_accessors -- metadata.accessor)
+        # are public surface but need no test of their own; excluding them keeps untested signal real.
+        push @out, grep { !$reached{ $_->{id} } && !($_->{metadata} // {})->{accessor} && !$seen{ $_->{id} }++ } $self->api($m);
     }
     return @out;
 }
@@ -668,7 +679,9 @@ sub undocumented ($self, $module = undef) {
         : map { $_->{qualified_name} // $_->{name} } grep { !($_->{metadata} // {})->{cpan} } $s->all_nodes(qw(package class));
     my (%seen, @out);
     for my $m (@modules) {
-        push @out, grep { !$seen{ $_->{id} }++ && !(defined $_->{docstring} && $_->{docstring} =~ /\S/) } $self->api($m);
+        # exclude generated accessors (metadata.accessor) -- they need no per-accessor POD stanza.
+        push @out, grep { !$seen{ $_->{id} }++ && !($_->{metadata} // {})->{accessor}
+                          && !(defined $_->{docstring} && $_->{docstring} =~ /\S/) } $self->api($m);
     }
     return @out;
 }
@@ -1357,6 +1370,7 @@ sub context ($self, $spec, %opt) {
         for my $c (@{ $v->{callees} }) {               # project callees -> inline their source
             next unless ($c->{kind} // '') =~ /function|method/;
             next if ($c->{metadata} // {})->{cpan} || !$c->{file_path};   # skip external deps
+            next if ($c->{metadata} // {})->{accessor};                   # a generated accessor's "body" is just its `use` line
             push @callees, $c unless $callee_seen{ $c->{id} }++;
         }
         my $qn = $node->{qualified_name} // $node->{name};

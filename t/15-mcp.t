@@ -20,7 +20,7 @@ is $mcp0->dispatch({ jsonrpc => '2.0', method => 'notifications/initialized' }),
 # --- tools/list ---
 my $tl = $mcp0->dispatch({ jsonrpc => '2.0', id => 2, method => 'tools/list' });
 my @tools = @{ $tl->{result}{tools} };
-is scalar(@tools), 52, 'fifty-two tools (43 read + 6 write + index / sync / status)';
+is scalar(@tools), 53, 'fifty-three tools (43 read + 7 write + index / sync / status)';
 ok( (grep { $_->{name} eq 'pcg_callers'  } @tools), 'pcg_callers listed' );
 ok( (grep { $_->{name} eq 'pcg_hotspots' } @tools), 'pcg_hotspots listed' );
 ok( (grep { $_->{name} eq 'pcg_untested' } @tools), 'pcg_untested listed' );
@@ -34,6 +34,7 @@ ok( (grep { $_->{name} eq 'pcg_path'     } @tools), 'pcg_path listed' );
 ok( (grep { $_->{name} eq 'pcg_affected' } @tools), 'pcg_affected listed' );
 ok( (grep { $_->{name} eq 'pcg_deps'     } @tools), 'pcg_deps listed' );
 ok( (grep { $_->{name} eq 'pcg_api'      } @tools), 'pcg_api listed' );
+ok( (grep { $_->{name} eq 'pcg_extract'  } @tools), 'pcg_extract listed' );
 is $tools[0]{inputSchema}{type}, 'object', 'inputSchema is an object';
 is $tools[0]{name}, 'pcg_overview', 'pcg_overview is advertised first (the recommended first call)';
 
@@ -128,6 +129,8 @@ like _call('pcg_taint',  {}),                       qr/Taint paths/,            
 like _call('pcg_pr', {}),                           qr/`ref` is required|needs git/i, 'pcg_pr dispatches (ref/git guard)';
 like _call('pcg_change_signature', { target => 'No::Such', remove => 1 }), qr/no plain function/,
      'pcg_change_signature dispatches (handler wiring + error path)';
+like _call('pcg_extract', { file => 'no/such.pm', lines => '1-2', name => 'x' }), qr/no such file/,
+     'pcg_extract dispatches (handler wiring + error path)';
 like _call('pcg_search', { query => 'run', semantic => 1 }), qr/Semantic search/,      'pcg_search semantic:true routes to the semantic handler (not keyword)';
 like _call('pcg_unresolved', {}),                   qr/Unresolved method calls/,       'pcg_unresolved dispatches';
 like _call('pcg_resolve', { resolutions => [] }),   qr/applied 0/,                     'pcg_resolve dispatches (empty input)';

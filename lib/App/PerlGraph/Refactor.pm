@@ -1,6 +1,6 @@
 package App::PerlGraph::Refactor;
 use v5.36;
-our $VERSION = q{0.065};
+our $VERSION = q{0.072};
 use Moo;
 use App::PerlGraph::Model qw(package_of);
 use App::PerlGraph::Grammar qw(:all);
@@ -470,9 +470,10 @@ sub _apply_removals ($self, $nodes) {
 }
 
 # The SIXTH write tool: change a plain function's parameter list and propagate it to every
-# RESOLVED call site. Two conservative operations -- add a parameter (`add => SPEC`, at 1-based
-# position `at` or appended, inserting `value` (default `undef`) at each call site) or remove
-# one (`remove => N`, dropping the Nth positional argument at each site). Function-only: a
+# RESOLVED call site. Three conservative operations -- add a parameter (`add => SPEC`, at 1-based
+# position `at` or appended, inserting `value` (default `undef`) at each call site), remove one
+# (`remove => N`, dropping the Nth positional argument at each site), or reorder them
+# (`reorder => '2,1,3'`, a permutation that also permutes each call site's args). Function-only: a
 # method ($self/$class first param) is refused, and a `$obj->method` call site is reported to
 # the frontier, because the invocant offsets the positions and the dispatch can't be statically
 # tied. A call site whose argument list is statically indeterminate (a splat / deref / call
@@ -480,10 +481,10 @@ sub _apply_removals ($self, $nodes) {
 # The def's signature and every call site are byte-span edits. Dry-run unless apply => 1.
 sub change_signature ($self, $target, %opt) {
     my $s = $self->store;
-    my $both = (exists $opt{add} && defined $opt{add}) + (exists $opt{remove} && defined $opt{remove});
-    return { error => "specify --add '\$param' or --remove N" } unless $both;
-    return { error => "use either --add or --remove, not both" }                       if $both > 1;
-    my $op = defined $opt{remove} ? 'remove' : 'add';
+    my $n_ops = (defined $opt{add}) + (defined $opt{remove}) + (defined $opt{reorder});
+    return { error => "specify --add '\$param', --remove N, or --reorder '2,1,3'" } unless $n_ops;
+    return { error => "use only one of --add / --remove / --reorder" }                if $n_ops > 1;
+    my $op = defined $opt{remove} ? 'remove' : defined $opt{reorder} ? 'reorder' : 'add';
 
     my @defs = grep { ($_->{kind} // '') eq 'function' }
                ($target =~ /::/ ? $s->nodes_by_qname($target) : $s->nodes_by_name($target));
@@ -505,6 +506,17 @@ sub change_signature ($self, $target, %opt) {
         return { error => "--remove takes a 1-based position (this signature has @{[ scalar @params ]} param(s))" }
             unless $pos =~ /\A[1-9][0-9]*\z/ && $pos <= @params;
         my @np = @params; splice @np, $pos - 1, 1; $newparams = \@np;
+    }
+    elsif ($op eq 'reorder') {
+        my @perm = grep { length } split /\s*,\s*/, ($opt{reorder} =~ s/\A\s+|\s+\z//gr);
+        return { error => "--reorder takes a comma list of 1-based positions, e.g. '2,1,3'" }
+            if !@perm || grep { !/\A[1-9][0-9]*\z/ } @perm;
+        return { error => "--reorder must be a permutation of 1..@{[ scalar @params ]} (got '@{[ join ',', @perm ]}')" }
+            unless @perm == @params && join(',', sort { $a <=> $b } @perm) eq join(',', 1 .. @params);
+        return { error => "the reorder leaves the parameters in their current order" }
+            if join(',', @perm) eq join(',', 1 .. @params);
+        $newparams = [ map { $params[$_ - 1] } @perm ];
+        $pos = \@perm;                                                # passed to _rewrite_args; carries the permutation
     }
     else {
         my $spec = $opt{add} =~ s/\A\s+|\s+\z//gr;
@@ -594,7 +606,8 @@ sub change_signature ($self, $target, %opt) {
     }
 
     my $applied = $opt{apply} ? $self->_apply_inline(\@edits, undef) : 0;
-    return { target => $qn, op => $op, position => $pos, signature => $sigtext, new_signature => $newsig,
+    return { target => $qn, op => $op, position => (ref $pos eq 'ARRAY' ? join(',', @$pos) : $pos),
+             signature => $sigtext, new_signature => $newsig,
              value => $value, edits => \@edits, frontier => \@frontier, files => [ sort keys %files ], applied => $applied };
 }
 
@@ -639,6 +652,11 @@ sub _rewrite_args ($argsnode, $op, $pos, $value) {
         return (undef, "the call passes $cnt arg(s) -- it does not reach the removed position $pos") if $cnt < $pos;
         my @na = @args; splice @na, $pos - 1, 1;
         return (join(', ', @na), undef);
+    }
+    if ($op eq 'reorder') {                                          # $pos is the permutation (1-based old positions, new order)
+        return (undef, "the call passes $cnt arg(s) but the signature has @{[ scalar @$pos ]} parameter(s) -- can't position-map the reorder")
+            if $cnt != @$pos;
+        return (join(', ', map { $args[$_ - 1] } @$pos), undef);
     }
     return (undef, 'the call has no argument list to extend -- add the argument manually') unless $argsnode;
     return (undef, "the call passes $cnt arg(s) -- cannot insert at position $pos") if $pos > $cnt + 1;
@@ -730,24 +748,208 @@ sub _apply_inline ($self, $edits, $remove) {
     return $count;
 }
 
+# Extract a contiguous STATEMENT RANGE out of a sub into a new named sub (the inverse of inline).
+# Inputs = variables declared OUTSIDE the range that it reads (-> the new sub's params); outputs =
+# variables the range `my`-declares that are read AFTER it (-> the return list + a `my (...) =` at
+# the call site). CONSERVATIVE: refuses anything it can't prove safe -- non-local control flow
+# (return/next/last/redo/goto/wantarray), a direct @_ read, an outer variable the range MUTATES
+# (its new value can't be threaded back), a `state` declaration (its persistence wouldn't survive),
+# a range that splits a statement (or one ending on the sub's closing-brace line), or >1 array/hash
+# input OR output (the call site couldn't unpack them).
+# Dry-run unless apply: shows the generated sub, the call that replaces the range, and inputs/outputs.
+sub extract ($self, $file, $range, $name, %opt) {
+    return { error => "give a bare sub name, not '@{[ $name // '' ]}'" } unless defined $name && $name =~ /\A[A-Za-z_]\w*\z/;
+    my ($rs, $re) = (($range // '') =~ /\A(\d+)-(\d+)\z/);
+    return { error => "range must be START-END line numbers (e.g. 10-15)" } unless $rs && $re && $re >= $rs;
+    my $disk = path($self->root)->child($file);
+    return { error => "no such file: $file" } unless $disk->is_file;
+    my $src  = $disk->slurp_raw;
+    my $tree = eval { $self->parser->parse_string($src) } or return { error => "could not parse $file" };
+    my @lines = split /(?<=\n)/, $src;
+
+    # enclosing sub = the smallest NODE_SUB whose body strictly contains [rs,re] (sl < rs keeps the
+    # `sub`/signature line outside the range; el >= re keeps the close brace outside).
+    my @subs;
+    { my @st = ($tree); while (my $n = pop @st) { push @subs, $n if ($n->{type} // '') eq NODE_SUB; push @st, @{ $n->{children} // [] } } }
+    my ($sub) = sort { ($a->{el} - $a->{sl}) <=> ($b->{el} - $b->{sl}) }
+                grep { ($_->{sl} // 0) < $rs && ($_->{el} // 0) >= $re } @subs;
+    return { error => "lines $range are not inside a single sub body" } unless $sub;
+
+    my ($block) = grep { ($_->{type} // '') eq NODE_BLOCK } @{ $sub->{children} };
+    return { error => "could not find the sub body" } unless $block;
+    my @stmts = grep { ($_->{type} // '') =~ /statement\z/ } @{ $block->{children} };
+    for my $s (@stmts) {                                          # a statement straddling either edge -> refuse
+        my ($a, $b) = ($s->{sl} // 0, $s->{el} // 0);
+        return { error => "lines $range split a statement (it spans lines $a-$b) -- extract whole statements" }
+            if ($a < $rs && $b >= $rs) || ($a <= $re && $b > $re);
+    }
+    my @rstmts = grep { ($_->{sl} // 0) >= $rs && ($_->{el} // 0) <= $re } @stmts;
+    return { error => "no complete statements in lines $range" } unless @rstmts;
+    my ($lo, $hi) = ($rstmts[0]{sl}, $rstmts[-1]{el});
+    # If the last statement shares its line with the sub's closing brace (`stmt }` on one line),
+    # the line-based splice that replaces the range would eat the `}` -- refuse rather than corrupt.
+    return { error => "the range's last line ($hi) also holds the sub's closing brace -- put the `}` on its own line, or shrink the range" }
+        if $hi >= ($sub->{el} // 0);
+    my $rtext = join '', @lines[ $lo - 1 .. $hi - 1 ];
+
+    for my $kw (qw(return next last redo goto wantarray)) {
+        return { error => "the range uses `$kw` -- a block with non-local control flow can't move into a sub" }
+            if $rtext =~ /(?<![\w>-])\b\Q$kw\E\b/;
+    }
+    return { error => "the range reads \@_ directly -- extract can't thread the caller's args" } if $rtext =~ /\@_/;
+    # A `state` var persists across calls to the ENCLOSING sub; moved into a new sub (called once
+    # per enclosing call) its persistence + any post-range write-back would silently change meaning.
+    return { error => "the range declares a `state` variable -- its cross-call persistence wouldn't survive extraction" }
+        if $rtext =~ /(?<![\w>-])\bstate\s+[\$\@%(]/;
+
+    # every `my`/`state`/`our`/`local` declaration in the sub, tagged with its line, + signature params.
+    my @decl;
+    { my @st = ($sub); while (my $n = pop @st) {
+        push @decl, { sl => $n->{sl} // 0, vars => [ _decl_vars($n) ] } if ($n->{type} // '') eq 'variable_declaration';
+        push @st, @{ $n->{children} // [] };
+    } }
+    my ($sig) = grep { ($_->{type} // '') eq 'signature' } @{ $sub->{children} };
+    my @sigp  = $sig ? (($sig->{text} // '') =~ /([\$\@%]\w+)/g) : ();
+    my %decl_in = map { $_ => 1 } map { @{ $_->{vars} } } grep { $_->{sl} >= $lo && $_->{sl} <= $hi } @decl;
+    my @outer   = do { my %s; grep { !$s{$_}++ } @sigp, map { @{ $_->{vars} } } grep { $_->{sl} < $lo } @decl };
+    my $atext   = $hi < ($sub->{el} // 0) ? join('', @lines[ $hi .. $sub->{el} - 1 ]) : '';
+
+    my @inputs  = grep { _var_used($rtext, $_) } @outer;                  # outer vars the range reads
+    my @outputs = grep { _var_used($atext, $_) } sort keys %decl_in;      # range-locals read afterwards
+
+    my @lhs = _assign_lhs(\@rstmts);                                      # non-my assignment targets in the range
+    if (my @mut = grep { my $in = $_; grep { _var_used($_, $in) } @lhs } @inputs) {
+        return { error => "the range modifies @{[ join ', ', @mut ]} (declared outside it) -- extract can't thread the new value back" };
+    }
+    return { error => "the range has more than one array/hash input (@{[ join ', ', grep { /\A[\@%]/ } @inputs ]}) -- not safely unpackable as params" }
+        if (grep { /\A[\@%]/ } @inputs) > 1;
+    @inputs = ((grep { /\A\$/ } @inputs), (grep { /\A[\@%]/ } @inputs));   # a single array/hash param goes last
+    # Same hazard on the RETURN side: `my (@a, @b) = f()` would let @a swallow everything. Refuse >1
+    # array/hash output, and put the single one last so `my ($s, @rest) = f()` unpacks correctly.
+    return { error => "the range has more than one array/hash output (@{[ join ', ', grep { /\A[\@%]/ } @outputs ]}) -- the call site can't unpack them (the first would swallow the rest)" }
+        if (grep { /\A[\@%]/ } @outputs) > 1;
+    @outputs = ((grep { /\A\$/ } @outputs), (grep { /\A[\@%]/ } @outputs));
+
+    my $indent = $lines[$lo-1] =~ /\A(\s*)/ ? $1 : '';
+    (my $body = $rtext) =~ s/\n\z//;
+    my $ret = @outputs > 1 ? '(' . join(', ', @outputs) . ')' : $outputs[0];
+    my @nb = ("sub $name {\n");
+    push @nb, "${indent}my (" . join(', ', @inputs) . ") = \@_;\n" if @inputs;
+    push @nb, map { "$_\n" } split /\n/, $body;
+    push @nb, "${indent}return $ret;\n" if @outputs;
+    push @nb, "}\n";
+    my $new_sub = join '', @nb;
+    my $call = $indent . (@outputs ? "my $ret = " : '') . "$name(" . join(', ', @inputs) . ");\n";
+
+    my $applied = 0;
+    if ($opt{apply}) {
+        splice @lines, $lo - 1, $hi - $lo + 1, $call;            # range -> the call
+        my $insert = ($sub->{el} // 0) - ($hi - $lo);           # the close brace shifted up by the lines we removed
+        splice @lines, $insert, 0, "\n$new_sub";                # new sub right after the enclosing sub
+        $disk->spew_raw(join '', @lines);
+        $applied = 1;
+    }
+    return { sub => (($sub->{fields}{ +F_NAME } // {})->{text} // '?'), name => $name, file => $file,
+             lines => "$lo-$hi", inputs => \@inputs, outputs => \@outputs,
+             new_sub => $new_sub, call => $call, applied => $applied };
+}
+
+sub _decl_vars ($n) { return ($n->{text} // '') =~ /([\$\@%]\w+)/g }
+
+# Does $text reference the declared variable $var (e.g. '$x' / '@x' / '%x'), counting Perl's
+# sigil-variant access forms ($x[..] reads @x, $x{..} reads %x, $#x reads @x, @x{..} reads %x)?
+sub _var_used ($text, $var) {
+    my ($sig, $nm) = $var =~ /\A([\$\@%])(\w+)\z/ or return 0;
+    my $n = qr/(?:\{\Q$nm\E\}|\Q$nm\E\b)/;          # the name, bare OR ${braced} (interpolation `"${x}y"` counts)
+    my $lb = qr/(?<![\w\$\@%])/;                     # not part of a longer name / a $$ / @$ / %$ deref
+    return scalar $text =~ /$lb\$$n(?![\[{])/                                      if $sig eq '$';
+    return scalar $text =~ /$lb\@$n(?!\{)|$lb\$$n\s*\[|\$#\{?\Q$nm\E\}?/           if $sig eq '@';
+    return scalar $text =~ /$lb\%$n|$lb\$$n\s*\{|$lb\@$n\s*\{/;
+}
+
+# The assignment TARGET texts in these statements -- the LHS of every assignment whose LHS is not a
+# `my`/etc. declaration (those make new locals, not mutations). Used to detect a mutated input.
+sub _assign_lhs ($stmts) {
+    my @lhs;
+    my @st = @$stmts;
+    while (my $n = pop @st) {
+        if (($n->{type} // '') eq 'assignment_expression') {
+            my $first = ($n->{children} // [])->[0];
+            push @lhs, $first->{text} // '' if $first && ($first->{type} // '') ne 'variable_declaration';
+        }
+        push @st, @{ $n->{children} // [] };
+    }
+    return @lhs;
+}
+
+# Orchestrated cleanup: APPLY the safe subset of the `pcg tidy` survey. Phase 1 dedupes each
+# exact-clone group (rewrites copies to `goto &Canonical`); phase 2 rm's each unused sub (with
+# rm's own export/caller guards + dead-private-helper cascade), looping so cross-batch cascades
+# (a helper only the just-removed subs called) surface after each graph re-sync. Dead EXPORTS are
+# reported, never auto-retracted -- removing public API may break out-of-repo consumers. The
+# dry-run is just `pcg tidy` (the survey + per-item commands); this is the executor (apply:true).
+sub tidy ($self, %opt) {
+    require App::PerlGraph::Query;
+    require App::PerlGraph::Indexer;
+    my $survey = App::PerlGraph::Query->new(store => $self->store)->tidy(%opt);
+    return { %$survey, applied => 0 } unless $opt{apply};
+
+    my $idx = App::PerlGraph::Indexer->new(store => $self->store, root => $self->root);
+    my (@deduped, @removed, @skipped);
+
+    # Phase 1 -- dedupe exact-clone groups (canonical = the first FUNCTION member; dedupe keeps a
+    # function, and skips methods/type-2 copies itself). Independent groups -> one sync after all.
+    for my $g (@{ $survey->{clones} // [] }) {
+        my ($canon) = grep { ($_->{kind} // '') eq 'function' } @{ $g->{members} // [] };
+        next unless $canon && defined $canon->{qualified_name};
+        my $r = $self->dedupe($canon->{qualified_name}, apply => 1);
+        if    ($r->{error})                 { push @skipped, { op => 'dedupe', target => $canon->{qualified_name}, why => $r->{error} } }
+        elsif (@{ $r->{replaced} // [] })   { push @deduped, { canonical => $r->{canonical}, replaced => [ map { $_->{name} } @{ $r->{replaced} } ] } }
+    }
+    $idx->sync if @deduped;
+
+    # Phase 2 -- rm unused subs. A survey's removable subs are mutually independent (an unused sub
+    # has no caller, so none calls another), so a whole batch applies cleanly before one re-sync;
+    # the loop then re-surveys to catch helpers freed by the removals. Bounded against runaway.
+    my %tried;
+    for (1 .. 12) {
+        my @rem = grep { defined $_->{qualified_name} && !$tried{ $_->{qualified_name} }++ }
+                  @{ App::PerlGraph::Query->new(store => $self->store)->tidy->{removable} };
+        last unless @rem;
+        my $did = 0;
+        for my $sub (@rem) {
+            my $r = $self->rm($sub->{qualified_name}, apply => 1);
+            if ($r->{error}) { push @skipped, { op => 'rm', target => $sub->{qualified_name}, why => $r->{error} } }
+            else             { push @removed, @{ $r->{removed} }; $did++ }
+        }
+        last unless $did;
+        $idx->sync;
+    }
+
+    return { deduped => \@deduped, removed => \@removed, skipped => \@skipped, applied => 1 };
+}
+
 1;
 
 __END__
 
 =head1 NAME
 
-App::PerlGraph::Refactor - graph-driven rename / move / inline / dedupe / change-signature / rm codemods
+App::PerlGraph::Refactor - graph-driven rename / move / inline / extract / dedupe / change-signature / rm codemods
 
 =head1 DESCRIPTION
 
-The six graph-driven write tools. RENAMES a function/method within its own package; MOVES
-a function to another existing package (relocating its source and requalifying call sites to
-NewPkg::sub); INLINES a simple function at its call sites as a C<do { ... }> block and
-removes the definition; DEDUPEs an exact (type-1) structural clone group by keeping one
-canonical function and rewriting each byte-identical duplicate to C<sub name { goto
-&Canonical }>; CHANGE_SIGNATUREs a plain function by adding or removing a parameter and
-propagating it to every resolved call site; or safely RMs a dead sub, cascade-removing the
-now-dead private helpers it solely used. All use the resolved call graph to locate every
+The seven graph-driven write tools (plus the C<tidy> cleanup orchestrator). RENAMES a
+function/method within its own package; MOVES a function to another existing package
+(relocating its source and requalifying call sites to NewPkg::sub); INLINES a simple function
+at its call sites as a C<do { ... }> block and removes the definition; EXTRACTs a contiguous
+statement range out of a sub into a new named sub (the inverse of inline, inferring parameters
+and a return list from variable liveness); DEDUPEs an exact (type-1) structural clone group by
+keeping one canonical function and rewriting each byte-identical duplicate to C<sub name { goto
+&Canonical }>; CHANGE_SIGNATUREs a plain function by adding, removing, or reordering a parameter
+and propagating it to every resolved call site; or safely RMs a dead sub, cascade-removing the
+now-dead private helpers it solely used. C<tidy> orchestrates the safe subset (dedupe + rm,
+re-syncing between) for a whole-codebase cleanup. All use the resolved call graph to locate every
 reference precisely and the resolver to decide which call sites actually target the symbol.
 Dynamic C<$obj-E<gt>method>
 dispatch that cannot be tied to the symbol is reported, not edited; rm refuses a sub that is
