@@ -1,6 +1,6 @@
 package App::PerlGraph::CLI;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Path::Tiny qw(path);
 use Cpanel::JSON::XS ();
 use App::PerlGraph::Store;
@@ -91,8 +91,9 @@ usage: pcg <command> [args] [path]
   suggest-reviewers <ref>   who should review the change vs <ref>: authors of the changed files,
                         ranked by how much of that code they wrote (git authorship x the diff)
   sinks                 command/SQL execution sites + which web endpoints reach them (attack surface)
-  taint [--limit N]     source -> sink paths: a user-input source (endpoint / request accessor) whose
-                        call graph reaches a dynamically-built command/SQL sink (reachability, to verify)
+  taint [--limit N]     source -> sink paths: a user-input source (endpoint / request accessor / $ENV /
+                        @ARGV / STDIN) reaching a dynamic command/SQL sink -- [value-flow]/[cross-sub] are
+                        CONFIRMED value-flow, [local]/untagged are reachability to verify
   diff <ref>            structural diff vs a git ref: added/removed/re-signatured symbols (+ breaking)
   semver <ref>          recommend a major/minor/patch bump from the diff (breaking->major, new public->minor)
   changelog <ref>       draft a Changes-style entry from the structural diff (added/removed/changed + bump)

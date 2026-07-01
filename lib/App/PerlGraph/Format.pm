@@ -1,6 +1,6 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use App::PerlGraph::Source;
 use App::PerlGraph::Model qw(package_of is_public);
 use Cpanel::JSON::XS ();
@@ -1020,18 +1020,19 @@ sub taint ($r) {
                 : $p->{source}{kind} eq 'external' ? "reads `$p->{source}{detail}`"        # $ENV / @ARGV / STDIN
                 :                                    "reads `->$p->{source}{detail}`";       # request accessor
         my $sinks = join(', ', map { "$_->{type}:$_->{name}" } @{ $p->{sinks} });
-        my $tag = $p->{value_flow} ? '**[value-flow]** ' : $p->{local} ? '**[local]** ' : '';
+        my $tag = $p->{value_flow} ? '**[value-flow]** ' : $p->{param_flow} ? '**[cross-sub]** ' : $p->{local} ? '**[local]** ' : '';
         $out .= sprintf "- %s%s\n", $tag, $src;
         $out .= '    ' . join(' -> ', map { "`$_`" } @{ $p->{path} }) . "\n";
         $out .= "    sink: **$sinks**"
               . ($p->{value_flow} ? " (the tainted value FLOWS into the sink argument -- confirmed in-sub)\n"
+               : $p->{param_flow} ? " (VERIFIED: the source's value propagates argument->parameter through the call chain into the sink argument)\n"
                : $p->{local}      ? " (source + sink share the sub, but the value may not reach the sink arg -- verify)\n"
                :                    "\n");
     }
     $out .= "\nCONFIDENCE: **[value-flow]** = the tainted value provably reaches the sink's ARGUMENT in one sub (the\n"
-          . "strongest); **[local]** = source + sink share a sub but the value may not reach the argument; an\n"
-          . "untagged cross-sub path is call-graph REACHABILITY only -- it proves input can reach the sink's sub,\n"
-          . "not that the tainted value lands in its argument. VERIFY each.\n";
+          . "strongest); **[cross-sub]** = VERIFIED inter-procedural value-flow -- the source's value propagates\n"
+          . "argument->parameter through the call chain into the sink's argument; **[local]** = source + sink share a\n"
+          . "sub but the value may not reach the argument; an untagged path is call-graph REACHABILITY only. VERIFY.\n";
     return $out;
 }
 

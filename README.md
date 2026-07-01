@@ -255,11 +255,15 @@ Static resolvers connect indirection that plain parsing misses (provenance
 
 - **Static resolution covers idiomatic OO without running code** — bareword
   calls (including symbols imported via `use Mod qw(name)`), `Class->method`,
-  `\&name` references, and `$self`/`$class` method calls
+  `\&name` references, and invocant method calls
   (resolved against the enclosing package, the transitive MRO — inheritance via
   `@ISA`/`parent`/`base`/Moo·Moose `extends`/`Mojo::Base`/native `class :isa`, plus
   composed `with`/`:does` roles) all
-  become edges — the `$self`/`$class`/role ones as `heuristic` provenance.
+  become edges — as `heuristic` provenance. The invocant is `$self`/`$class` OR, in an
+  OO class, a method's **first signature parameter** when it is a conventional invocant
+  name — `$self`/`$class`/`$this` or Mojolicious's `$c` (`$c->stash` in a controller
+  `sub action ($c) {...}` resolves like `$self->stash`); an arbitrarily-named first
+  parameter, such as a helper's `$thing`, is left opaque.
   Attribute accessors resolve too: Moo/Moose/Mojo `has`, native `field :reader`,
   and the common accessor-generator modules — `Class::XSAccessor`/`::Array`
   (`getters`/`setters`/`accessors`/`predicates`), `Class::Tiny`, `Object::Tiny`,

@@ -1,6 +1,6 @@
 package App::PerlGraph::Review;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use App::PerlGraph::Git;
 use App::PerlGraph::Diff;

@@ -1,6 +1,6 @@
 package App::PerlGraph::Extractor;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use App::PerlGraph::Model qw(node_id qualify sink_type);
 use App::PerlGraph::Grammar qw(:all);
@@ -234,7 +234,10 @@ sub _handle_sub ($self, $n) {
     if (my $r = $self->_return_class($n)) { $meta{returns} = $r }   # a `Class->new` builder
     if (my $dup = $self->_body_fingerprint($n)) { $meta{dup} = $dup }  # structural clone fingerprint
     if (my $ts = _taint_source(_decomment($n))) { $meta{taint_source} = $ts }  # reads external input ($ENV/@ARGV/STDIN)
-    $meta{taint_flow} = 1 if _value_flow($n);   # a tainted value reaches a sink ARGUMENT within this sub
+    my ($tflow, $sink_params, $taint_out) = _value_flow($n);   # intra flow + inter-procedural facts
+    $meta{taint_flow}  = 1            if $tflow;              # a tainted value reaches a sink ARG within this sub
+    $meta{sink_params} = $sink_params if @$sink_params;      # parameter POSITIONS that reach a sink arg
+    $meta{taint_out}   = $taint_out   if @$taint_out;        # per outgoing call: arg positions carrying a source / this sub's param
     my $snode = $self->_emit({
         kind           => ($n->{type} eq NODE_METHOD_DECL ? 'method' : 'function'),
         name           => $name,
@@ -245,6 +248,7 @@ sub _handle_sub ($self, $n) {
         (%meta ? (metadata => \%meta) : ()),
     });
     $self->_edge(($pkg ? $pkg->{id} : $self->{_file}{id}), $snode->{id}, 'contains');
+    $snode->{_invocant} = _invocant_name($n);   # first sig param, stashed for _handle_method_call (transient; not stored)
     $self->_handle_catalyst($n, $snode);
     return $snode;
 }
@@ -284,7 +288,7 @@ my $TAINT_SOURCE_RX = qr/\$ENV\s*\{|(?<!\w)\@ARGV\b|\$ARGV\s*\[|<\s*(?:STDIN|ARG
 # assignments that mention it; the answer is whether a sink call's argument mentions a tainted
 # var (or a source directly). A `local` hit with this set is value-flow-confirmed, not just co-located.
 sub _value_flow ($sub) {
-    my (@assign, @sink_arg);
+    my (@assign, @sink_arg, @call);
     my @stack = ($sub);
     while (my $n = pop @stack) {
         my $t = $n->{type} // '';
@@ -298,28 +302,92 @@ sub _value_flow ($sub) {
         elsif ($t =~ /function_call_expression|method_call_expression/) {
             my $f = $n->{fields}{ +F_FUNCTION } // $n->{fields}{ +F_METHOD };
             my $nm = $f ? (split /::/, ($f->{text} // ''))[-1] : '';
-            push @sink_arg, (($n->{fields}{ +F_ARGUMENTS } // {})->{text} // '')
-                if defined sink_type($nm, ($t =~ /method/ ? 1 : 0));
+            my $is_m = $t =~ /method/ ? 1 : 0;
+            my $args = ($n->{fields}{ +F_ARGUMENTS } // {})->{text} // '';
+            if    (defined sink_type($nm, $is_m)) { push @sink_arg, $args }
+            elsif (length $nm)                    { push @call, { callee => $nm, method => $is_m, args => [ _split_args($args) ] } }
         }
         push @stack, @{ $n->{children} // [] };
     }
-    return 0 unless @sink_arg;
-    my %t;                                                          # tainted variable names
-    for my $a (grep { $_->[1] =~ $TAINT_SOURCE_RX } @assign) { $t{$_} = 1 for @{ $a->[0] } }   # seed
-    my $changed = 1;
-    while ($changed) {                                             # fixed point
-        $changed = 0;
-        for my $a (@assign) {
-            next unless grep { !$t{$_} } @{ $a->[0] };             # all LHS already tainted -> nothing to add
-            next unless grep { $a->[1] =~ /\Q$_\E\b/ } keys %t;    # RHS mentions no tainted var (yet)
-            $t{$_} = 1, $changed = 1 for @{ $a->[0] };             # taint ALL LHS (over-taint is the safe direction)
+    return (0, [], []) unless @sink_arg || @call;
+    my $hit = sub ($text, $set) { grep { $text =~ /\Q$_\E\b/ } keys %$set };   # a tainted var appears in $text
+    # (1) taint_flow: a SOURCE-tainted value reaches a sink argument WITHIN this sub (intra-procedural).
+    my %src_seed; for my $a (grep { $_->[1] =~ $TAINT_SOURCE_RX } @assign) { $src_seed{$_} = 1 for @{ $a->[0] } }
+    my $src_set = _tainted_set(\@assign, \%src_seed);
+    my $flow = (grep { $_ =~ $TAINT_SOURCE_RX } @sink_arg) || (grep { $hit->($_, $src_set) } @sink_arg) ? 1 : 0;
+    # (2) INTER-procedural facts. sink_params: which parameter POSITIONS reach a sink argument.
+    # taint_out: per outgoing call, which arg positions carry a source (src) or one of this sub's
+    # parameters (param) -- so the query can propagate taint arg->param along a call path.
+    my @params = _sig_params($sub);
+    my (@sink_params, @taint_out);
+    for my $i (0 .. $#params) {
+        my $pset = _tainted_set(\@assign, { $params[$i] => 1 });
+        push @sink_params, $i + 1 if grep { $hit->($_, $pset) } @sink_arg;
+        for my $c (@call) {
+            for my $j (0 .. $#{ $c->{args} }) {
+                push @taint_out, { callee => $c->{callee}, method => $c->{method}, arg => $j + 1, param => $i + 1 }
+                    if $hit->($c->{args}[$j], $pset);
+            }
         }
     }
-    for my $arg (@sink_arg) {
-        return 1 if $arg =~ $TAINT_SOURCE_RX;                      # a source used directly in the sink
-        return 1 if grep { $arg =~ /\Q$_\E\b/ } keys %t;           # a tainted var in the sink arg
+    for my $c (@call) {                                            # a SOURCE passed into a call arg (the inter-proc seed)
+        for my $j (0 .. $#{ $c->{args} }) {
+            push @taint_out, { callee => $c->{callee}, method => $c->{method}, arg => $j + 1, src => 1 }
+                if $c->{args}[$j] =~ $TAINT_SOURCE_RX || $hit->($c->{args}[$j], $src_set);
+        }
     }
-    return 0;
+    return ($flow, \@sink_params, \@taint_out);
+}
+
+# All signature parameter names of a sub (`sub m ($a, $b, @rest)` -> $a,$b,@rest), in order.
+sub _sig_params ($sub) {
+    my ($sig) = grep { ($_->{type} // '') eq 'signature' } @{ $sub->{children} // [] };
+    return $sig ? (($sig->{text} // '') =~ /([\$\@%]\w+)/g) : ();
+}
+
+# Forward-taint fixed point: seed the tainted set, propagate through assignments (a var whose RHS
+# mentions a tainted var becomes tainted -- over-taints, the safe direction), return the full set.
+sub _tainted_set ($assign, $seed) {
+    my %t = %$seed;
+    my $changed = 1;
+    while ($changed) {
+        $changed = 0;
+        for my $a (@$assign) {
+            next unless grep { !$t{$_} } @{ $a->[0] };
+            next unless grep { $a->[1] =~ /\Q$_\E\b/ } keys %t;
+            $t{$_} = 1, $changed = 1 for @{ $a->[0] };
+        }
+    }
+    return \%t;
+}
+
+# Split a call's argument text on TOP-LEVEL commas into positional args -- bracket-depth AND
+# quote aware (with backslash-escape parity), so a comma inside a bracketed sub-expression
+# `foo(1,2)`, a bracket-delimited `qq{...}`/`qq(...)`, or a quoted string `"SELECT a, b"` (which
+# SQL/command sink args routinely contain) is not a split point. HEURISTIC gap: a bare `'`/`"`
+# inside a regex / quote-op literal (`/'/`, `m!...!`, `tr/'/'/`, a non-bracket `qq/.../`) is not
+# recognized as pattern text and can mis-split that arg -- acceptable for a taint tier the tool
+# already frames as "verify", and rare in real sink args (usually a plain `$var` / `"...$x..."`).
+sub _split_args ($str) {
+    my @out; my $buf = ''; my $depth = 0; my $q = '';   # $q = the open quote char, '' when not in a string
+    my @ch = split //, $str;
+    for my $i (0 .. $#ch) {
+        my $c = $ch[$i];
+        if ($q) {                                        # inside a string: append; a matching quote closes it,
+            $buf .= $c;                                   # but only when UNESCAPED -- an even run (incl. 0) of
+            if ($c eq $q) {                               # immediately-preceding backslashes means not escaped
+                my $bs = 0; $bs++ while $i - 1 - $bs >= 0 && $ch[$i - 1 - $bs] eq '\\';
+                $q = '' unless $bs % 2;
+            }
+        }
+        elsif ($c eq "'" || $c eq '"')      { $q = $c;    $buf .= $c }
+        elsif ($c =~ /[(\[{]/)              { $depth++;   $buf .= $c }
+        elsif ($c =~ /[)\]}]/)              { $depth--;   $buf .= $c }
+        elsif ($c eq ',' && $depth == 0)    { push @out, $buf; $buf = '' }
+        else                                {             $buf .= $c }
+    }
+    push @out, $buf if length $buf;
+    return @out;
 }
 
 # A structural fingerprint of a sub BODY for clone detection: the pre-order sequence
@@ -923,6 +991,19 @@ sub _handle_refgen ($self, $n, $cur_sub) {
     };
 }
 
+# A sub whose first signature parameter is a CONVENTIONAL invocant name is (heuristically) a method,
+# and that parameter is `$self`. We accept only the well-known spellings -- `$self`/`$class`/`$this` and
+# Mojolicious's `$c` -- NOT any first parameter: a plain helper `sub _fmt ($thing, $opt) {...}` inside a
+# class must NOT get `$thing` typed as an invocant just because the param happens to match a later
+# `$thing->render` receiver. Returns the invocant var text (`$self`) or undef.
+my %INVOCANT_PARAM = map { $_ => 1 } qw($self $class $this $c);
+sub _invocant_name ($sub) {
+    return undef unless $sub;
+    my ($sig) = grep { ($_->{type} // '') eq 'signature' } @{ $sub->{children} // [] };
+    return undef unless $sig && ($sig->{text} // '') =~ /\A\s*\(\s*(\$\w+)/;
+    return $INVOCANT_PARAM{$1} ? $1 : undef;
+}
+
 sub _handle_method_call ($self, $n, $cur_sub) {
     my $m = $n->{fields}{ +F_METHOD } or return;
     my $meth = $m->{text};
@@ -945,6 +1026,12 @@ sub _handle_method_call ($self, $n, $cur_sub) {
     my $recv = $inv ? $inv->{text} : undef;
     my %cand;
     $cand{receiver}      = $recv if defined $recv;
+    # A method's FIRST signature parameter, when named a CONVENTIONAL invocant -- $self/$class/$this/$c,
+    # see %INVOCANT_PARAM / _invocant_name -- IS the invocant: resolve `$c->method` against this OO class
+    # exactly like `$self->method`. Mojolicious controllers use `sub action ($c) { $c->stash... }`, which
+    # was otherwise fully opaque. (An arbitrarily-named first param, e.g. a helper's `$thing`, is NOT typed.)
+    $cand{invocant} = 1 if defined $recv && $self->{_pkg} && $self->{_pkg}{_is_class}
+                        && defined($cur_sub) && $recv eq ($cur_sub->{_invocant} // "\0");
     my $rtype = defined $recv ? ($self->{_vartype} // {})->{$recv} : undef;   # inferred via `my $recv = ...`
     if    (ref $rtype eq 'HASH' && $rtype->{call}) { $cand{receiver_call} = $rtype->{call} }   # my $recv = foo()
     elsif ($rtype)                                 { $cand{receiver_type} = $rtype }            # my $recv = Class->new

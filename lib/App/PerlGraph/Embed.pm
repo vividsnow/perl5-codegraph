@@ -1,6 +1,6 @@
 package App::PerlGraph::Embed;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Cpanel::JSON::XS ();
 use Path::Tiny ();
 

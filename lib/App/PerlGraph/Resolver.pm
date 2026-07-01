@@ -1,6 +1,6 @@
 package App::PerlGraph::Resolver;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use App::PerlGraph::Model qw(package_of qualify is_builtin is_external is_universal);
 
@@ -189,7 +189,7 @@ sub _resolve_method ($self, $ref) {
         $start = $fn ? ($fn->{metadata} || {})->{returns} : undef;
         $prov  = 'inferred';
     }
-    elsif ($recv =~ /\A\$(?:self|class)\z/) { $start = $self->_from_package($ref); $prov = 'heuristic' }
+    elsif ($recv =~ /\A\$(?:self|class)\z/ || $cand->{invocant}) { $start = $self->_from_package($ref); $prov = 'heuristic' }   # $self / a named first-param invocant ($c...)
     elsif ($recv =~ /\A[\w:]+\z/)           { $start = $recv;                      $prov = 'static'    }
     else                                    { return }   # unknown receiver ($obj, expression, chain)
     return unless defined $start;
@@ -226,6 +226,14 @@ sub mro ($self, $class) { @{ $self->{_mro_cache}{$class} //= [ $self->_mro($clas
 # Class->new` receiver, or a bareword `Class->meth` receiver; undef for an opaque
 # `$obj`/expression/chain receiver. Lets checkcalls ask "is the method missing from
 # a class we DO know?" rather than "did resolution fail (for any reason)?".
+#
+# DELIBERATELY does NOT honour $cand->{invocant} (a named first-param invocant like a
+# Mojolicious controller's `$c`), even though _resolve_method does. Resolution and typo-
+# detection have OPPOSITE risk profiles: an inferred `$c->method` call EDGE is harmless
+# (no edge results if the class lacks the method), but typing `$c` HERE would make
+# checkcalls flag every `$c->stash`/`->render`/`->param`/... -- framework methods inherited
+# from an external base NOT in the graph -- as "missing" (measured: +35 false positives, 0
+# real bugs, on a Mojolicious app). checkcalls stays conservative: fully-owned receivers only.
 sub receiver_class ($self, $ref) {
     my $cand = $ref->{candidates} || {};
     return $cand->{receiver_type} if $cand->{receiver_type};          # my $x = Class->new

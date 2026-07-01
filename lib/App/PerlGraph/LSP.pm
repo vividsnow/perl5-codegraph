@@ -1,6 +1,6 @@
 package App::PerlGraph::LSP;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);

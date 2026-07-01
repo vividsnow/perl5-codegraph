@@ -1,5 +1,49 @@
 Revision history for App-PerlGraph
 
+0.074     2026-07-01
+          - `pcg taint` gains a VERIFIED CROSS-SUB (inter-procedural) value-flow tier -- taint tracked through the
+            call graph, not just call-graph reachability. Extraction now records, per sub: sink_params (which
+            PARAMETER POSITIONS reach a command/SQL sink's argument) and taint_out (per outgoing call, which
+            argument positions carry a source or one of this sub's parameters). The query then VERIFIES each
+            reachability path end to end -- propagating the tainted PARAMETER POSITION hop by hop (a source at the
+            origin, then each sub's tainted param -> the argument it is passed in -> the callee's parameter at that
+            position, offset by 1 for a `$obj->` method invocant) and confirming the final tainted parameter feeds
+            the sink sub's sink argument. Only a path where the source's value provably propagates argument->
+            parameter through the whole chain into the sink is tagged `[cross-sub]` (multi-hop supported). Ranks
+            below `[value-flow]` (intra, exact), above `[local]`; unverified paths stay untagged reachability. On
+            jakutia (136 sources, 28 dynamic sinks) the verified tier tags 0 cross-sub flows: its 3 cross-sub
+            REACHABILITY candidates all fail end-to-end verification -- the tainted value does NOT propagate
+            argument->parameter into the sink (e.g. a sub reads $ENV but passes an unrelated composed command to its
+            exec helper), so they stay untagged reachability rather than a false CONFIRMED. That no-over-tagging
+            precision is the point; the mechanism itself is proven by t/104's synthetic single- + multi-hop flows.
+            The arg splitter is bracket- AND quote-aware with backslash-escape parity (a comma inside a
+            `"SELECT a, b"` string, or a literal-backslash-terminated `"x\\"`, does not shift the tainted arg's
+            index), and the arg->param offset accounts for a native `method`'s IMPLICIT `$self` (no +1 there, unlike
+            a `sub ($self, ...)` called via `->`). EXTRACTION_VERSION 13 -> 16.
+          - Tests +13 (1652): t/104 covers a verified single-hop path, a MULTI-HOP source->step->run path, a
+            constant-fed sink staying untagged, POSITION PRECISION (a tainted argument mapping to a parameter that
+            does NOT reach the sink is rejected), a comma-inside-a-quoted-arg not shifting the position, and a direct
+            `_split_args` unit block (bracket / single+double quote / escaped-quote / even-backslash-parity splits).
+            pcg_taint MCP/skill/CLI/Query-docstring tiers updated. (Fixed a greedy-array trap
+            `my (@out,$buf,$depth)=((),'',0)` in the new arg-splitter -- @out swallowed the seed values, shifting
+            every arg position by 2; the same bug pattern as _split_top_commas.)
+
+0.073     2026-07-01
+          - Resolution depth: the invocant heuristic now recognizes a method's FIRST SIGNATURE PARAMETER as the
+            invocant when it is a CONVENTIONAL invocant name -- `$self` / `$class` / `$this`, or Mojolicious's `$c`.
+            In a classic-OO class (composes a base / uses Moo·Moose·Mojo::Base / @ISA / base / parent),
+            `sub action ($c) { $c->method }` resolves `$c->method` against the class + its MRO exactly like
+            `$self->method` (`heuristic` provenance) -- the pervasive Mojolicious controller pattern (`$c` = the
+            controller), otherwise wholly opaque. Scoped to OO classes, the first param, AND the known invocant
+            spellings: a `$c` that is a SECOND parameter, any first param in a non-class package, or an
+            arbitrarily-named first param (a helper's `sub _fmt ($thing) { $thing->render }` does NOT type `$thing`)
+            is left opaque -- so no new false positives (jakutia's checkcalls/checkargs stay flat). (Native `class`
+            declarations are out of scope: their `method`s take an IMPLICIT `$self`, never a signature parameter.)
+            EXTRACTION_VERSION 12 -> 13.
+          - Tests +6 (1639): t/107 covers a Mojo-style controller resolving `$c->method`, the heuristic provenance,
+            and the negative cases (second-param `$c`, non-class package, and a same-named helper `$thing` inside a
+            real class staying opaque).
+
 0.072     2026-06-30
           - Post-wave-9 REVIEW-LOOP HARDENING (a 3-reviewers-per-round adversarial pass over the 0.066-0.071
             changes; real findings fixed, false positives filtered):

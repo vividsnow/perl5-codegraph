@@ -1,6 +1,6 @@
 package App::PerlGraph::Indexer;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use Digest::SHA qw(sha1_hex);
 use Path::Iterator::Rule;
@@ -31,7 +31,7 @@ our $PERL_RX     = qr/\.(?:pl|pm|t|psgi|pod|xs)$/;
 # Bump when the extractor's output changes (new node/edge kinds, resolution rules)
 # so a `pcg index`/`sync` after an upgrade re-extracts unchanged files instead of
 # trusting their stale graph. Files carry the version they were extracted with.
-use constant EXTRACTION_VERSION => 12;  # 12: intra-procedural value-flow (metadata.taint_flow: a tainted value reaches a sink arg in-sub)
+use constant EXTRACTION_VERSION => 16;  # 16: quote-aware arg split + conventional-name invocant guard; 15: inter-procedural taint (sink_params/taint_out) for verified cross-sub value-flow
 
 # The dir-pruning rule shared by file and directory scans: the named IGNORE_DIRS,
 # plus any non-root subdir that is itself a git repo/worktree (its own .git) --

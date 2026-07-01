@@ -1,6 +1,6 @@
 package App::PerlGraph::Refactor;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use App::PerlGraph::Model qw(package_of);
 use App::PerlGraph::Grammar qw(:all);

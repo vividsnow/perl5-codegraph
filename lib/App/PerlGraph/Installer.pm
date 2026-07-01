@@ -1,6 +1,6 @@
 package App::PerlGraph::Installer;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);
@@ -82,7 +82,7 @@ routes/helpers, XSUBs), not text matches.
 - Draft a Changes / release-notes entry from the structural diff (added / removed / changed, grouped, with the bump) -> **pcg_changelog** `<ref>` (a ready-to-edit scaffold; turn into prose before release).
 - Security attack surface (command/SQL execution sites + which web endpoints reach them) -> **pcg_sinks** (flags sinks whose argument is dynamically built -- interpolated/concatenated -- as the injection-shaped sites; constant/placeholdered ones are safe).
 - Source -> sink TAINT PATHS (a user-input source -- endpoint / request accessor / $ENV / @ARGV / STDIN -- whose call graph
-  reaches a dynamic command/SQL sink, with the path shown) -> **pcg_taint** (a `[value-flow]` hit confirms the tainted value reaches the sink ARG in-sub; `[local]`/cross-sub are reachability to VERIFY).
+  reaches a dynamic command/SQL sink, with the path shown) -> **pcg_taint** (`[value-flow]` = tainted value reaches the sink ARG in-sub; `[cross-sub]` = a VERIFIED inter-procedural flow, the source's value propagates arg->param through the call chain into the sink arg; `[local]`/untagged are weaker reachability to VERIFY).
 - Which tests exercise X -> **pcg_covers**.  Tests impacted by a diff -> **pcg_affected**.
 - Broken method calls -- a static BUG FINDER: a `$obj->method` the receiver's KNOWN in-repo class doesn't
   define (a typo or a call into renamed/removed API) -> **pcg_checkcalls** (heuristic; `pcg_index runtime:true` sharpens it).

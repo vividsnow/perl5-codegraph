@@ -1,6 +1,6 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.072};
+our $VERSION = q{0.074};
 use Moo;
 use App::PerlGraph::Model qw(package_of is_public is_universal);
 use App::PerlGraph::Grammar qw(NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_LIST_EXPR F_ARGUMENTS F_FUNCTION F_METHOD F_INVOCANT);
@@ -396,14 +396,45 @@ sub sinks ($self, %opt) {
 # route_parameters), OR any sub that reads external process input ($ENV / @ARGV / STDIN,
 # flagged metadata.taint_source at extraction) -- and only DYNAMIC sinks
 # (whose command/SQL string is built from a variable -- the injectable ones) are targets, with
-# the actual call PATH shown. A same-sub case is sharpened by INTRA-PROCEDURAL value-flow
-# (metadata.taint_flow): a `value_flow` hit means the tainted value provably reaches the sink's
-# ARGUMENT (highest confidence); a plain `local` hit is co-located (source + sink in the sub, but
-# the value may not reach the arg). Cross-sub paths are call-graph reachability only -- they prove
-# user input can REACH the sink's sub, not that the tainted value lands in its argument; VERIFY them.
+# the actual call PATH shown, tagged by CONFIDENCE: `value_flow` (metadata.taint_flow) = the tainted
+# value provably reaches the sink's ARGUMENT within one sub (strongest); `param_flow` = a VERIFIED
+# cross-sub flow -- _verify_flow propagates the source's value argument->parameter hop-by-hop (via each
+# sub's metadata.taint_out) all the way into the sink's argument (which must land in metadata.sink_params);
+# `local` = source + sink share a sub but the value may not reach the arg; an untagged path is call-graph
+# reachability only. VERIFY.
 my %TAINT_SOURCE_CALLS = map { $_ => 1 } qw(
     param params cookie cookies upload uploads header headers
     query_parameters body_parameters route_parameters);
+
+# Verify a reachability path [n0..nk] (n0 = a source sub, nk = a sink sub) carries taint END TO END:
+# propagate the tainted PARAMETER position hop-by-hop using each sub's metadata.taint_out (which arg
+# positions carry a source / one of the sub's params) and confirm the tainted param at nk feeds one
+# of its metadata.sink_params (the params reaching its sink). Positional -- a `$obj->m($x)` call's arg q
+# maps to the callee's param q+1 (past the explicit `$self`), EXCEPT a native `method NAME (...)` decl
+# (kind 'method') whose `$self` is implicit, so its params number from q. Hops are matched by callee
+# SHORT name (taint_out is recorded pre-resolution): a sub calling two same-named methods on different
+# classes can in principle cross-match -- a rare over-verify, still worth confirming. CONFIRMED flow only.
+sub _verify_flow ($s, $ids) {
+    return 0 if @$ids < 2;
+    my %tainted;                                              # tainted parameter positions at the current node
+    for my $step (0 .. $#$ids - 1) {
+        my $from = $s->node($ids->[$step])     or return 0;
+        my $to   = $s->node($ids->[$step + 1]) or return 0;
+        (my $to_nm = $to->{qualified_name} // $to->{name} // '') =~ s/.*:://;
+        my $self_slot = ($to->{kind} // '') eq 'method' ? 0 : 1;   # native `method`'s $self is implicit -> no +1
+        my %next;
+        for my $e (@{ ($from->{metadata} // {})->{taint_out} // [] }) {
+            next unless ($e->{callee} // '') eq $to_nm;
+            next unless $e->{src} ? ($step == 0) : $tainted{ $e->{param} // -1 };   # source at the origin, else a tainted param
+            $next{ ($e->{arg} // 0) + ($e->{method} ? $self_slot : 0) } = 1;
+        }
+        return 0 unless %next;                                # taint did not propagate to the next hop
+        %tainted = %next;
+    }
+    my %sp = map { $_ => 1 } @{ ($s->node($ids->[-1])->{metadata} // {})->{sink_params} // [] };
+    return (grep { $sp{$_} } keys %tainted) ? 1 : 0;
+}
+
 sub taint ($self, %opt) {
     my $s = $self->store;
     my %sink;                                                 # sub id -> [ {type,name} ] (DYNAMIC sinks only)
@@ -451,12 +482,15 @@ sub taint ($self, %opt) {
         }
     }
     for my $p (@paths) {                                      # resolve ids -> qnames once, at the end
+        # a CROSS-sub path is VERIFIED value-flow when the tainted value propagates arg->param
+        # hop-by-hop from the source into the sink sub's parameter that feeds its sink argument.
+        $p->{param_flow} = $p->{local} ? 0 : (_verify_flow($s, $p->{ids}) ? 1 : 0);
         $p->{path}     = [ map { my $n = $s->node($_); $n ? ($n->{qualified_name} // $n->{name} // '?') : '?' } @{ $p->{ids} } ];
         $p->{src_sub}  = $p->{path}[0];
         $p->{sink_sub} = $p->{path}[-1];
         delete $p->{ids};
     }
-    @paths = sort { $b->{value_flow} <=> $a->{value_flow} || $b->{local} <=> $a->{local} || @{ $a->{path} } <=> @{ $b->{path} }
+    @paths = sort { $b->{value_flow} <=> $a->{value_flow} || $b->{param_flow} <=> $a->{param_flow} || $b->{local} <=> $a->{local} || @{ $a->{path} } <=> @{ $b->{path} }
                  || $a->{src_sub} cmp $b->{src_sub} || $a->{sink_sub} cmp $b->{sink_sub} } @paths;
     my $limit = $opt{limit} || 50;
     @paths = @paths[0 .. $limit - 1] if @paths > $limit;

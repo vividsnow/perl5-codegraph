@@ -6,6 +6,7 @@ use App::PerlGraph::Store;
 use App::PerlGraph::Indexer;
 use App::PerlGraph::Query;
 use App::PerlGraph::Format;
+use App::PerlGraph::Extractor;
 
 my $parser = eval { App::PerlGraph::Parser->new } or skip_all "parser unavailable: $@";
 eval { $parser->parse_string("1;\n") } or skip_all "grammar not built: $@";
@@ -115,5 +116,42 @@ my $cmt = _taint_of("package Z;\nuse v5.36;\nsub run (\$x) {\n    # historically
 is $cmt->{sources}, 0, 'Query: a $ENV mentioned only in a full-line comment is NOT counted as a taint source';
 my $icmt = _taint_of("package Z;\nuse v5.36;\nsub run (\$x) {\n    system(\"\$x\");  # avoids \$ENV{HOME} on sandboxed runs\n}\n1;\n");
 is $icmt->{sources}, 0, 'Query: a $ENV in an INLINE (trailing) comment is NOT counted as a taint source either';
+
+# --- CROSS-SUB value-flow: VERIFIED inter-procedural (the tainted value propagates arg->param into the sink) ---
+my $xs = _taint_of("package Z;\nuse v5.36;\nsub handler { my \$x = \$ENV{CMD}; return run(\$x) }\nsub run (\$cmd) { system(\"echo \$cmd\") }\n1;\n");
+my ($xp) = grep { ($_->{src_sub} // '') =~ /handler/ } @{ $xs->{paths} };
+ok $xp && $xp->{param_flow},   'Query: source -> run($x), run($cmd) sinks $cmd -> VERIFIED [cross-sub]';
+ok $xp && !$xp->{value_flow},  'Query: ...NOT intra-sub value-flow (the sink is in a different sub)';
+ok $xp && !$xp->{local},       'Query: ...and not local';
+# MULTI-HOP: source -> step($x) -> run($v) -> sink, verified through two calls
+my $mh = _taint_of("package Z;\nuse v5.36;\nsub h { my \$x = \$ENV{C}; return step(\$x) }\nsub step (\$v) { return run(\$v) }\nsub run (\$cmd) { system(\"echo \$cmd\") }\n1;\n");
+my ($mp) = grep { ($_->{src_sub} // '') =~ /::h\z/ } @{ $mh->{paths} };
+ok $mp && $mp->{param_flow}, 'Query: multi-hop source -> step -> run is verified [cross-sub]';
+# a helper whose dynamic sink is fed by a CONSTANT (not its parameter) is only reachability, not verified
+my $ns = _taint_of("package Z;\nuse v5.36;\nsub handler { my \$x = \$ENV{CMD}; return logit(\$x) }\nsub logit (\$m) { my \$c = '/tmp/x'; system(\"touch \$c\") }\n1;\n");
+my ($np) = grep { ($_->{src_sub} // '') =~ /handler/ } @{ $ns->{paths} };
+ok $np && !$np->{param_flow}, 'Query: a helper whose sink is fed by a CONSTANT (not its param) is untagged, not [cross-sub]';
+# POSITION precision: the tainted value is passed at the arg position of a param that does NOT reach the sink
+my $pp = _taint_of("package Z;\nuse v5.36;\nsub c { my \$z = \$ENV{Z}; return two(\$z, 'k') }\nsub two (\$val, \$key) { system(\"echo \$key\") }\n1;\n");
+my ($pq) = grep { ($_->{src_sub} // '') =~ /::c\z/ } @{ $pp->{paths} };
+ok $pq && !$pq->{param_flow}, 'Query: tainted arg maps to $val (param 1) but the sink is fed by $key (param 2) -> NOT verified';
+# QUOTE-AWARE position: a comma INSIDE a quoted argument must not be read as an argument separator, or
+# the tainted arg's position shifts and the cross-sub flow is missed. Here `$x` is the 2nd arg (after the
+# SQL-ish string literal that itself contains a comma) and must map to `$cmd` (param 2) -> still verified.
+my $qa = _taint_of("package Z;\nuse v5.36;\nsub h { my \$x = \$ENV{C}; return run(\"a, b, c\", \$x) }\nsub run (\$lit, \$cmd) { system(\"echo \$cmd\") }\n1;\n");
+my ($qp) = grep { ($_->{src_sub} // '') =~ /::h\z/ } @{ $qa->{paths} };
+ok $qp && $qp->{param_flow}, 'Query: a comma inside a quoted arg does not shift the tainted arg position (still verified [cross-sub])';
+
+# --- _split_args UNIT: the positional splitter that feeds taint_out arg positions must be bracket-,
+# quote-, AND backslash-parity aware (a mis-split shifts every downstream arg position) --------------
+{
+    my $sp = \&App::PerlGraph::Extractor::_split_args;
+    is [ $sp->(q{$a, $b}) ],          ['$a', ' $b'],          '_split_args: plain top-level comma splits';
+    is [ $sp->(q{"a, b", $x}) ],      ['"a, b"', ' $x'],      '_split_args: comma inside a double-quoted string is not a separator';
+    is [ $sp->(q{'a, b', $x}) ],      [q{'a, b'}, ' $x'],     '_split_args: comma inside a single-quoted string is not a separator';
+    is [ $sp->(q{f(1, 2), $x}) ],     ['f(1, 2)', ' $x'],     '_split_args: comma inside brackets is not a separator';
+    is [ $sp->(qq{"a\\", b", \$x}) ], [qq{"a\\", b"}, ' $x'], '_split_args: an escaped quote (odd backslash) does not end the string';
+    is [ $sp->(qq{"x\\\\", \$y}) ],   [qq{"x\\\\"}, ' $y'],   '_split_args: an even backslash run before a quote DOES close (parity)';
+}
 
 done_testing;
