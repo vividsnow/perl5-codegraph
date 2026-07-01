@@ -1,6 +1,6 @@
 package App::PerlGraph::Query;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use Moo;
 use App::PerlGraph::Model qw(package_of is_public is_universal);
 use App::PerlGraph::Grammar qw(NODE_CALL NODE_CALL_AMBIG NODE_CALL_OP NODE_METHOD_CALL NODE_LIST_EXPR F_ARGUMENTS F_FUNCTION F_METHOD F_INVOCANT);

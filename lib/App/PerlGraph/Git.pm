@@ -1,6 +1,6 @@
 package App::PerlGraph::Git;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use Moo;
 
 # Thin read-only wrapper over `git log` for the history-aware analyses (churn for

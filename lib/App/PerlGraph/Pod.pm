@@ -1,6 +1,6 @@
 package App::PerlGraph::Pod;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 
 # Map a documented name -> its POD text (first block), from `=headN name` /
 # `=item name` sections. Heuristic but covers the common "one section per sub"

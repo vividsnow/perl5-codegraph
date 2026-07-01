@@ -1,6 +1,6 @@
 package App::PerlGraph::Runtime;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use Moo;
 use Cpanel::JSON::XS ();
 use POSIX ();

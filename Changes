@@ -1,5 +1,18 @@
 Revision history for App-PerlGraph
 
+0.075     2026-07-02
+          - Agent-facing DISCOVERABILITY polish (no behaviour change): the deployed skill's auto-trigger
+            `description` now spans every tool family -- security / taint, bug-finding (broken & wrong-arity
+            calls), PR / branch review, risk & impact ("is it safe to change X"), and the refactor WRITE tools
+            (rename / move / inline / extract) -- not just read & navigation, so the skill auto-loads on those
+            tasks instead of the agent falling back to grep. The MCP server INSTRUCTIONS opening gives a concrete
+            structural-trigger list ("who calls X, what X calls, where defined, how A reaches B, blast radius,
+            which test, is a call broken, can user input reach a sink") in place of a generic "prefer over grep".
+            pcg_duplication and pcg_hotspots descriptions now lead with the INTENT ("copy-pasted / duplicated
+            subs -- DRY targets"; "where risk and complexity concentrate") rather than the mechanism, matching
+            the skill's "Pick the right tool" phrasing. No tool added or removed; EXTRACTION_VERSION unchanged
+            (16); suite 1652, kwalitee 'perfect'.
+
 0.074     2026-07-01
           - `pcg taint` gains a VERIFIED CROSS-SUB (inter-procedural) value-flow tier -- taint tracked through the
             call graph, not just call-graph reachability. Extraction now records, per sub: sink_params (which

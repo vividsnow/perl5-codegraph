@@ -1,6 +1,6 @@
 package App::PerlGraph::Installer;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use Moo;
 use Cpanel::JSON::XS ();
 use Path::Tiny qw(path);
@@ -27,12 +27,16 @@ use constant SKILL => <<'MD';
 ---
 name: perl-codegraph
 description: >-
-  Use when exploring, understanding, navigating, reviewing, or refactoring a Perl
-  codebase (.pm / .pl / .t files) -- query the pcg code knowledge graph via its
-  pcg_* MCP tools instead of grep/Read for anything structural. Triggers on
-  questions like "who calls X", "what does Y call", "blast radius of changing Z",
-  "where is this defined", "how does A reach B", "which tests cover this",
-  "find dead code", "module dependencies / cycles".
+  Use when exploring, understanding, navigating, reviewing, refactoring, or
+  security-auditing a Perl codebase (.pm / .pl / .t / .psgi) -- query the pcg code
+  knowledge graph through its pcg_* MCP tools instead of grep/Read for anything
+  structural (they return RESOLVED callers/callees/@ISA/imports/routes, not text
+  matches). Triggers on tasks like "who calls X / what does Y call", "where is this
+  defined", "blast radius / is it safe to change X", "how does A reach B", "which
+  tests cover this", "find dead / untested / duplicated code", "any broken or
+  wrong-arity method calls", "can user input reach a SQL/shell sink", "review this
+  branch / what changed", "module deps / cycles / architecture", and refactors like
+  "rename / move / inline / extract this sub".
 ---
 
 # pcg -- Perl code knowledge graph

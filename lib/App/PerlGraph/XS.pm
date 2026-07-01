@@ -1,6 +1,6 @@
 package App::PerlGraph::XS;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use App::PerlGraph::Model qw(node_id);
 
 # Scan an XS (.xs) source into { nodes, edges, refs }: a package node + a

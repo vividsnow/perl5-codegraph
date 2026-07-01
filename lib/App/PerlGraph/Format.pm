@@ -1,6 +1,6 @@
 package App::PerlGraph::Format;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use App::PerlGraph::Source;
 use App::PerlGraph::Model qw(package_of is_public);
 use Cpanel::JSON::XS ();

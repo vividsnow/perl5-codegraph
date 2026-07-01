@@ -1,6 +1,6 @@
 package App::PerlGraph::Store;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use Moo;
 use DBI;
 use Cpanel::JSON::XS ();

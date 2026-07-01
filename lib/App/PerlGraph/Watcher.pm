@@ -1,6 +1,6 @@
 package App::PerlGraph::Watcher;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use Moo;
 use App::PerlGraph::Indexer ();   # shared $PERL_RX / @IGNORE_DIRS / ->dirs
 

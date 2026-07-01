@@ -1,6 +1,6 @@
 package App::PerlGraph::MCP;
 use v5.36;
-our $VERSION = q{0.074};
+our $VERSION = q{0.075};
 use Moo;
 use Cpanel::JSON::XS ();
 use App::PerlGraph ();
@@ -27,7 +27,7 @@ sub _build__json ($self) { Cpanel::JSON::XS->new->utf8->canonical }
 
 use constant PROTOCOL_VERSION => '2024-11-05';
 use constant INSTRUCTIONS => <<'MD';
-`pcg` is a Perl code knowledge graph: it parses the codebase into a graph of packages, subs, calls, imports and inheritance, and answers STRUCTURAL questions with *resolved* relationships (callers, callees, @ISA, imports, Mojolicious/Dancer/Catalyst routes, XSUBs) -- not text matches. Prefer it over grep/Read for anything structural. Every relationship is tagged by provenance: `[optree]` `[mop]` `[symtab]` `[xs]` are authoritative; `[static]` `[framework]` are exact static facts; `[inferred]` is deterministic but local; `[heuristic]` `[llm]` are honest guesses -- never treat the last two as proven.
+`pcg` is a Perl code knowledge graph: it parses the codebase into a graph of packages, subs, calls, imports and inheritance, and answers STRUCTURAL questions with *resolved* relationships (callers, callees, @ISA, imports, Mojolicious/Dancer/Catalyst routes, XSUBs) -- not text matches. Reach for a pcg_* tool instead of grep/Read the moment a question is STRUCTURAL -- who calls X, what X calls, where a symbol is defined, how A reaches B, a change's blast radius, which test covers it, is a call broken, can user input reach a sink. Every relationship is tagged by provenance: `[optree]` `[mop]` `[symtab]` `[xs]` are authoritative; `[static]` `[framework]` are exact static facts; `[inferred]` is deterministic but local; `[heuristic]` `[llm]` are honest guesses -- never treat the last two as proven.
 
 ORIENT in an unfamiliar repo: pcg_overview (the map -- scale, frameworks, entry points, most-central symbols; the best FIRST call); pcg_metrics (a one-call code-health snapshot -- resolution %, test/doc coverage, complexity, dead code, clones, cycles + concerns; for triage / a release gate, NOT an orientation map -- use pcg_overview to get oriented); pcg_explore <term> (matching symbols + source + relationships in one call; beats grep); pcg_search <name> (locate a symbol; semantic:true ranks by meaning when embeddings exist).
 UNDERSTAND a symbol: pcg_explain (one-call dossier -- source + callers/callees + transitive blast radius + covering tests); pcg_context (a paste-ready EDITING set -- the symbol + the full source of every project callee it depends on + tests, budget-capped; a non-symbol arg becomes a search). Finer-grained: pcg_node (def + source); pcg_callers / pcg_callees; pcg_impact (transitive callers = blast radius); pcg_path A B (shortest call chain).
@@ -90,7 +90,7 @@ my @TOOLS = (
       inputSchema => { type => 'object', properties => {} } },
     { name => 'pcg_scaffold', handler => 'scaffold', description => "Generate a POD + test SKELETON (with TODO placeholders) for a sub, derived from its signature -- the actionable starting point for pcg_untested / pcg_undocumented. Returns a `=head2` POD stub (using \$obj->name and dropping the invocant for a method) and a Test2::V0 test stub that loads the package and calls the sub with one placeholder argument per parameter, plus an assertion to fill in. Read-only: it emits text to paste/adapt, it does not write any file.",
       inputSchema => { type => 'object', properties => { symbol => { type => 'string', description => 'The sub to scaffold: Pkg::sub, or a unique bare name' } }, required => ['symbol'] } },
-    { name => 'pcg_duplication', handler => 'duplication', description => "Structural code clones: groups of subs whose BODY has an identical CST shape -- same structure with identifiers and literals abstracted away, so type-1 (exact) and type-2 (copy-paste with renamed vars / changed constants) duplicates are caught. Ranked by size x number of copies, so the biggest, most-copied groups -- the best extract-a-shared-helper / DRY targets -- come first. Near-duplicates with small edits (type-3) are NOT grouped, so a reported group is a real structural match, not a guess. To collapse an exact (type-1) duplicate group into a single canonical function, use pcg_dedupe.",
+    { name => 'pcg_duplication', handler => 'duplication', description => "Copy-pasted / structurally duplicated subs -- the DRY / extract-a-shared-helper targets. Finds clone groups whose BODY has an identical CST shape (identifiers + literals abstracted away), catching type-1 (exact) and type-2 (renamed vars / changed constants) duplicates; ranked by size x number of copies so the biggest, most-copied groups come first. Near-duplicates with small edits (type-3) are NOT grouped, so a reported group is a real structural match, not a guess. To collapse an exact (type-1) group into one canonical function, use pcg_dedupe.",
       inputSchema => { type => 'object', properties => {
           limit     => { type => 'integer', description => 'Max clone groups to return (default 20)' },
           min_nodes => { type => 'integer', description => 'Ignore subs whose body has fewer than N AST nodes (default 30)' },
@@ -155,7 +155,7 @@ my @TOOLS = (
           name  => { type => 'string',  description => 'The bare name for the new sub' },
           apply => { type => 'boolean', description => 'Write the edits to disk (default false = dry-run plan)' },
       }, required => ['file', 'lines', 'name'] } },
-    { name => 'pcg_hotspots', handler => 'hotspots', description => 'Call-graph hotspots, four lists: the most depended-upon symbols (fan-in, each with its transitive blast radius -- change with care), the symbols that make the most calls (fan-out), the most cyclomatically-complex symbols, and the most efferently-coupled modules. Good for review/refactor triage.',
+    { name => 'pcg_hotspots', handler => 'hotspots', description => 'Where risk and complexity concentrate -- review / refactor triage. Four call-graph hotspot lists: the most depended-upon symbols (fan-in, each with its transitive blast radius -- change with care), the symbols that make the most calls (fan-out), the most cyclomatically-complex symbols, and the most efferently-coupled modules.',
       inputSchema => { type => 'object', properties => { limit => { type => 'integer', description => 'Top N per list (default 15)' } } } },
     { name => 'pcg_risk', handler => 'risk', description => 'History-aware risk: symbols ranked by git churn (commits touching their file) x fan-in (how many depend on them). Frequently-changed AND widely-depended-upon code is the top refactor/test target. With `since`, count only churn from commits since that ref (risk on the current branch). Needs a git work tree.',
       inputSchema => { type => 'object', properties => {
